@@ -215,7 +215,7 @@ The bot requires these core settings, all created by the bootstrap:
 | `BOT_TOKEN` | Official Discord bot token |
 | `GUILD_ID`, `CONTROL_CH_ID`, `DASHBOARD_CH_ID`, `LOG_CH_ID` | Control server routing |
 | `OWNER_IDS` | Authorized Discord operators |
-| `GH_TOKEN`, `GITHUB_OWNER`, `ALT_REPOS` | GitHub dispatch and sync |
+| `GH_TOKEN`, `ALT_GITHUB_OWNER`, `ALT_REPOS` | GitHub dispatch and sync |
 | `ALT_DISCORD_IDS`, `ALT_NAMES` | DM routing and display names |
 | `TUNING_JSON` | Optional shared bot tuning object |
 
@@ -347,7 +347,7 @@ webhook URLs, or the GitHub token in this object.
   reports, and normal workflow inputs.
 - If `/run` is missing, restart the control-bot workflow and wait for guild
   command sync. Check that the bot is in the configured server.
-- If `/run` reports a GitHub error, verify `GH_TOKEN`, `GITHUB_OWNER`, the
+- If `/run` reports a GitHub error, verify `GH_TOKEN`, `ALT_GITHUB_OWNER`, the
   `ALT_REPOS` mapping, and that the alt repository contains `send_ads.yml`.
 - If the dashboard shows an alt as ❔, wait for its first structured heartbeat.
 - If an alt self-check returns 401, replace its `USER_TOKEN` secret. A 403 on

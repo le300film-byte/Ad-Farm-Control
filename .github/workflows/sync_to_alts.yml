@@ -52,7 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           ALT_REPOS: ${{ secrets.ALT_REPOS }}
-          GITHUB_OWNER: ${{ secrets.GITHUB_OWNER }}
+          GITHUB_OWNER: ${{ secrets.ALT_GITHUB_OWNER }}
           SYNC_BRANCH: ${{ vars.SYNC_BRANCH || 'main' }}
           MANUAL_MSG: ${{ github.event.inputs.message }}
           REPOS_OVERRIDE: ${{ github.event.inputs.repos_override }}

@@ -155,153 +155,455 @@ async def _check_perms(inter: discord.Interaction) -> bool:
     return True
 
 
-class RunModal(discord.ui.Modal, title="Start an alt run · 1/2"):
-    """First page of the run form.
+def _set_selected_option(select: discord.ui.Select, selected: str) -> None:
+    """Keep a select menu's visible checkmark in sync after an edit."""
+    for option in select.options:
+        option.default = option.value == selected
 
-    Discord limits a modal to five rows. The form therefore uses two
-    consecutive modals rather than falling back to a long list of slash
-    command arguments.
+
+class RunStartView(discord.ui.View):
+    """Private first step of /run: choose an actual configured alt and mode.
+
+    A modal submit cannot open another modal in Discord. This view deliberately
+    uses select menus and a button for the first step; the button interaction
+    can safely open the mode-specific details modal.
     """
 
-    alt_id = discord.ui.TextInput(
-        label="Alt ID (1–4)", custom_id="alt_id", placeholder="1",
-        required=True, max_length=2,
-    )
-    ad_type = discord.ui.TextInput(
-        label="Ad type (sell or buy)", custom_id="ad_type", placeholder="sell",
-        default="sell", required=True, max_length=4,
-    )
-    sell_rate = discord.ui.TextInput(
-        label="Sell/token rate (e.g. 2.5$)", custom_id="sell_rate",
-        placeholder="2.5$", default="2.5$", required=True, max_length=20,
-    )
-    sell_extra = discord.ui.TextInput(
-        label="Sell extra text", custom_id="sell_extra",
-        placeholder="DM ME QUICK CAN DO SMALL AND BIG AMOUNTS",
-        default="DM ME QUICK CAN DO SMALL AND BIG AMOUNTS",
-        required=False, max_length=500,
-    )
-    buy_rate_rap = discord.ui.TextInput(
-        label="Buy RAP rate (e.g. 1.8)", custom_id="buy_rate_rap",
-        placeholder="1.8", default="1.8", required=False, max_length=20,
-    )
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.alt_id: int | None = None
+        self.ad_type: str | None = None
+
+        alt_options = []
+        for alt_id in state.alt_ids[:25]:
+            alt = state.get(alt_id)
+            label = (alt.name if alt else f"Alt {alt_id}")[:100]
+            description = (f"{alt.ad_type} mode" if alt and alt.ad_type else "Configured alt")[:100]
+            alt_options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=str(alt_id),
+                    description=description,
+                    emoji=_ad_icon(alt.ad_type if alt else ""),
+                )
+            )
+        self.alt_select = discord.ui.Select(
+            placeholder="1. Choose an alt…",
+            min_values=1,
+            max_values=1,
+            options=alt_options,
+            row=0,
+        )
+        self.alt_select.callback = self._select_alt
+        self.add_item(self.alt_select)
+
+        self.mode_select = discord.ui.Select(
+            placeholder="2. Choose sell or buy…",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Sell", value="sell", emoji="💰",
+                                     description="Post a selling ad"),
+                discord.SelectOption(label="Buy", value="buy", emoji="🛒",
+                                     description="Post a buying ad"),
+            ],
+            row=1,
+        )
+        self.mode_select.callback = self._select_mode
+        self.add_item(self.mode_select)
+
+        self.continue_button = discord.ui.Button(
+            label="Continue",
+            style=discord.ButtonStyle.primary,
+            emoji="➡️",
+            row=2,
+        )
+        self.continue_button.callback = self._continue
+        self.add_item(self.continue_button)
+
+        self.cancel_button = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+        self.cancel_button.callback = self._cancel
+        self.add_item(self.cancel_button)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message(
+                "🔒 This private /run form belongs to another operator.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _select_alt(self, inter: discord.Interaction) -> None:
+        self.alt_id = int(self.alt_select.values[0])
+        _set_selected_option(self.alt_select, str(self.alt_id))
+        await inter.response.edit_message(embed=_run_start_embed(self), view=self)
+
+    async def _select_mode(self, inter: discord.Interaction) -> None:
+        self.ad_type = self.mode_select.values[0]
+        _set_selected_option(self.mode_select, self.ad_type)
+        await inter.response.edit_message(embed=_run_start_embed(self), view=self)
+
+    async def _continue(self, inter: discord.Interaction) -> None:
+        if self.alt_id is None or self.ad_type is None:
+            await inter.response.send_message(
+                "❌ Choose both an alt and an ad type first.", ephemeral=True
+            )
+            return
+        await inter.response.send_modal(
+            RunDetailsModal(owner_id=self.owner_id, alt_id=self.alt_id, ad_type=self.ad_type)
+        )
+
+    async def _cancel(self, inter: discord.Interaction) -> None:
+        for item in self.children:
+            item.disabled = True
+        await inter.response.edit_message(
+            content="🛑 Run setup cancelled.", embed=None, view=self
+        )
+
+
+class RunDetailsModal(discord.ui.Modal):
+    """Mode-specific second step, opened by a button interaction."""
+
+    def __init__(self, *, owner_id: int, alt_id: int, ad_type: str):
+        super().__init__(title=f"{ad_type.title()} ad details", timeout=300)
+        self.owner_id = owner_id
+        self.alt_id = alt_id
+        self.ad_type = ad_type
+
+        if ad_type == "sell":
+            self.rate_input = discord.ui.TextInput(
+                label="Sell rate (for example 2.5$)",
+                custom_id="sell_rate",
+                placeholder="2.5$",
+                default="2.5$",
+                required=True,
+                max_length=20,
+            )
+            self.extra_input = discord.ui.TextInput(
+                label="Extra text after the rate",
+                custom_id="sell_extra",
+                placeholder="DM ME QUICK CAN DO SMALL AND BIG AMOUNTS",
+                default="DM ME QUICK CAN DO SMALL AND BIG AMOUNTS",
+                required=False,
+                max_length=500,
+            )
+            self.add_item(self.rate_input)
+            self.add_item(self.extra_input)
+        else:
+            self.rate_input = discord.ui.TextInput(
+                label="Token rate (for example 2.2)",
+                custom_id="buy_rate",
+                placeholder="2.2",
+                default="2.2",
+                required=True,
+                max_length=20,
+            )
+            self.rap_input = discord.ui.TextInput(
+                label="RAP rate (for example 1.8)",
+                custom_id="buy_rate_rap",
+                placeholder="1.8",
+                default="1.8",
+                required=True,
+                max_length=20,
+            )
+            self.style_input = discord.ui.TextInput(
+                label="Buy style: detailed or simple",
+                custom_id="buy_style",
+                placeholder="detailed",
+                default="detailed",
+                required=True,
+                max_length=8,
+            )
+            self.simple_input = discord.ui.TextInput(
+                label="Simple buy text (only for simple style)",
+                custom_id="buy_simple_text",
+                placeholder="BUYING ALL BLADE BALL DM ME QUICK",
+                required=False,
+                max_length=1900,
+            )
+            for item in (self.rate_input, self.rap_input, self.style_input, self.simple_input):
+                self.add_item(item)
 
     async def on_submit(self, inter: discord.Interaction) -> None:
-        values = {
-            "alt_id": (self.alt_id.value or "").strip(),
-            "ad_type": (self.ad_type.value or "").strip().lower(),
-            "sell_rate": (self.sell_rate.value or "").strip(),
-            "sell_extra": (self.sell_extra.value or "").strip(),
-            "buy_rate_rap": (self.buy_rate_rap.value or "").strip(),
-        }
-        errors = _validate_run_page_one(values)
-        if errors:
-            await inter.response.send_message("❌ " + " ".join(errors), ephemeral=True)
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message(
+                "🔒 This private /run form belongs to another operator.", ephemeral=True
+            )
             return
-        await inter.response.send_modal(RunOptionsModal(values))
+        try:
+            values = {
+                "alt_id": str(self.alt_id),
+                "ad_type": self.ad_type,
+                "interval_min": "5",
+                "total_hours": "6",
+                "attach_image": "yes",
+            }
+            if self.ad_type == "sell":
+                values.update({
+                    "sell_rate": self.rate_input.value.strip(),
+                    "sell_extra": self.extra_input.value.strip(),
+                })
+            else:
+                values.update({
+                    "buy_rate": self.rate_input.value.strip(),
+                    "buy_rate_rap": self.rap_input.value.strip(),
+                    "buy_style": self.style_input.value.strip().lower(),
+                    "buy_simple_text": self.simple_input.value.strip(),
+                })
+            errors, parsed = _validate_run_values(values)
+            if errors:
+                await inter.response.send_message(
+                    "❌ " + " ".join(errors), ephemeral=True
+                )
+                return
+            settings = RunSettingsView(owner_id=self.owner_id, values=values, parsed=parsed)
+            await inter.response.send_message(
+                embed=settings.embed(), view=settings, ephemeral=True
+            )
+        except Exception as exc:
+            await _private_interaction_error(inter, f"❌ Could not prepare the run form: {exc}")
 
 
-class RunOptionsModal(discord.ui.Modal, title="Start an alt run · 2/2"):
-    """Second page of the run form; submits the workflow after validation."""
+class RunSettingsView(discord.ui.View):
+    """Private final step: common timing/image choices and Start button."""
 
-    def __init__(self, page_one: dict[str, str]):
-        super().__init__()
-        self.page_one = page_one
+    def __init__(self, *, owner_id: int, values: dict[str, str], parsed: dict[str, object]):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.values = dict(values)
+        self.parsed = dict(parsed)
 
-    buy_style = discord.ui.TextInput(
-        label="Buy style (detailed or simple)", custom_id="buy_style",
-        placeholder="detailed", default="detailed", required=True, max_length=8,
-    )
-    buy_simple_text = discord.ui.TextInput(
-        label="Buy simple text (full message)", custom_id="buy_simple_text",
-        placeholder="BUYING ALL BLADE BALL DM ME QUICK",
-        default="BUYING ALL BLADE BALL DM ME QUICK",
-        required=False, max_length=1900,
-    )
-    interval_min = discord.ui.TextInput(
-        label="Interval minutes (3 or 5)", custom_id="interval_min",
-        placeholder="5", default="5", required=True, max_length=2,
-    )
-    total_hours = discord.ui.TextInput(
-        label="Total hours (6, 12, 18, 24, or 48)", custom_id="total_hours",
-        placeholder="6", default="6", required=True, max_length=2,
-    )
-    attach_image = discord.ui.TextInput(
-        label="Attach image? (yes or no)", custom_id="attach_image",
-        placeholder="yes", default="yes", required=True, max_length=3,
+        self.interval_select = discord.ui.Select(
+            placeholder="Interval: 5 minutes",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="3 minutes", value="3"),
+                discord.SelectOption(label="5 minutes", value="5", default=True),
+            ],
+            row=0,
+        )
+        self.interval_select.callback = self._select_interval
+        self.add_item(self.interval_select)
+
+        self.hours_select = discord.ui.Select(
+            placeholder="Runtime: 6 hours",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=f"{hours} hours", value=str(hours), default=hours == 6)
+                for hours in (6, 12, 18, 24, 48)
+            ],
+            row=1,
+        )
+        self.hours_select.callback = self._select_hours
+        self.add_item(self.hours_select)
+
+        self.image_select = discord.ui.Select(
+            placeholder="Image: yes",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Attach image after warmup", value="yes", emoji="🖼️", default=True),
+                discord.SelectOption(label="Text only", value="no", emoji="💬"),
+            ],
+            row=2,
+        )
+        self.image_select.callback = self._select_image
+        self.add_item(self.image_select)
+
+        self.start_button = discord.ui.Button(
+            label="Start run",
+            style=discord.ButtonStyle.success,
+            emoji="🚀",
+            row=3,
+        )
+        self.start_button.callback = self._start
+        self.add_item(self.start_button)
+
+        self.cancel_button = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.secondary,
+            row=3,
+        )
+        self.cancel_button.callback = self._cancel
+        self.add_item(self.cancel_button)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message(
+                "🔒 This private /run form belongs to another operator.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _select_interval(self, inter: discord.Interaction) -> None:
+        self.values["interval_min"] = self.interval_select.values[0]
+        self.parsed["interval"] = int(self.values["interval_min"])
+        _set_selected_option(self.interval_select, self.values["interval_min"])
+        await inter.response.edit_message(embed=self.embed(), view=self)
+
+    async def _select_hours(self, inter: discord.Interaction) -> None:
+        self.values["total_hours"] = self.hours_select.values[0]
+        self.parsed["hours"] = int(self.values["total_hours"])
+        _set_selected_option(self.hours_select, self.values["total_hours"])
+        await inter.response.edit_message(embed=self.embed(), view=self)
+
+    async def _select_image(self, inter: discord.Interaction) -> None:
+        self.values["attach_image"] = self.image_select.values[0]
+        _set_selected_option(self.image_select, self.values["attach_image"])
+        await inter.response.edit_message(embed=self.embed(), view=self)
+
+    async def _start(self, inter: discord.Interaction) -> None:
+        try:
+            errors, parsed = _validate_run_values(self.values)
+            if errors:
+                await inter.response.send_message("❌ " + " ".join(errors), ephemeral=True)
+                return
+            await _dispatch_run_from_modal(inter, self.values, parsed)
+        except Exception as exc:
+            await _private_interaction_error(inter, f"❌ Could not start the run: {exc}")
+
+    async def _cancel(self, inter: discord.Interaction) -> None:
+        for item in self.children:
+            item.disabled = True
+        await inter.response.edit_message(
+            content="🛑 Run setup cancelled.", embed=None, view=self
+        )
+
+    def embed(self) -> discord.Embed:
+        alt = state.get(int(self.values["alt_id"]))
+        alt_name = alt.name if alt else f"Alt {self.values['alt_id']}"
+        embed = discord.Embed(
+            title="⚙️ Run settings",
+            description=f"**{alt_name}** · {_ad_icon(self.values['ad_type'])} `{self.values['ad_type']}`\n"
+                        "Choose the common settings, then press **Start run**.",
+            color=0x5865F2,
+        )
+        if self.values["ad_type"] == "sell":
+            detail = f"Rate: `{self.values.get('sell_rate', '')}`\nExtra: `{self.values.get('sell_extra', '')[:180]}`"
+        else:
+            detail = (
+                f"Tokens: `{self.values.get('buy_rate', '')}` · RAP: `{self.values.get('buy_rate_rap', '')}`\n"
+                f"Style: `{self.values.get('buy_style', '')}`\n"
+                f"Text: `{self.values.get('buy_simple_text', '')[:180]}`"
+            )
+        embed.add_field(name="Ad details", value=detail[:1000] or "—", inline=False)
+        embed.add_field(name="Interval", value=f"`{self.values.get('interval_min', '5')} min`", inline=True)
+        embed.add_field(name="Runtime", value=f"`{self.values.get('total_hours', '6')} h`", inline=True)
+        embed.add_field(name="Image", value=f"`{self.values.get('attach_image', 'yes')}`", inline=True)
+        return embed
+
+
+def _run_start_embed(view: RunStartView) -> discord.Embed:
+    alt_text = "not selected"
+    if view.alt_id is not None:
+        alt = state.get(view.alt_id)
+        alt_text = f"{alt.name} (Alt {view.alt_id})" if alt else f"Alt {view.alt_id}"
+    mode_text = view.ad_type or "not selected"
+    return discord.Embed(
+        title="🚀 Start an alt run · Step 1 of 3",
+        description=(
+            "This private setup is visible only to you.\n\n"
+            f"Alt: **{alt_text}**\n"
+            f"Ad type: **{_ad_icon(view.ad_type or '')} {mode_text}**\n\n"
+            "Choose both values, then press **Continue**."
+        ),
+        color=0x5865F2,
     )
 
-    async def on_submit(self, inter: discord.Interaction) -> None:
-        values = {
-            **self.page_one,
-            "buy_style": (self.buy_style.value or "").strip().lower(),
-            "buy_simple_text": (self.buy_simple_text.value or "").strip(),
-            "interval_min": (self.interval_min.value or "").strip(),
-            "total_hours": (self.total_hours.value or "").strip(),
-            "attach_image": (self.attach_image.value or "").strip().lower(),
-        }
-        errors, parsed = _validate_run_values(values)
-        if errors:
-            await inter.response.send_message("❌ " + " ".join(errors), ephemeral=True)
-            return
-        await _dispatch_run_from_modal(inter, values, parsed)
+
+async def _private_interaction_error(inter: discord.Interaction, text: str) -> None:
+    """Keep /run errors private whether the interaction was already deferred."""
+    try:
+        if inter.response.is_done():
+            await inter.followup.send(text, ephemeral=True)
+        else:
+            await inter.response.send_message(text, ephemeral=True)
+    except Exception:
+        # There is no useful second response if Discord rejected the first one.
+        pass
 
 
 def _validate_run_page_one(values: dict[str, str]) -> list[str]:
-    errors: list[str] = []
-    raw_alt_id = values.get("alt_id", "").strip()
-    if raw_alt_id not in {"1", "2", "3", "4"}:
-        errors.append("alt_id must be exactly 1, 2, 3, or 4.")
-    else:
-        alt_id = int(raw_alt_id)
-        if alt_id not in config.ALT_REPOS:
-            errors.append(f"Alt {alt_id} is not configured in ALT_REPOS.")
-    if values["ad_type"] not in ("sell", "buy"):
-        errors.append("ad_type must be sell or buy.")
-    rate = _extract_price(values["sell_rate"])
-    if rate is None or not 0 < rate <= 20:
-        errors.append("sell_rate must contain a number between 0 and 20, for example 2.5$.")
-    rap = _extract_price(values["buy_rate_rap"])
-    if values["ad_type"] == "buy" and (rap is None or not 0 < rap <= 20):
-        errors.append("buy_rate_rap must contain a number between 0 and 20, for example 1.8.")
-    if len(values["sell_extra"]) > 500:
-        errors.append("sell_extra is limited to 500 characters.")
-    return errors
+    """Compatibility helper for callers that validate only ad details."""
+    return _validate_run_values({
+        **values,
+        "interval_min": values.get("interval_min", "5"),
+        "total_hours": values.get("total_hours", "6"),
+        "attach_image": values.get("attach_image", "yes"),
+    })[0]
 
 
 def _validate_run_values(values: dict[str, str]) -> tuple[list[str], dict[str, object]]:
-    errors = _validate_run_page_one(values)
-    style = values["buy_style"]
-    if style not in ("detailed", "simple"):
-        errors.append("buy_style must be detailed or simple.")
-    if style == "simple" and values["ad_type"] == "buy" and not values["buy_simple_text"]:
-        errors.append("buy_simple_text is required for a simple buy run.")
-    if len(values["buy_simple_text"]) > 1900:
-        errors.append("buy_simple_text is limited to 1900 characters.")
+    errors: list[str] = []
+    raw_alt_id = values.get("alt_id", "").strip()
+    if raw_alt_id not in {str(i) for i in state.alt_ids}:
+        errors.append("Choose one of the configured alts.")
     try:
-        interval = int(values["interval_min"])
-        if interval not in (3, 5):
-            errors.append("interval_min must be 3 or 5.")
-    except ValueError:
-        interval = 0
-        errors.append("interval_min must be 3 or 5.")
-    try:
-        hours = int(values["total_hours"])
-        if hours not in (6, 12, 18, 24, 48):
-            errors.append("total_hours must be 6, 12, 18, 24, or 48.")
-    except ValueError:
-        hours = 0
-        errors.append("total_hours must be 6, 12, 18, 24, or 48.")
-    if values["attach_image"] not in ("yes", "no"):
-        errors.append("attach_image must be yes or no.")
-    try:
-        parsed_alt_id = int(values["alt_id"])
+        parsed_alt_id = int(raw_alt_id)
     except (TypeError, ValueError):
         parsed_alt_id = 0
+
+    ad_type = values.get("ad_type", "").strip().lower()
+    if ad_type not in ("sell", "buy"):
+        errors.append("ad_type must be sell or buy.")
+
+    if ad_type == "sell":
+        rate = _extract_price(values.get("sell_rate", ""))
+        if rate is None or not 0 < rate <= 20:
+            errors.append("Sell rate must contain a number between 0 and 20, for example 2.5$.")
+        if len(values.get("sell_extra", "")) > 500:
+            errors.append("Sell extra text is limited to 500 characters.")
+        rap = None
+    elif ad_type == "buy":
+        rate = _extract_price(values.get("buy_rate", ""))
+        if rate is None or not 0 < rate <= 20:
+            errors.append("Token rate must contain a number between 0 and 20, for example 2.2.")
+        rap = _extract_price(values.get("buy_rate_rap", ""))
+        if rap is None or not 0 < rap <= 20:
+            errors.append("RAP rate must contain a number between 0 and 20, for example 1.8.")
+        style = values.get("buy_style", "").strip().lower()
+        if style not in ("detailed", "simple"):
+            errors.append("Buy style must be detailed or simple.")
+        simple_text = values.get("buy_simple_text", "").strip()
+        if style == "simple" and not simple_text:
+            errors.append("Simple buy text is required when using simple style.")
+        if len(simple_text) > 1900:
+            errors.append("Simple buy text is limited to 1900 characters.")
+    else:
+        rate = None
+        rap = None
+
+    try:
+        interval = int(values.get("interval_min", ""))
+        if interval not in (3, 5):
+            errors.append("Interval must be 3 or 5 minutes.")
+    except (TypeError, ValueError):
+        interval = 0
+        errors.append("Interval must be 3 or 5 minutes.")
+
+    try:
+        hours = int(values.get("total_hours", ""))
+        if hours not in (6, 12, 18, 24, 48):
+            errors.append("Runtime must be 6, 12, 24,  or 48 hours.")
+    except (TypeError, ValueError):
+        hours = 0
+        errors.append("Runtime must be 6, 12, 18, 24, or 48 hours.")
+
+    attach_image = values.get("attach_image", "").strip().lower()
+    if attach_image not in ("yes", "no"):
+        errors.append("Image setting must be yes or no.")
+
     parsed = {
         "alt_id": parsed_alt_id,
-        "rate": _extract_price(values["sell_rate"]),
-        "rap": _extract_price(values["buy_rate_rap"]),
+        "rate": rate,
+        "rap": rap,
         "interval": interval,
         "hours": hours,
     }
@@ -312,19 +614,29 @@ async def _dispatch_run_from_modal(
     inter: discord.Interaction, values: dict[str, str], parsed: dict[str, object]
 ) -> None:
     """Cancel the previous run, dispatch the new workflow, and acknowledge it."""
-    # The /run command already consumed the owner's cooldown before opening
-    # the first modal. Do not consume it a second time on modal submission.
     if not _is_owner(inter):
-        await inter.response.send_message(
-            "🔒 You aren't authorized to run control commands.", ephemeral=True
+        await _private_interaction_error(
+            inter, "🔒 You aren't authorized to run control commands."
         )
         return
-    # Defer ephemerally so every error path below remains private.
-    await inter.response.defer(ephemeral=True)
+    if not inter.response.is_done():
+        await inter.response.defer(ephemeral=True)
     alt_id = int(parsed["alt_id"])
     a = state.get(alt_id)
     if not a:
         await inter.followup.send(f"❓ Unknown alt {alt_id}.", ephemeral=True)
+        return
+    if not config.GITHUB_TOKEN:
+        await inter.followup.send(
+            "❌ GitHub control is not configured: GH_TOKEN is missing.", ephemeral=True
+        )
+        return
+    if not config.GITHUB_OWNER or not config.ALT_REPOS:
+        await inter.followup.send(
+            "❌ GitHub control is not configured: ALT_GITHUB_OWNER/ALT_REPOS are missing. "
+            "Update the core Control Bot workflow and restart it.",
+            ephemeral=True,
+        )
         return
 
     ad_type = values["ad_type"]
@@ -343,16 +655,14 @@ async def _dispatch_run_from_modal(
     if ad_type == "sell":
         inputs.update({
             "sell_rate": values["sell_rate"],
-            "sell_extra": values["sell_extra"],
+            "sell_extra": values.get("sell_extra", ""),
         })
     else:
         inputs.update({
-            # The modal's sell_rate field is the token rate in buy mode. The
-            # workflow already calls this input buy_rate.
             "buy_style": values["buy_style"],
             "buy_rate": f"{rate:g}",
             "buy_rate_rap": f"{rap:g}",
-            "buy_simple_text": values["buy_simple_text"],
+            "buy_simple_text": values.get("buy_simple_text", ""),
         })
 
     try:
@@ -370,11 +680,11 @@ async def _dispatch_run_from_modal(
         return
 
     state.set_workflow(alt_id, run_id=None, status="queued", conclusion="")
-    preview = values["sell_extra"] if ad_type == "sell" else (
-        values["buy_simple_text"] or f"BUYING BLADE BALL TOKENS {rate:g}/1K RAP {rap:g}/1K"
+    preview = values.get("sell_extra", "") if ad_type == "sell" else (
+        values.get("buy_simple_text", "") or f"BUYING BLADE BALL TOKENS {rate:g}/1K RAP {rap:g}/1K"
     )
     state.set_run_config(alt_id, ad_type=ad_type, rate=rate, message=preview)
-    rate_str = values["sell_rate"] if ad_type == "sell" else f"tok {rate:g} / rap {rap:g}"
+    rate_str = values.get("sell_rate", "") if ad_type == "sell" else f"tok {rate:g} / rap {rap:g}"
     log_line = (
         f"🚀 **{a.name}** STARTED — {ad_type} {rate_str} · "
         f"{values['interval_min']}min × {values['total_hours']}h · img={values['attach_image']}\n{msg}"
@@ -388,11 +698,31 @@ async def _dispatch_run_from_modal(
     )
 
 
-@bot.tree.command(name="run", description="Start an alt run using a pop-up form.")
+@bot.tree.command(name="run", description="Start an alt run using a private 3-step form.")
 async def cmd_run(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
-    await inter.response.send_modal(RunModal())
+    if not state.alt_ids:
+        await inter.response.send_message(
+            "❌ No configured alts are available. Check ALT_REPOS and ALT_DISCORD_IDS.",
+            ephemeral=True,
+        )
+        return
+    if not config.GITHUB_TOKEN:
+        await inter.response.send_message(
+            "❌ GitHub control is not configured: GH_TOKEN is missing.",
+            ephemeral=True,
+        )
+        return
+    if not config.GITHUB_OWNER or not config.ALT_REPOS:
+        await inter.response.send_message(
+            "❌ GitHub control is not configured: ALT_GITHUB_OWNER/ALT_REPOS are missing. "
+            "Restart the Control Bot after updating the core workflow.",
+            ephemeral=True,
+        )
+        return
+    view = RunStartView(owner_id=inter.user.id)
+    await inter.response.send_message(embed=_run_start_embed(view), view=view, ephemeral=True)
 
 
 # Alt autocomplete: alt parameter on commands that take an int
@@ -407,7 +737,7 @@ async def alt_autocomplete(inter: discord.Interaction, current: str):
     return out[:25]
 
 
-# Decorator to add alt autocomplete to the right params
+# Decorator to add autocomplete to the right params
 def alt_param(fn):
     # We apply choices via autocomplete at registration time — see cmd registration below.
     return fn

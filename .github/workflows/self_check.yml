@@ -97,6 +97,7 @@ jobs:
 
       - name: Cloudflare WARP
         if: steps.warp_check.outputs.should_warp == 'true'
+        continue-on-error: true
         uses: sebst/actions-warp@v1
         with:
           tos: 'YES'

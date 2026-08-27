@@ -635,7 +635,7 @@ class Bootstrap:
             "LOG_CH_ID": self.channels["farm-logs"],
             "OWNER_IDS": self.owner_id,
             "GH_TOKEN": self.gh_token,
-            "GITHUB_OWNER": self.github_owner,
+            "ALT_GITHUB_OWNER": self.github_owner,
             "ALT_REPOS": repo_map,
             "ALT_DISCORD_IDS": id_map,
             "ALT_NAMES": name_map,

@@ -11,7 +11,7 @@
 #                                                                             #
 # Required repo secrets (on the CORE repo):                                   #
 #   BOT_TOKEN, GUILD_ID, CONTROL_CH_ID, DASHBOARD_CH_ID, LOG_CH_ID, OWNER_IDS,#
-#   GH_TOKEN, GITHUB_OWNER, ALT_REPOS, ALT_DISCORD_IDS, ALT_NAMES              #
+#   GH_TOKEN, ALT_GITHUB_OWNER, ALT_REPOS, ALT_DISCORD_IDS, ALT_NAMES              #
 #   Optional: TUNING_JSON                                                      #
 # --------------------------------------------------------------------------- #
 
@@ -102,7 +102,7 @@ jobs:
           DASHBOARD_CH_ID: ${{ secrets.DASHBOARD_CH_ID }}
           OWNER_IDS: ${{ secrets.OWNER_IDS }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GITHUB_OWNER: ${{ secrets.GITHUB_OWNER }}
+          GITHUB_OWNER: ${{ secrets.ALT_GITHUB_OWNER }}
           ALT_REPOS: ${{ secrets.ALT_REPOS }}
           ALT_DISCORD_IDS: ${{ secrets.ALT_DISCORD_IDS }}
           ALT_NAMES: ${{ secrets.ALT_NAMES }}
