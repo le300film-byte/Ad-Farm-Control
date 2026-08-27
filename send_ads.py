@@ -2073,50 +2073,120 @@ _DATACENTER_KWS = ("microsoft", "azure", "amazon", "aws", "google", "ovh",
                    "alibaba", "tencent", "digital ocean")
 
 def _lookup_egress():
-    """Resolve the actual session egress and ask an independent risk provider.
+    """Resolve actual egress through the runner's verified HTTPS route.
 
-    The provider response is required, not merely logged: an arbitrary non-empty
-    ASN/org string is not proof that the route is outside a datacenter. IPWHO's
-    hosting flag and connection type provide a second signal alongside the
-    explicit provider-name deny-list below. The same SESSION carries the
-    configured HTTPS proxy (or the system WARP route), so the lookup measures
-    the route the sender will use.
+    The workflow verifies this route successfully with curl. Some WARP runners
+    cannot make the provider requests through curl_cffi even though normal
+    HTTPS traffic is working, which caused a false ? / ? / ? failure here.
+    Keep the provider, hosting, and country checks fail-closed.
     """
     details = {
         "ip": "?", "org": "?", "country": "", "country_name": "?",
         "verified": False, "hosting": False, "connection_type": "",
     }
+
+    def _fetch_json(url: str):
+        import subprocess
+        from urllib.request import Request, ProxyHandler, build_opener
+
+        proxy = (HTTPS_PROXY or "").strip()
+        command = [
+            "curl", "-fsSL", "--max-time", "10", "--retry", "1"
+        ]
+
+        if proxy:
+            command.extend(["--proxy", proxy])
+        else:
+            command.extend(["--noproxy", "*"])
+
+        command.append(url)
+
+        try:
+            raw = subprocess.check_output(
+                command,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+
+        # Fallback for environments where curl is unavailable.
+        try:
+            if proxy:
+                handler = ProxyHandler({
+                    "http": proxy,
+                    "https": proxy,
+                })
+            else:
+                handler = ProxyHandler({})
+
+            opener = build_opener(handler)
+            request = Request(
+                url,
+                headers={"User-Agent": "adfarm-egress-check/1"},
+            )
+
+            with opener.open(request, timeout=10) as response:
+                payload = json.loads(
+                    response.read().decode("utf-8", errors="replace")
+                )
+
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
     try:
-        r = SESSION.get("https://api.ipify.org?format=json", timeout=10)
-        if r.status_code != 200:
-            return details
-        ip = r.json().get("ip")
+        ip_payload = _fetch_json(
+            "https://api.ipify.org?format=json"
+        ) or {}
+
+        ip = ip_payload.get("ip")
         if not isinstance(ip, str) or not ip.strip():
             return details
+
         details["ip"] = ip.strip()
-        risk = SESSION.get(f"https://ipwho.is/{ip}", timeout=10)
-        if risk.status_code != 200:
+
+        payload = _fetch_json(
+            f"https://ipwho.is/{details['ip']}"
+        ) or {}
+
+        if payload.get("success") is False:
             return details
-        payload = risk.json()
-        if not isinstance(payload, dict) or payload.get("success") is False:
-            return details
+
         connection = payload.get("connection") or {}
         security = payload.get("security") or {}
-        if not isinstance(connection, dict) or not isinstance(security, dict):
+
+        if not isinstance(connection, dict):
             return details
+        if not isinstance(security, dict):
+            return details
+
         org = connection.get("org") or connection.get("isp")
         if not isinstance(org, str) or not org.strip():
             return details
+
         details["org"] = org.strip().lower()
-        details["country"] = str(payload.get("country_code") or "").upper()
-        details["country_name"] = str(payload.get("country") or "?")
-        details["connection_type"] = str(connection.get("type") or "").lower()
-        details["hosting"] = bool(security.get("hosting")) or any(
+        details["country"] = str(
+            payload.get("country_code") or ""
+        ).upper()
+        details["country_name"] = str(
+            payload.get("country") or "?"
+        )
+        details["connection_type"] = str(
+            connection.get("type") or ""
+        ).lower()
+        details["hosting"] = bool(
+            security.get("hosting")
+        ) or any(
             marker in details["connection_type"]
             for marker in ("hosting", "datacenter", "data center")
         )
         details["verified"] = True
         return details
+
     except Exception:
         return details
 
