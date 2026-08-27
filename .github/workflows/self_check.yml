@@ -1,0 +1,415 @@
+# --------------------------------------------------------------------------- #
+# SELF-CHECK — Validate all secrets/vars are present and actually work.      #
+# --------------------------------------------------------------------------- #
+# Fires:
+#   - Manually: Actions tab → "🔍 Self-Check Secrets" → Run workflow.
+#   - Automatically on push to send_ads.py / self_check.yml (so you catch
+#     breakages after a sync immediately).
+#
+# What it tests:
+#   1. All required + recommended secrets are present (non-empty).
+#   2. USER_TOKEN authenticates against Discord (GET /users/@me → 200).
+#   3. Every CHANNEL_ID is reachable (GET /channels/:id → 200, logs slowmode).
+#   4. Webhook URLs are reachable (POST a short test ping, then DELETE it).
+#   5. GIST_TOKEN + GIST_ID work (can read the gist).
+#   6. CONTROL_GIST_ID (if set) is reachable via GIST_TOKEN.
+#   7. WARP / HTTPS_PROXY routing: IP is NOT a known datacenter.
+#   8. CONTROLLER_USER_IDS look like snowflakes.
+#   9. ALT_ID / ALT_NAME are sane (ALT_ID is a number ≥ 0).
+#  10. send_ads.py parses (import-time compile check) and self-tests pass.
+#
+# Takes a few minutes when routing or Discord API calls need retries. No ad
+# is ever posted; this is read-only plus tiny webhook test messages it cleans up.
+# --------------------------------------------------------------------------- #
+
+name: "🔍 Self-Check Secrets"
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "send_ads.py"
+      - ".github/workflows/self_check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  self-check:
+    name: "Validate secrets & connectivity"
+    runs-on: ubuntu-latest
+    # Routing/API checks may wait through retries; keep this longer than the
+    # script's 180-second sender self-test timeout and the bootstrap poll.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet 'curl_cffi>=0.6.0'
+
+      - name: Validate TUNING_JSON
+        env:
+          TUNING_JSON: ${{ secrets.TUNING_JSON }}
+        shell: python
+        run: |
+          import json
+          import os
+          import sys
+
+          raw = os.environ.get("TUNING_JSON", "").strip()
+          if not raw:
+              print("TUNING_JSON is empty; using application defaults.")
+              raise SystemExit(0)
+          try:
+              value = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              print(f"TUNING_JSON must be valid JSON: {exc}")
+              raise SystemExit(1)
+          if not isinstance(value, dict):
+              print("TUNING_JSON must be a JSON object.")
+              raise SystemExit(1)
+          print("TUNING_JSON is a valid JSON object.")
+
+      - name: Decide WARP usage
+        id: warp_check
+        env:
+          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          WARP_ENABLED: ${{ secrets.WARP_ENABLED }}
+        shell: bash
+        run: |
+          if [ -n "${HTTPS_PROXY:-}${HTTP_PROXY:-}" ]; then
+            echo "should_warp=false" >> "$GITHUB_OUTPUT"
+            echo "🔵 Proxy set — skipping WARP."
+          elif [ "${WARP_ENABLED:-1}" = "0" ]; then
+            echo "should_warp=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ WARP disabled."
+          else
+            echo "should_warp=true" >> "$GITHUB_OUTPUT"
+            echo "🟢 WARP enabled."
+          fi
+
+      - name: Cloudflare WARP
+        if: steps.warp_check.outputs.should_warp == 'true'
+        uses: sebst/actions-warp@v1
+        with:
+          tos: 'YES'
+
+      - name: Run self-check
+        env:
+          # Pass ALL alt secrets through — the test script inspects & validates
+          # whatever is set, only fails on REQUIRED missing/invalid.
+          USER_TOKEN: ${{ secrets.USER_TOKEN }}
+          CHANNEL_IDS: ${{ secrets.CHANNEL_IDS }}
+          CHANNEL_NAMES: ${{ secrets.CHANNEL_NAMES }}
+          AD_TYPE: sell  # dummy for validation
+          MESSAGE: "self-test message — will not be posted"
+          RATE: 2.5
+          INTERVAL_MIN: 5
+          TOTAL_RUN_MIN: 5
+          LOG_WEBHOOK_URL: ${{ secrets.LOG_WEBHOOK_URL }}
+          DASHBOARD_WEBHOOK_URL: ${{ secrets.DASHBOARD_WEBHOOK_URL }}
+          DM_WEBHOOK_URL: ${{ secrets.DM_WEBHOOK_URL }}
+          TUNING_JSON: ${{ secrets.TUNING_JSON }}
+          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          WARP_ENABLED: ${{ secrets.WARP_ENABLED }}
+          ALLOWED_COUNTRIES: ${{ secrets.ALLOWED_COUNTRIES }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          CONTROL_GIST_ID: ${{ secrets.CONTROL_GIST_ID }}
+          CONTROLLER_USER_IDS: ${{ secrets.CONTROLLER_USER_IDS }}
+          PANIC_TRUSTED_IDS: ${{ secrets.PANIC_TRUSTED_IDS }}
+          CONFIRM_USER_IDS: ${{ secrets.CONFIRM_USER_IDS }}
+          ALT_ID: ${{ vars.ALT_ID }}
+          ALT_NAME: ${{ vars.ALT_NAME }}
+          HEARTBEAT_INTERVAL_SEC: ${{ secrets.HEARTBEAT_INTERVAL_SEC }}
+          WEBHOOK_TIMEOUT: ${{ secrets.WEBHOOK_TIMEOUT }}
+          DM_WEBHOOK_TIMEOUT: ${{ secrets.DM_WEBHOOK_TIMEOUT }}
+          SELF_CHECK: "1"  # flag used below
+        shell: bash
+        run: |
+          cat > /tmp/self_check.py <<'PYEOF'
+          import os, sys, time, json, base64, re
+          import urllib.request, urllib.error
+          try:
+              from curl_cffi import requests as creq
+              BROWSER = "chrome124"
+          except Exception as e:
+              print(f"❌ curl_cffi import failed: {e}")
+              sys.exit(2)
+
+          PASSED = 0
+          FAILED = 0
+          WARNINGS = 0
+
+          RED = "\033[0;31m"; GRN = "\033[0;32m"; YLW = "\033[0;33m"; RST = "\033[0m"
+          def ok(msg):
+              global PASSED; PASSED += 1; print(f"{GRN}✅ PASS{RST} {msg}")
+          def fail(msg):
+              global FAILED; FAILED += 1; print(f"{RED}❌ FAIL{RST} {msg}")
+          def warn(msg):
+              global WARNINGS; WARNINGS += 1; print(f"{YLW}⚠️  WARN{RST} {msg}")
+          def info(msg):
+              print(f"   • {msg}")
+
+          API = "https://discord.com/api/v9"
+          HEADERS = {"Authorization": os.environ.get("USER_TOKEN",""),
+                     "User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
+          PROXIES = None
+          proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+          if proxy:
+              PROXIES = {"http": proxy, "https": proxy}
+
+          # Import send_ads for AST/self-test. We have to do a compile-only check
+          # because full import will try to run.
+          print("\n━━━━━ 1. Required secrets present ━━━━━")
+          for req in ["USER_TOKEN", "CHANNEL_IDS"]:
+              v = os.environ.get(req, "").strip()
+              if v: ok(f"{req} is set ({len(v)} chars)")
+              else: fail(f"{req} is MISSING (required)")
+
+          if FAILED:
+              print(f"\n{RED}Cannot continue — required secrets missing.{RST}")
+              sys.exit(1)
+
+          # ALT_ID / ALT_NAME sanity
+          print("\n━━━━━ 2. Alt identity ━━━━━")
+          alt_id_raw = os.environ.get("ALT_ID", "").strip()
+          try:
+              alt_id = int(alt_id_raw) if alt_id_raw else 0
+              if alt_id < 0 or alt_id > 99:
+                  warn(f"ALT_ID={alt_id} looks odd (should be 0 for single, 1..N for multi)")
+              else:
+                  ok(f"ALT_ID={alt_id}")
+          except Exception:
+              fail(f"ALT_ID='{alt_id_raw}' is not a number")
+              alt_id = 0
+          alt_name = os.environ.get("ALT_NAME", "").strip() or f"Alt{alt_id or '?'}"
+          ok(f"ALT_NAME={alt_name}")
+
+          # CHANNEL_IDS parse
+          print("\n━━━━━ 3. Channels reachable ━━━━━")
+          ch_str = os.environ["CHANNEL_IDS"]
+          channels = [c.strip() for c in ch_str.split(",") if c.strip()]
+          for cid in channels:
+              if not cid.isdigit():
+                  fail(f"channel '{cid}' is not a numeric snowflake")
+                  continue
+              try:
+                  r = creq.get(f"{API}/channels/{cid}", headers=HEADERS, proxies=PROXIES,
+                              impersonate=BROWSER, timeout=15)
+                  if r.status_code == 200:
+                      j = r.json()
+                      name = j.get("name", "?")
+                      slow = j.get("rate_limit_per_user", 0)
+                      ok(f"channel {cid} (#{name}) accessible" + (f" — slowmode {slow}s" if slow else ""))
+                  elif r.status_code == 403:
+                      fail(f"channel {cid} returned 403 — alt can't see it (not joined/no perms)")
+                  elif r.status_code == 404:
+                      warn(f"channel {cid} returned 404 — deleted/moved (auto-discovery handles this on run)")
+                  else:
+                      fail(f"channel {cid} HTTP {r.status_code}: {r.text[:120]}")
+              except Exception as e:
+                  fail(f"channel {cid} request error: {type(e).__name__}: {e}")
+
+          # Auth check (double down with @me)
+          print("\n━━━━━ 4. Discord auth ━━━━━")
+          try:
+              r = creq.get(f"{API}/users/@me", headers=HEADERS, proxies=PROXIES,
+                          impersonate=BROWSER, timeout=15)
+              if r.status_code == 200:
+                  me = r.json()
+                  uname = me.get("username") or me.get("global_name") or "?"
+                  uid = me.get("id", "?")
+                  email = "✓ verified" if me.get("verified") else "not verified"
+                  phone = "✓ phone" if me.get("phone") else "no phone"
+                  ok(f"USER_TOKEN valid — @{uname} (id {uid}) · {email} · {phone}")
+                  if alt_id and os.environ.get("ALT_DISCORD_IDS_EXPECTED", "").strip():
+                      expected = os.environ["ALT_DISCORD_IDS_EXPECTED"]
+                      if str(uid) != str(expected):
+                          warn(f"token's user id {uid} != expected ALT_DISCORD_IDS entry {expected}")
+              elif r.status_code == 401:
+                  fail("USER_TOKEN is INVALID (401)")
+              else:
+                  fail(f"USER_TOKEN check failed HTTP {r.status_code}")
+          except Exception as e:
+              fail(f"USER_TOKEN check error: {type(e).__name__}: {e}")
+
+          # Webhook checks
+          print("\n━━━━━ 5. Webhook URLs ━━━━━")
+          def check_webhook(label, env_name):
+              url = os.environ.get(env_name, "").strip()
+              if not url:
+                  warn(f"{label} ({env_name}) not set — optional, skipping")
+                  return
+              if "discord.com/api/webhooks/" not in url:
+                  fail(f"{label} URL doesn't look like a Discord webhook")
+                  return
+              try:
+                  # Send a test message
+                  payload = {"content": f"🔍 Self-check from **{alt_name}** (test ping; will be deleted).",
+                             "allowed_mentions": {"parse": []}}
+                  r = creq.post(url + "?wait=true", json=payload, impersonate=BROWSER,
+                                timeout=20, proxies=PROXIES)
+                  if r.status_code in (200, 204):
+                      # Discord normally returns 200 for ?wait=true, but 204 is
+                      # also a successful webhook response. Never parse JSON from
+                      # a body that is not present.
+                      msg = r.json() if r.status_code == 200 else {}
+                      mid = msg.get("id") if isinstance(msg, dict) else None
+                      ok(f"{label} POST OK")
+                      # Try to clean up when the response supplied a message ID.
+                      if mid:
+                          try:
+                              creq.delete(f"{url}/messages/{mid}", impersonate=BROWSER,
+                                          timeout=10, proxies=PROXIES)
+                              info("   cleaned up test message")
+                          except Exception:
+                              info("   (could not delete — ignore the ping)")
+                      elif r.status_code == 204:
+                          info("   (Discord returned 204; no message ID to delete)")
+                  elif r.status_code == 401:
+                      fail(f"{label} returned 401 — invalid webhook token")
+                  else:
+                      fail(f"{label} returned HTTP {r.status_code}: {r.text[:120]}")
+              except Exception as e:
+                  fail(f"{label} error: {type(e).__name__}: {e}")
+
+          check_webhook("logs", "LOG_WEBHOOK_URL")
+          check_webhook("dashboard", "DASHBOARD_WEBHOOK_URL")
+          check_webhook("dm-forward", "DM_WEBHOOK_URL")
+
+          # Gist checks
+          print("\n━━━━━ 6. Gist access ━━━━━")
+          gist_token = os.environ.get("GIST_TOKEN", "").strip()
+          def check_gist(label, gid):
+              nonlocal_gid = gid
+              if not nonlocal_gid:
+                  warn(f"{label} gist id not set — skipping")
+                  return
+              if not gist_token:
+                  fail(f"{label} gist id set but GIST_TOKEN missing")
+                  return
+              try:
+                  hdrs = {"Authorization": f"token {gist_token}",
+                          "Accept": "application/vnd.github+json",
+                          "User-Agent": "self-check"}
+                  req = urllib.request.Request(f"https://api.github.com/gists/{nonlocal_gid}",
+                                               headers=hdrs)
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      j = json.loads(resp.read())
+                  files = list(j.get("files", {}).keys())
+                  ok(f"{label} gist OK — files: {', '.join(files) or '(empty)'}")
+              except urllib.error.HTTPError as e:
+                  fail(f"{label} gist HTTP {e.code}")
+              except Exception as e:
+                  fail(f"{label} gist error: {type(e).__name__}: {e}")
+          check_gist("blocklist", os.environ.get("GIST_ID","").strip())
+          check_gist("control",   os.environ.get("CONTROL_GIST_ID","").strip())
+          if gist_token and not os.environ.get("GIST_ID","").strip():
+              warn("GIST_TOKEN is set but GIST_ID is not — blocklist persistence disabled")
+
+          # Trusted IDs look like snowflakes
+          print("\n━━━━━ 7. Trusted IDs look valid ━━━━━")
+          snow = re.compile(r"^\d{16,20}$")
+          for name in ["CONTROLLER_USER_IDS", "PANIC_TRUSTED_IDS", "CONFIRM_USER_IDS"]:
+              v = os.environ.get(name, "").strip()
+              if not v:
+                  warn(f"{name} not set")
+                  continue
+              ids = [x.strip() for x in v.split(",") if x.strip()]
+              bad = [x for x in ids if not snow.match(x)]
+              if bad:
+                  fail(f"{name} contains non-snowflake values: {bad}")
+              else:
+                  ok(f"{name} format OK ({len(ids)} IDs)")
+          if os.environ.get("CHANNEL_NAMES", "").strip() and not os.environ.get("CONFIRM_USER_IDS", "").strip():
+              fail("CHANNEL_NAMES is configured but CONFIRM_USER_IDS is empty — auto-discovery would be disabled/fail-closed")
+
+          # IP health
+          print("\n━━━━━ 8. Outbound IP / routing ━━━━━")
+          if os.environ.get("WARP_ENABLED", "").strip() == "0" and not proxy:
+              fail("WARP_ENABLED=0 with no HTTPS_PROXY/HTTP_PROXY — no verified non-datacenter route is configured")
+          try:
+              ip_response = creq.get("https://api.ipify.org?format=json", impersonate=BROWSER,
+                                     timeout=15, proxies=PROXIES)
+              ip = ip_response.json().get("ip", "?") if ip_response.status_code == 200 else "?"
+              risk_response = creq.get(f"https://ipwho.is/{ip}", impersonate=BROWSER,
+                                       timeout=15, proxies=PROXIES)
+              risk = risk_response.json() if risk_response.status_code == 200 else {}
+              connection = risk.get("connection") or {}
+              security = risk.get("security") or {}
+              org = str(connection.get("org") or connection.get("isp") or "").strip()
+              connection_type = str(connection.get("type") or "").lower()
+              hosting = bool(security.get("hosting")) or any(
+                  marker in connection_type for marker in ("hosting", "datacenter", "data center")
+              )
+              risk_ip = str(risk.get("ip") or "?")
+              risk_ok = bool(risk.get("success", True)) and bool(org) and risk_ip == ip
+              trace = ""
+              try:
+                  trace = creq.get("https://www.cloudflare.com/cdn-cgi/trace",
+                                   impersonate=BROWSER, timeout=10, proxies=PROXIES).text
+              except Exception:
+                  pass
+              warp_on = "warp=on" in trace
+              datacenter_kws = ("microsoft","azure","amazon","aws","google","ovh",
+                                "digitalocean","hetzner","oracle","linode","github",
+                                "alibaba","tencent","digital ocean")
+              is_dc = any(k in org.lower() for k in datacenter_kws)
+              loc = str(risk.get("country_code") or "").upper()
+              if not loc:
+                  for line in trace.splitlines():
+                      if line.startswith("loc="):
+                          loc = line.split("=",1)[1].upper()
+              allowed = [c.strip().upper() for c in os.environ.get("ALLOWED_COUNTRIES","").split(",") if c.strip()]
+              print(f"   IP: {ip}")
+              print(f"   Org: {org or '?'}")
+              print(f"   Provider type: {connection_type or '?'}; hosting={hosting}")
+              print(f"   WARP: {'on' if warp_on else 'off'}")
+              print(f"   Country: {loc or '?'}")
+              if not risk_ok:
+                  fail("Independent IP/provider verification failed or disagreed with ipify — refusing an unverified route")
+              elif hosting and "cloudflare" not in org.lower():
+                  fail(f"Outbound IP is classified as hosting/datacenter ({org}) — route is not verified safe")
+              elif is_dc:
+                  fail(f"Outbound IP appears to be a datacenter ({org[:60]}) — route is not verified safe")
+              else:
+                  ok("IP routing OK (independently verified non-datacenter organization)")
+              if allowed and (not loc or loc.upper() not in allowed):
+                  fail(f"Country {loc or '?'} not in ALLOWED_COUNTRIES ({','.join(allowed)})")
+              elif allowed:
+                  ok(f"Country {loc} is in allowed list")
+          except Exception as e:
+              fail(f"IP check error: {type(e).__name__}: {e}")
+
+          # send_ads.py parse + self-test
+          print("\n━━━━━ 9. send_ads.py self-test ━━━━━")
+          import subprocess
+          r = subprocess.run([sys.executable, "send_ads.py", "--self-test"],
+                             capture_output=True, text=True, timeout=180,
+                             env={**os.environ})
+          if "ALL SELF-TESTS PASSED" in r.stdout:
+              ok("send_ads.py --self-test passed")
+          else:
+              fail("send_ads.py --self-test FAILED")
+              print("--- stdout ---")
+              print(r.stdout[-2000:])
+              print("--- stderr ---")
+              print(r.stderr[-1000:])
+
+          # Summary
+          print("\n" + "="*60)
+          print(f"SELF-CHECK SUMMARY: {GRN}{PASSED} passed{RST}, {YLW}{WARNINGS} warnings{RST}, {RED}{FAILED} failed{RST}")
+          print("="*60)
+          if FAILED:
+              sys.exit(1)
+          PYEOF
+          python3 /tmp/self_check.py

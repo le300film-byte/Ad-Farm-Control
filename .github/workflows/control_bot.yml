@@ -1,0 +1,121 @@
+# --------------------------------------------------------------------------- #
+# CONTROL BOT — Run the official Discord control bot on GitHub Actions.       #
+# --------------------------------------------------------------------------- #
+# This workflow runs the discord.py control bot on GitHub Actions.            #
+#                                                                             #
+# USAGE:                                                                      #
+#   - Go to Actions → "🤖 Control Bot" → Run workflow → Run workflow.         #
+#     This starts one chunk of up to 6h; re-run it as needed.                #
+#   - To stop: cancel the running workflow from the Actions UI.               #
+#   - Optional: schedule it to run during your usual awake hours (see cron).  #
+#                                                                             #
+# Required repo secrets (on the CORE repo):                                   #
+#   BOT_TOKEN, GUILD_ID, CONTROL_CH_ID, DASHBOARD_CH_ID, LOG_CH_ID, OWNER_IDS,#
+#   GH_TOKEN, GITHUB_OWNER, ALT_REPOS, ALT_DISCORD_IDS, ALT_NAMES              #
+#   Optional: TUNING_JSON                                                      #
+# --------------------------------------------------------------------------- #
+
+name: "🤖 Control Bot"
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How long to run the bot (hours, max 6 per chunk)"
+        required: false
+        default: "6"
+        type: choice
+        options:
+          - "1"
+          - "3"
+          - "6"
+  schedule:
+    # Optional: auto-start at 10:00 UTC (12:00 Sevilla/ES) every day.
+    # Comment out to start manually only.
+    - cron: "0 10 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "control_bot/**"
+      - ".github/workflows/control_bot.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: control-bot
+  cancel-in-progress: true   # re-deploy cancels old bot → never two copies running
+
+jobs:
+  plan:
+    name: Plan run time
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+      chunk_minutes: ${{ steps.plan.outputs.chunk_minutes }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          HOURS="${{ github.event.inputs.hours || '6' }}"
+          # Cap each chunk at 360 min (6h = GHA per-job max for typical runners)
+          CHUNK_MIN=$(( HOURS * 60 ))
+          if [ "$CHUNK_MIN" -gt 360 ]; then CHUNK_MIN=360; fi
+          CHUNKS=1
+          echo "chunks=$CHUNKS" >> "$GITHUB_OUTPUT"
+          echo "chunk_minutes=$CHUNK_MIN" >> "$GITHUB_OUTPUT"
+          echo "🤖 Will run control bot for $HOURS hour(s) in one $CHUNK_MIN-min chunk."
+
+  run-bot:
+    name: "Run control bot"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJson(needs.plan.outputs.chunk_minutes) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet -r control_bot/requirements.txt
+
+      - name: Validate owner allow-list
+        env:
+          OWNER_IDS: ${{ secrets.OWNER_IDS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${OWNER_IDS//[[:space:]]/}" ]]; then
+            echo "::error::OWNER_IDS must be configured; refusing to start an unrestricted control bot."
+            exit 1
+          fi
+
+      - name: Run control bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GUILD_ID: ${{ secrets.GUILD_ID }}
+          CONTROL_CH_ID: ${{ secrets.CONTROL_CH_ID }}
+          DASHBOARD_CH_ID: ${{ secrets.DASHBOARD_CH_ID }}
+          OWNER_IDS: ${{ secrets.OWNER_IDS }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_OWNER: ${{ secrets.GITHUB_OWNER }}
+          ALT_REPOS: ${{ secrets.ALT_REPOS }}
+          ALT_DISCORD_IDS: ${{ secrets.ALT_DISCORD_IDS }}
+          ALT_NAMES: ${{ secrets.ALT_NAMES }}
+          LOG_CH_ID: ${{ secrets.LOG_CH_ID }}
+          TUNING_JSON: ${{ secrets.TUNING_JSON }}
+          DASHBOARD_REFRESH_SEC: ${{ secrets.DASHBOARD_REFRESH_SEC }}
+          OFFLINE_AFTER_SEC: ${{ secrets.OFFLINE_AFTER_SEC }}
+          CMD_COOLDOWN_SEC: ${{ secrets.CMD_COOLDOWN_SEC }}
+          CONTROL_HTTP_TIMEOUT: ${{ secrets.CONTROL_HTTP_TIMEOUT }}
+          LOG_LEVEL: ${{ secrets.LOG_LEVEL }}
+          PYTHONUNBUFFERED: "1"
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "🤖 Starting control bot at $(date -u +%H:%M:%SZ)..."
+          echo "   Timeout: ${{ needs.plan.outputs.chunk_minutes }} min"
+          python -m control_bot
