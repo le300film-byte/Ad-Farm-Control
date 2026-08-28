@@ -1,5 +1,5 @@
 # --------------------------------------------------------------------------- #
-# SYNC_TO_ALTS — Push v5.x updates to every alt repo automatically.           #
+# SYNC_TO_ALTS — Push V6 updates to every alt repo automatically.           #
 # --------------------------------------------------------------------------- #
 # When you edit `send_ads.py` or the per-alt workflow in THIS core repo and
 # push to main, this job iterates over every repo listed in ALT_REPOS and
@@ -10,12 +10,13 @@
 #   GH_TOKEN    — the token returned by `gh auth token`, with access to the
 #                 core/alt repositories and Gists.
 #   ALT_REPOS   — 1:alt1-sell,2:alt2-sell,3:alt3-buy,4:alt4-buy
+#   ALT_GITHUB_OWNER — owner/org selected for the alt repositories
 #
 # Optional repo vars:
 #   SYNC_BRANCH — Target branch on alt repos (default: main)
 # --------------------------------------------------------------------------- #
 
-name: "Sync v5.x to Alt Repos"
+name: "Sync V6 to Alt Repos"
 
 on:
   push:
@@ -50,7 +51,7 @@ jobs:
 
       - name: "Sync files to each alt repo"
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_PAT }}
           ALT_REPOS: ${{ secrets.ALT_REPOS }}
           GITHUB_OWNER: ${{ secrets.ALT_GITHUB_OWNER }}
           SYNC_BRANCH: ${{ vars.SYNC_BRANCH || 'main' }}

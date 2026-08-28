@@ -1,5 +1,5 @@
 """
-Discord Marketplace Ad Sender  v5.5  (self-bot / alt account)
+Discord Marketplace Ad Sender  V6  (self-bot / alt account)
 ==============================================================
 Sends ONE ad (SELL or BUY, chosen at workflow start) to marketplace channels
 with human-like timing, browser-grade TLS/HTTP2 fingerprint (curl_cffi
@@ -9,7 +9,7 @@ posted after you), image EXIF strip + hash randomization, post-send typo
 edits, DM forwarding to a webhook, and auto-learn (remembers which message
 variations get blocked by anti-spam).
 
-v5.5 additions (centralized control):
+V6 additions (centralized control):
   - 🎛️ REMOTE DM CONTROL: listens for !setprice / !setmode / !setmessage /
     !pause / !resume / !stop / !sync / !status DMs from CONTROLLER_USER_IDS
     (the official control bot). Commands update in-memory config mid-run and
@@ -25,12 +25,12 @@ v5.5 additions (centralized control):
     CONTROLLER_USER_IDS, it's treated as a control command (not forwarded
     to the buyer-DM webhook).
 
-v5.4 addition:
+V6 addition:
   - 🔄 AUTO CHANNEL DISCOVERY: when a configured channel returns 404, fetch
     guild channels, post a confirmation prompt, wait for ✅/❌ reaction,
     hot-swap the new ID without restart.
 
-v5.3 additions:
+V6 additions:
   - 🚨 SHADOWBAN CAUTION MODE (F-27): per-channel rolling verification window;
     if 2/3 recent posts fail, throttle channel (2x interval, text-only, no
     reacts/edits) with red dashboard alert; exit caution after 3 survives.
@@ -47,10 +47,10 @@ v5.3 additions:
     exits cleanly with code 2.
   - 📡 PASSIVE DEAL SCANNER (F-13): reuses existing read_channel() fetches (ZERO
     extra API calls); extracts competitor prices via regex; fires deal-alert
-    embeds to DASHBOARD_WEBHOOK_URL when prices beat configured rate. Passive
-    only — no replies/DMs/mentions.
+    embeds to the separate DEAL_WEBHOOK_URL when prices beat configured rate.
+    Passive only — no replies/DMs/mentions; dashboard heartbeat state is separate.
 
-v5.2 additions:
+V6 additions:
   - DM forwarding to a private Discord webhook (username/avatar spoof,
     attachments, clickable "Open DM" deep link, forwards both sides)
   - Public-activity auto-pause when a buyer DMs (no posts/reactions/typing
@@ -61,7 +61,7 @@ v5.2 additions:
     deleted → account/IP is flagged → stop with exit code 2
   - WARP/proxy geo-country check (abort if outside ALLOWED_COUNTRIES)
 
-v5.1 anti-detection stack (in order of impact):
+V6 anti-detection stack (in order of impact):
   1. curl_cffi 'chrome' impersonation — real TLS/JA3/HTTP2 fingerprint
   2. WebSocket gateway connection — IDENTIFY + heartbeats + READY (online)
   3. Cookie/x-fingerprint warmup (GET /, /app, /experiments) pre-auth
@@ -159,12 +159,31 @@ def _tuning_raw(name):
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
-def log(m):
-    print(f"[{_ts()}] {m}", flush=True)
+def log(m, kind="INFO"):
+    """Write a typed, grep-friendly operational log line."""
+    category = str(kind or "INFO").upper()[:20]
+    if category == "INFO":
+        upper = str(m).upper()
+        if "DEAL" in upper or "🔥" in str(m):
+            category = "DEAL"
+        elif "CAUTION" in upper or "⚠️" in str(m):
+            category = "CAUTION"
+        elif "ERROR" in upper or "FAIL" in upper or "❌" in str(m):
+            category = "ERROR"
+        elif "CONTROL" in upper:
+            category = "CONTROL"
+    counts = globals().setdefault("_log_counts", {})
+    counts[category] = int(counts.get(category, 0)) + 1
+    if category in {"ERROR", "CAUTION", "SECURITY"}:
+        globals()["_last_error"] = str(m)[:300]
+    print(f"[{_ts()}] [{category}] {m}", flush=True)
+
+def event_log(kind, message):
+    log(message, kind=kind)
 
 def dbg(m):
     if DEBUG:
-        print(f"[{_ts()}] [DEBUG] {m}", flush=True)
+        log(m, kind="DEBUG")
 
 def _env(name, default=""):
     return os.environ.get(name, "").strip() or _tuning_raw(name) or default
@@ -216,12 +235,11 @@ def _list(name, default):
 # --------------------------------------------------------------------------- #
 # Config                                                                      #
 # --------------------------------------------------------------------------- #
-VERSION = "v5.5.1"
+VERSION = "V6.0"
 USER_TOKEN    = _required("USER_TOKEN")
-CHANNEL_IDS   = [c.strip() for c in _required("CHANNEL_IDS").split(",") if c.strip()]
-if not CHANNEL_IDS or any(not c.isdigit() for c in CHANNEL_IDS):
-    log("❌ CONFIG ERROR: CHANNEL_IDS must contain one or more numeric Discord channel IDs.")
-    sys.exit(1)
+CHANNEL_IDS   = [c.strip() for c in _env("CHANNEL_IDS").split(",") if c.strip()]
+if any(not c.isdigit() for c in CHANNEL_IDS):
+    log("ℹ️ CHANNEL_IDS includes keyword targets; they will be resolved after authentication.")
 AD_TYPE       = _required("AD_TYPE").lower()
 MESSAGE       = _required("MESSAGE")
 ATTACH_IMAGE  = _bool("ATTACH_IMAGE", False)
@@ -249,11 +267,11 @@ TYPO_EDIT_CHANCE  = _float("TYPO_EDIT_CHANCE", 0.18)
 SUPPRESS_EMBEDS   = _bool("SUPPRESS_EMBEDS", False)
 IMAGE_JITTER      = _bool("IMAGE_JITTER", True)
 
-# v5.2 new
+# V6 new
 DM_WEBHOOK_URL    = _env("DM_WEBHOOK_URL")
 LOG_WEBHOOK_URL   = _env("LOG_WEBHOOK_URL")  # shared #farm-logs webhook
-DASHBOARD_WEBHOOK_URL = _env("DASHBOARD_WEBHOOK_URL")  # heartbeat + deal embeds
-WEBHOOK_TIMEOUT   = _int("WEBHOOK_TIMEOUT", 20)  # seconds — applies to the three control-server webhooks
+DASHBOARD_WEBHOOK_URL = _env("DASHBOARD_WEBHOOK_URL")  # heartbeat/dashboard embeds
+WEBHOOK_TIMEOUT   = _int("WEBHOOK_TIMEOUT", 20)  # seconds — applies to the four control-server webhooks
 DM_WEBHOOK_TIMEOUT = _int("DM_WEBHOOK_TIMEOUT", 20)  # seconds — DM-forward webhook (user DMs)
 DM_PAUSE_MINUTES  = _float("DM_PAUSE_MINUTES", 2.0)
 FORWARD_OWN_DMS   = _bool("FORWARD_OWN_DMS", True)
@@ -263,10 +281,12 @@ GIST_TOKEN        = _env("GIST_TOKEN")
 GIST_ID           = _env("GIST_ID")
 ALLOWED_COUNTRIES = _list("ALLOWED_COUNTRIES", [])  # e.g. FR,ES,NL,DE,IE,GB,PT,MA,IT
 
-# v5.3 config (all optional — sane defaults if empty)
+# V6 config (all optional — sane defaults if empty)
 DEAL_SCAN_ENABLED    = _bool("DEAL_SCAN_ENABLED", True)
 DEAL_MY_RATE         = _float("DEAL_MY_RATE", 0.0)   # 0 = auto-extract from MESSAGE
 DEAL_ALERT_DELTA     = _float("DEAL_ALERT_DELTA", 0.05)  # alert only if edge >= this
+# Deal alerts have their own destination; they never share the dashboard webhook.
+DEAL_WEBHOOK_URL     = _env("DEAL_WEBHOOK_URL") or _env("DEALS_WEBHOOK_URL")
 IP_HEALTH_CHECK_INTERVAL_MIN = _float("IP_HEALTH_CHECK_INTERVAL_MIN", 30)
 IP_HEALTH_PAUSE_MIN  = _float("IP_HEALTH_PAUSE_MIN", 10)
 CAUTION_WINDOW       = _int("CAUTION_WINDOW", 3)     # rolling window size
@@ -279,9 +299,11 @@ NEW_LOCATION_TIMEOUT_SEC = _float("NEW_LOCATION_TIMEOUT_SEC", 30)
 RATELIMIT_PREADJUST  = _bool("RATELIMIT_PREADJUST", True)
 RATELIMIT_JITTER     = _float("RATELIMIT_JITTER", 0.05)
 
-# v5.4: auto channel discovery on 404 (deleted/recreated channels)
+# V6: auto channel discovery on 404 (deleted/recreated channels)
 CHANNEL_NAMES        = [x.strip() for x in _env("CHANNEL_NAMES", "").split(",") if x.strip()]
-# Build a positional mapping: CHANNEL_NAMES[i] corresponds to CHANNEL_IDS[i]
+CHANNEL_KEYWORDS     = [x.strip() for x in _env("CHANNEL_KEYWORDS", "").split(",") if x.strip()]
+# Build a positional mapping: CHANNEL_NAMES[i] corresponds to CHANNEL_IDS[i].
+# A name/keyword can also be used when an ID is not available at setup time.
 _CHANNEL_NAME_BY_ID = {}
 for _i, _cid in enumerate(CHANNEL_IDS):
     if _i < len(CHANNEL_NAMES):
@@ -289,11 +311,11 @@ for _i, _cid in enumerate(CHANNEL_IDS):
 CONFIRM_USER_IDS     = set(x.strip() for x in _env("CONFIRM_USER_IDS", "").split(",") if x.strip())
 CONFIRM_TIMEOUT      = _int("CONFIRM_TIMEOUT", 60)
 
-# Clamp v5.4 params
+# Clamp V6 params
 if CONFIRM_TIMEOUT < 15: CONFIRM_TIMEOUT = 15
 if CONFIRM_TIMEOUT > 300: CONFIRM_TIMEOUT = 300
 
-# v5.5: remote control (central control bot)
+# V6: remote control (central control bot)
 CONTROLLER_USER_IDS = set(x.strip() for x in _env("CONTROLLER_USER_IDS", "").split(",") if x.strip())
 ALT_ID              = _int("ALT_ID", 0)        # 1..N; shown on dashboard
 ALT_NAME            = _env("ALT_NAME", f"Alt{ALT_ID if ALT_ID else '?'}")
@@ -304,7 +326,7 @@ CONTROL_CMD_PREFIX  = _env("CONTROL_CMD_PREFIX", "!")
 if HEARTBEAT_INTERVAL_SEC < 60: HEARTBEAT_INTERVAL_SEC = 60
 if SYNC_GIST_INTERVAL_SEC < 15: SYNC_GIST_INTERVAL_SEC = 15
 
-# Clamp v5.3 params to safe ranges
+# Clamp V6 params to safe ranges
 if CAUTION_WINDOW < 2: CAUTION_WINDOW = 2
 if CAUTION_FAIL_THRESHOLD < 1: CAUTION_FAIL_THRESHOLD = 1
 if CAUTION_EXIT_STREAK < 1: CAUTION_EXIT_STREAK = 1
@@ -318,7 +340,7 @@ if RATELIMIT_JITTER < 0: RATELIMIT_JITTER = 0
 
 
 # --------------------------------------------------------------------------- #
-# v5.5.1: Per-alt personality jitter
+# V6: Per-alt personality jitter
 #
 # When running multiple alts off the same codebase, identical behavioral
 # constants (typo chance, react chance, typing speed, interval jitter, AFK
@@ -376,7 +398,6 @@ if TOTAL_RUN_MIN < 5:
 if TOTAL_RUN_MIN > 2880:  # 48h
     log(f"⚠️ CONFIG: TOTAL_RUN_MIN={TOTAL_RUN_MIN} exceeds the 48h safety cap. Clamping to 2880 min (48h).")
     TOTAL_RUN_MIN = 2880
-
 if AD_TYPE not in ("sell", "buy"):
     log(f"❌ CONFIG ERROR: AD_TYPE must be 'sell' or 'buy', got '{AD_TYPE}'. Check workflow inputs / AD_TYPE env var.")
     sys.exit(1)
@@ -386,9 +407,8 @@ if len(MESSAGE) > DISCORD_MSG_LIMIT:
     log(f"❌ CONFIG ERROR: MESSAGE is {len(MESSAGE)} chars (Discord limit is {DISCORD_MSG_LIMIT}). Shorten your ad copy.")
     sys.exit(1)
 
-if not CHANNEL_IDS:
-    log("❌ CONFIG ERROR: No valid CHANNEL_IDS after parsing (empty list). Provide comma-separated channel IDs in the CHANNEL_IDS secret.")
-    sys.exit(1)
+# Channel IDs may be blank when CHANNEL_NAMES/CHANNEL_KEYWORDS will be
+# resolved safely after authentication. Main aborts if no target resolves.
 
 # --------------------------------------------------------------------------- #
 # Shared state between main + gateway thread                                  #
@@ -406,7 +426,7 @@ _last_save_to_gist = 0.0
 _dm_forward_failures = 0
 _avatar_base = "https://cdn.discordapp.com"
 
-# v5.3 shared state
+# V6 shared state
 _panic_event = threading.Event()
 _new_location_failed_event = threading.Event()
 _caution_channels = {}           # cid -> True (thread-safe via _state_lock)
@@ -420,16 +440,21 @@ _ip_health_bad_until = 0.0       # epoch; public activity paused while now < thi
 _last_deal_alert = {}            # (cid, seller_id, price_2dp) -> last alert epoch
 _deal_alert_lock = threading.Lock()
 _deal_alerts_sent = 0
+_last_deal_ts = 0.0
+_last_error = ""
+_log_counts = {}
 
-# v5.4 auto-discovery shared state
+# V6 auto-discovery shared state
 _discovery_lock = threading.Lock()
 _discovery_attempted = set()     # old cids for which we already tried discovery this run
 _discovery_replacements = {}     # old_cid -> new_cid (successful confirmations)
 _channel_id_to_guild = {}        # cid -> gid (fallback mapping for dead channels)
 
-# v5.5 remote control state
+# V6 remote control state
 _paused_by_controller = False    # /pause via DM or Gist (distinct from DM-pause)
 _run_start_epoch = 0.0
+_runtime_run_end = 0.0
+_runtime_hours = 0               # current/next runtime choice for heartbeat state
 _runtime_message = None          # overridden MESSAGE (set via !setmessage)
 _runtime_rate = None             # overridden rate (set via !setprice)
 _runtime_ad_type = None          # overridden ad_type (set via !setmode)
@@ -446,6 +471,8 @@ _slowmodes_ref = {}
 _last_sent_ref = {}
 _my_last_msg_id_ref = {}
 _stats_ref = None
+_next_post_ref = {}
+_dead_channels_ref = set()
 _last_variation_base = ""        # track which MESSAGE we last built variations from
 _variations_cache = []           # rebuilt when message changes
 
@@ -770,7 +797,6 @@ def api(method, url, retries=3, referer=None, files_mp=None, json_body=None,
                 pass
         return r
     return _fake_err_response(0, "max retries exceeded")
-
 def _fake_err_response(code, msg):
     r = creq.Response()
     r.status_code = code
@@ -850,8 +876,8 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
 # --------------------------------------------------------------------------- #
 _log_webhook_failures = 0
 
-def send_log_webhook(msg, username=None):
-    """Send one action-log line to the shared #farm-logs webhook.
+def send_log_webhook(msg, username=None, kind=None):
+    """Send one typed action-log line to the shared #farm-logs webhook.
 
     Discord lets each webhook message override its display name. Using
     ALT_NAME by default means the control bot can route all four alts through
@@ -862,7 +888,14 @@ def send_log_webhook(msg, username=None):
         return
     if _log_webhook_failures >= 5:
         return  # stop trying after repeated failures
-    line = f"`[{_ts()}]` {msg}"
+    category = str(kind or "INFO").upper()[:20]
+    if not kind:
+        upper = str(msg).upper()
+        if "DEAL" in upper or "🔥" in str(msg): category = "DEAL"
+        elif "CAUTION" in upper or "⚠️" in str(msg): category = "CAUTION"
+        elif "ERROR" in upper or "FAIL" in upper or "❌" in str(msg): category = "ERROR"
+        elif "CONTROL" in upper or "PAUSE" in upper or "RESUME" in upper: category = "CONTROL"
+    line = f"`[{_ts()}]` [{category}] {msg}"
 
     def _send():
         global _log_webhook_failures
@@ -931,19 +964,14 @@ def send_dashboard(embed_dict):
         return False
 
 # --------------------------------------------------------------------------- #
-# Deal-alert delivery (optional — uses the shared dashboard webhook)       #
+# Deal-alert delivery (optional — separate deals webhook)                    #
 # --------------------------------------------------------------------------- #
 _deal_webhook_failures = 0
 
 def send_deal_webhook(embed_dict):
-    """Send deal alerts through the shared dashboard webhook.
-
-    Deal alerts are dashboard events, not a fourth webhook destination. The
-    username identifies the originating alt while keeping the setup at three
-    webhooks total: logs, dashboard, and DM inbox.
-    """
+    """Send deal alerts to DEAL_WEBHOOK_URL, never to the dashboard webhook."""
     global _deal_webhook_failures
-    target = DASHBOARD_WEBHOOK_URL
+    target = DEAL_WEBHOOK_URL
     if not target:
         return False
     if _deal_webhook_failures >= 5:
@@ -1196,7 +1224,7 @@ def _reset_consecutive_deletions():
         _consecutive_deletions = 0
 
 # --------------------------------------------------------------------------- #
-# Proactive Rate Limiter (F-26 v5.3)                                          #
+# Proactive Rate Limiter (F-26 V6)                                          #
 # --------------------------------------------------------------------------- #
 class RateLimiter:
     """Thread-safe per-bucket proactive rate limiter.
@@ -1300,12 +1328,18 @@ class RateLimiter:
 _RATELIMITER = RateLimiter()
 
 # --------------------------------------------------------------------------- #
-# Shadowban Caution Mode helpers (F-27 v5.3)                                  #
+# Shadowban Caution Mode helpers (F-27 V6)                                  #
 # --------------------------------------------------------------------------- #
 def _record_verification(cid, mid, survived):
-    """Record a per-channel pass/fail, manage caution enter/exit."""
+    """Record an authoritative exact-message pass/fail.
+
+    ``None`` means verification was inconclusive (timeout, API failure, or a
+    permission response) and must never become a phantom deletion strike.
+    """
+    if survived is None:
+        return
     with _state_lock:
-        hist = _channel_verify_history.setdefault(cid, deque(maxlen=CAUTION_WINDOW))
+        hist = _channel_verify_history.setdefault(cid, deque(maxlen=max(1, CAUTION_WINDOW)))
         hist.append(bool(survived))
         was_caution = _caution_channels.get(cid, False)
         if survived:
@@ -1330,7 +1364,7 @@ def _record_verification(cid, mid, survived):
         else:
             _channel_caution_survives[cid] = 0
             fails = sum(1 for v in hist if not v)
-            if not was_caution and fails >= CAUTION_FAIL_THRESHOLD and len(hist) >= CAUTION_FAIL_THRESHOLD:
+            if not was_caution and fails >= CAUTION_FAIL_THRESHOLD and len(hist) >= max(1, CAUTION_WINDOW):
                 _caution_channels[cid] = True
                 log(f"⚠️ #{cid}: {fails}/{len(hist)} recent posts deleted — ENTERING CAUTION MODE "
                     f"({CAUTION_INTERVAL_MULT:.1f}x interval, text-only, no reacts/edits).")
@@ -1359,10 +1393,70 @@ def channel_caution_multiplier(cid):
     return CAUTION_INTERVAL_MULT if channel_in_caution(cid) else 1.0
 
 # --------------------------------------------------------------------------- #
-# Auto Channel Discovery on 404 (v5.4)                                        #
+# Auto Channel Discovery on 404 (V6)                                        #
 # --------------------------------------------------------------------------- #
 _guilds_cache_fetched = False
 _guilds_list_cache = []
+
+def _resolve_channel_keywords():
+    """Resolve keyword-only channel targets using the authenticated account.
+
+    This is intentionally best-effort and fail-closed: ambiguous or missing
+    names are not guessed, and no channel is added unless Discord returns a
+    unique text channel match. It lets a current installation start even when
+    setup has a channel name but no numeric ID yet.
+    """
+    global CHANNEL_IDS
+    numeric = [c for c in CHANNEL_IDS if c.isdigit()]
+    keywords = [c for c in CHANNEL_IDS if not c.isdigit()] + CHANNEL_NAMES + CHANNEL_KEYWORDS
+    keywords = list(dict.fromkeys(k.strip() for k in keywords if k.strip()))
+    if not keywords:
+        if not numeric:
+            log("❌ CONFIG ERROR: provide CHANNEL_IDS or CHANNEL_NAMES/CHANNEL_KEYWORDS.")
+        CHANNEL_IDS = numeric
+        return bool(CHANNEL_IDS)
+    gids = _fetch_my_guilds_fallback()
+    if not gids:
+        log("❌ CHANNEL RESOLUTION FAILED: no accessible guild context for keyword targets.")
+        CHANNEL_IDS = numeric
+        return bool(CHANNEL_IDS)
+    resolved = list(numeric)
+    for keyword in keywords:
+        target = keyword.strip().lower().replace(" ", "-")
+        matches = []
+        for gid in gids:
+            try:
+                r = api("GET", f"https://discord.com/api/v9/guilds/{gid}/channels", retries=2)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                for item in data if isinstance(data, list) else []:
+                    if not isinstance(item, dict) or item.get("type") not in (0, 5):
+                        continue
+                    name = str(item.get("name") or "").lower().replace(" ", "-")
+                    if name == target or target in name:
+                        matches.append(item)
+            except Exception as e:
+                dbg(f"[CHANNEL] keyword lookup failed for {gid}/{keyword}: {e}")
+        unique = {str(item.get("id")): item for item in matches if item.get("id")}
+        if len(unique) != 1:
+            log(f"⚠️ CHANNEL KEYWORD `{keyword}` matched {len(unique)} channels; leaving it unresolved (fail-closed).")
+            continue
+        item = next(iter(unique.values()))
+        cid = str(item["id"])
+        if cid not in resolved:
+            resolved.append(cid)
+        _CHANNEL_NAME_BY_ID[cid] = str(item.get("name") or keyword).lower()
+        gid = item.get("guild_id")
+        if gid:
+            _guild_id_cache[cid] = str(gid)
+            _channel_id_to_guild[cid] = str(gid)
+        log(f"✅ CHANNEL KEYWORD `{keyword}` resolved → #{item.get('name') or keyword} ({cid})")
+    CHANNEL_IDS = resolved
+    if CHANNEL_IDS:
+        return True
+    log("❌ CHANNEL RESOLUTION FAILED: no unambiguous channel targets were found.")
+    return False
 
 def _fetch_my_guilds_fallback():
     """Last-resort: fetch /users/@me/guilds once to find a guild ID.
@@ -1501,7 +1595,6 @@ def discover_channel_by_name(guild_id, channel_name):
 
 def _poll_reactions(cid, mid, emoji_url, trusted_only, timeout):
     """Poll for an approval/rejection from explicitly trusted users.
-
     Discovery is deliberately fail-closed: an empty trusted-user set never
     authorizes a channel replacement.
     """
@@ -1722,27 +1815,29 @@ def try_channel_discovery(old_cid, context):
 # Post-send verification (auto-learn)                                         #
 # --------------------------------------------------------------------------- #
 def _verify_message_alive(cid, mid, text, delay=35):
-    """Background: wait `delay` seconds, fetch the message. Strike if gone;
-    also feed F-27 caution tracker (rolling pass/fail per channel)."""
+    """Verify one sent message by ID; only HTTP 404 confirms deletion."""
     def _run():
         time.sleep(delay + random.uniform(-3, 8))
-        survived = False
+        outcome = None
         try:
             ref = f"https://discord.com/channels/{_guild_id_cache.get(cid,'@me')}/{cid}"
             r = SESSION.get(f"https://discord.com/api/v9/channels/{cid}/messages/{mid}",
                             referer=ref, timeout=10)
             if r.status_code == 200:
-                survived = True
-                dbg(f"post survived (cid={cid}, mid={mid})")
-            elif r.status_code in (404, 403):
+                outcome = True
+                dbg(f"[VERIFY] post survived (cid={cid}, mid={mid})")
+            elif r.status_code == 404:
+                outcome = False
+                log(f"⚠️ [VERIFY] confirmed deletion (cid={cid}, mid={mid})", kind="CAUTION")
                 _record_strike(text, cid, mid)
+            elif r.status_code == 403:
+                log(f"⚠️ [VERIFY] permission response for cid={cid}; not treating as deletion", kind="VERIFY")
             else:
-                dbg(f"verify got {r.status_code}, ignoring")
+                dbg(f"[VERIFY] inconclusive HTTP {r.status_code}; no caution strike")
         except Exception as e:
-            dbg(f"verify exception: {e}")
-        _record_verification(cid, mid, survived)
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+            dbg(f"[VERIFY] transient verification error: {type(e).__name__}: {e}")
+        _record_verification(cid, mid, outcome)
+    threading.Thread(target=_run, daemon=True, name=f"verify-{cid}").start()
 
 # --------------------------------------------------------------------------- #
 # Image processing                                                            #
@@ -1877,10 +1972,15 @@ def get_channel_info(cid):
     try:
         if r.status_code == 200:
             j = r.json()
-            gid = j.get("guild_id")
-            if gid:
-                _guild_id_cache[cid] = gid
-                _channel_id_to_guild[cid] = gid
+            # A runtime target must be a guild text/announcement channel. Do
+            # not accept a DM, category, thread, or malformed response as a
+            # scheduler channel; this also preserves fail-closed behavior when
+            # no guild context is available.
+            if not isinstance(j, dict) or j.get("type") not in (0, 5) or not j.get("guild_id"):
+                return None
+            gid = str(j["guild_id"])
+            _guild_id_cache[cid] = gid
+            _channel_id_to_guild[cid] = gid
             return j
     except Exception:
         pass
@@ -1955,7 +2055,7 @@ def read_channel(cid, limit=15):
     return msgs
 
 # --------------------------------------------------------------------------- #
-# Passive Deal Scanner (F-13 v5.3) — zero extra API calls                     #
+# Passive Deal Scanner (F-13 V6) — zero extra API calls                     #
 # --------------------------------------------------------------------------- #
 _DEAL_PRICE_PATTERNS = [
     re.compile(r'(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?\s*(?:\/|p\s*\/|per|for\s*(?:1\s*k)?)\s*(?:1\s*)?k\b', re.I),
@@ -1984,9 +2084,9 @@ def _extract_my_rate():
     return None
 
 def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind):
-    global _deal_alerts_sent
-    # Deal alerts share the dashboard webhook; there is no dedicated deals URL.
-    if not DASHBOARD_WEBHOOK_URL:
+    global _deal_alerts_sent, _last_deal_ts
+    if not DEAL_WEBHOOK_URL:
+        event_log("DEAL", "Deal matched but DEAL_WEBHOOK_URL is not configured.")
         return
     with _deal_alert_lock:
         k = (cid, str(seller.get("id") or seller.get("username")), f"{price:.2f}")
@@ -1995,6 +2095,7 @@ def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind):
             return
         _last_deal_alert[k] = now
         _deal_alerts_sent += 1
+        _last_deal_ts = now
     snip = (snippet or "").replace("\n", " ⏎ ")[:180]
     if kind == "buyer":
         title = "📈 DEAL ALERT — HIGH BUY"
@@ -2020,7 +2121,7 @@ def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind):
     }
     try:
         send_deal_webhook(embed)
-        log(f"🔥 DEAL: @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (yours ${my_rate:.2f})")
+        event_log("DEAL", f"🔥 @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (yours ${my_rate:.2f})")
     except Exception as e:
         dbg(f"[DEAL] alert error: {e}")
 
@@ -2066,19 +2167,22 @@ def scan_deals(cid, msgs):
             dbg(f"[DEAL] msg error: {e}")
 
 # --------------------------------------------------------------------------- #
-# Mid-run IP Health Monitor (F-21 v5.3)                                       #
+# Mid-run IP Health Monitor (F-21 V6)                                       #
 # --------------------------------------------------------------------------- #
 _DATACENTER_KWS = ("microsoft", "azure", "amazon", "aws", "google", "ovh",
                    "digitalocean", "hetzner", "oracle", "linode", "github",
                    "alibaba", "tencent", "digital ocean")
 
 def _lookup_egress():
-    """Resolve actual egress through the runner's verified HTTPS route.
+    """Resolve the actual egress and ask an independent risk provider.
 
-    The workflow verifies this route successfully with curl. Some WARP runners
-    cannot make the provider requests through curl_cffi even though normal
-    HTTPS traffic is working, which caused a false ? / ? / ? failure here.
-    Keep the provider, hosting, and country checks fail-closed.
+    The workflow verifies this same route successfully with the runner's curl
+    binary. Some WARP runners cannot make the two provider requests through
+    curl_cffi even though normal HTTPS/curl traffic is working, which used to
+    produce a false ``? / ? / ?`` failure here. Use curl for this small
+    verification probe (and urllib as a local fallback), while keeping the
+    provider response, hosting classification, and country checks fail-closed.
+    The sender's Discord traffic still uses SESSION below.
     """
     details = {
         "ip": "?", "org": "?", "country": "", "country_name": "?",
@@ -2090,103 +2194,60 @@ def _lookup_egress():
         from urllib.request import Request, ProxyHandler, build_opener
 
         proxy = (HTTPS_PROXY or "").strip()
-        command = [
-            "curl", "-fsSL", "--max-time", "10", "--retry", "1"
-        ]
-
+        curl_cmd = ["curl", "-fsSL", "--max-time", "10", "--retry", "1"]
         if proxy:
-            command.extend(["--proxy", proxy])
+            curl_cmd.extend(["--proxy", proxy])
         else:
-            command.extend(["--noproxy", "*"])
-
-        command.append(url)
-
+            # Do not inherit an unrelated runner proxy when WARP is the route.
+            curl_cmd.extend(["--noproxy", "*"])
+        curl_cmd.append(url)
         try:
-            raw = subprocess.check_output(
-                command,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            )
+            raw = subprocess.check_output(curl_cmd, stderr=subprocess.DEVNULL, timeout=15)
             payload = json.loads(raw.decode("utf-8", errors="replace"))
             if isinstance(payload, dict):
                 return payload
         except Exception:
             pass
 
-        # Fallback for environments where curl is unavailable.
+        # Fallback for local environments where curl is unavailable. An
+        # explicit proxy handler keeps the lookup on the same configured route.
         try:
-            if proxy:
-                handler = ProxyHandler({
-                    "http": proxy,
-                    "https": proxy,
-                })
-            else:
-                handler = ProxyHandler({})
-
+            handler = ProxyHandler({"http": proxy, "https": proxy}) if proxy else ProxyHandler({})
             opener = build_opener(handler)
-            request = Request(
-                url,
-                headers={"User-Agent": "adfarm-egress-check/1"},
-            )
-
+            request = Request(url, headers={"User-Agent": "adfarm-egress-check/1"})
             with opener.open(request, timeout=10) as response:
-                payload = json.loads(
-                    response.read().decode("utf-8", errors="replace")
-                )
-
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
             return payload if isinstance(payload, dict) else None
         except Exception:
             return None
 
     try:
-        ip_payload = _fetch_json(
-            "https://api.ipify.org?format=json"
-        ) or {}
-
+        ip_payload = _fetch_json("https://api.ipify.org?format=json") or {}
         ip = ip_payload.get("ip")
         if not isinstance(ip, str) or not ip.strip():
             return details
-
         details["ip"] = ip.strip()
 
-        payload = _fetch_json(
-            f"https://ipwho.is/{details['ip']}"
-        ) or {}
-
+        payload = _fetch_json(f"https://ipwho.is/{ip}") or {}
         if payload.get("success") is False:
             return details
-
         connection = payload.get("connection") or {}
         security = payload.get("security") or {}
-
-        if not isinstance(connection, dict):
+        if not isinstance(connection, dict) or not isinstance(security, dict):
             return details
-        if not isinstance(security, dict):
-            return details
-
         org = connection.get("org") or connection.get("isp")
         if not isinstance(org, str) or not org.strip():
             return details
-
         details["org"] = org.strip().lower()
-        details["country"] = str(
-            payload.get("country_code") or ""
-        ).upper()
-        details["country_name"] = str(
-            payload.get("country") or "?"
-        )
-        details["connection_type"] = str(
-            connection.get("type") or ""
-        ).lower()
-        details["hosting"] = bool(
-            security.get("hosting")
-        ) or any(
+        details["country"] = str(payload.get("country_code") or "").upper()
+        details["country_name"] = str(payload.get("country") or "?")
+        details["connection_type"] = str(connection.get("type") or "").lower()
+        details["hosting"] = bool(security.get("hosting")) or any(
             marker in details["connection_type"]
             for marker in ("hosting", "datacenter", "data center")
         )
         details["verified"] = True
         return details
-
     except Exception:
         return details
 
@@ -2248,7 +2309,7 @@ def _start_ip_health_monitor():
     log(f"🛰️ IP health monitor: STARTED (every {IP_HEALTH_CHECK_INTERVAL_MIN:.0f} min; {IP_HEALTH_PAUSE_MIN:.0f} min pause on datacenter).")
 
 # --------------------------------------------------------------------------- #
-# Remote Panic Stop (F-32 v5.3)                                               #
+# Remote Panic Stop (F-32 V6)                                               #
 # --------------------------------------------------------------------------- #
 def _check_panic_gist():
     if not GIST_TOKEN or not GIST_ID:
@@ -2312,7 +2373,7 @@ def _handle_panic_dm(author_id, content):
         _panic_trigger(f"trusted DM uid={author_id}")
 
 # --------------------------------------------------------------------------- #
-# Remote Control Commands (v5.5) — DMs from the official control bot          #
+# Remote Control Commands (V6) — DMs from the official control bot          #
 # --------------------------------------------------------------------------- #
 def _controller_reply(cid, text):
     """Send a short DM reply. cid here is the DM channel id."""
@@ -2347,7 +2408,7 @@ def _apply_rate_to_message(text, new_rate):
 
 def _handle_controller_dm(cid, author_id, content):
     """Parse and act on a DM command from a controller user. Returns True if handled."""
-    global _paused_by_controller, _runtime_message, _runtime_rate, _runtime_ad_type
+    global _paused_by_controller, _runtime_message, _runtime_rate, _runtime_ad_type, _runtime_hours
     if author_id not in CONTROLLER_USER_IDS:
         return False
     txt = (content or "").strip()
@@ -2426,6 +2487,86 @@ def _handle_controller_dm(cid, author_id, content):
         log(f"📝 Message updated by controller ({len(args)} chars)")
         send_log_webhook(f"📝 **MESSAGE UPDATED** by controller ({len(args)} chars)")
         _controller_reply(cid, f"✅ Message updated. {len(args)} chars — next post uses new copy.")
+    elif cmd == "setinterval":
+        try:
+            new_interval = int(args.strip())
+        except (TypeError, ValueError):
+            new_interval = 0
+        if new_interval not in (3, 5):
+            _controller_reply(cid, "❌ Interval must be 3 or 5 minutes.")
+            return True
+        global INTERVAL_MIN
+        INTERVAL_MIN = new_interval
+        event_log("CONTROL", f"interval updated by controller → {new_interval} minutes")
+        _controller_reply(cid, f"✅ Interval updated to {new_interval} minutes. Scheduler state changed live.")
+    elif cmd == "setruntime":
+        try:
+            new_hours = int(args.strip())
+        except (TypeError, ValueError):
+            new_hours = 0
+        if new_hours not in (6, 12, 18, 24, 48):
+            _controller_reply(cid, "❌ Runtime must be 6, 12, 18, 24, or 48 hours.")
+            return True
+        global _runtime_run_end
+        _runtime_run_end = time.time() + new_hours * 3600
+        _runtime_hours = new_hours
+        event_log("CONTROL", f"runtime updated by controller → {new_hours} hours")
+        _controller_reply(cid, f"✅ Runtime end moved to {new_hours} hours from now (48-hour cap).")
+    elif cmd in ("setchannel", "replacechannel"):
+        # Safe live channel update. The target must be numeric and readable
+        # before it enters the scheduler; this avoids phantom/typo channels.
+        old_cid = None
+        if cmd == "replacechannel":
+            parts = args.split(maxsplit=2)
+            if len(parts) < 2:
+                _controller_reply(cid, "❌ Use `!replacechannel <old_id> <new_id> [name]`.")
+                return True
+            old_cid, new_cid = parts[0], parts[1]
+            label = parts[2] if len(parts) > 2 else ""
+        else:
+            parts = args.split(maxsplit=1)
+            if not parts:
+                _controller_reply(cid, "❌ Use `!setchannel <channel_id> [name]`.")
+                return True
+            new_cid = parts[0]
+            label = parts[1] if len(parts) > 1 else ""
+        if not new_cid.isdigit():
+            _controller_reply(cid, "❌ Channel ID must contain digits only.")
+            return True
+        info = get_channel_info(new_cid)
+        if not info:
+            _controller_reply(cid, f"❌ Discord did not verify channel `{new_cid}`. No runtime change made.")
+            return True
+        new_name = str(info.get("name") or label or new_cid)[:80]
+        if old_cid and old_cid in CHANNEL_IDS and old_cid != new_cid:
+            context = {"ch_names": _ch_names_ref, "slowmodes": _slowmodes_ref,
+                       "last_sent": _last_sent_ref, "my_last_msg_id": _my_last_msg_id_ref,
+                       "stats": _stats_ref, "active_channels": _active_ch_ref,
+                       "dead_channels": _dead_channels_ref, "next_post_time": _next_post_ref}
+            _rename_channel_entry(old_cid, new_cid, new_name, **{k: context[k] for k in ("ch_names", "slowmodes", "last_sent", "my_last_msg_id", "stats")})
+            try:
+                CHANNEL_IDS[CHANNEL_IDS.index(old_cid)] = new_cid
+            except ValueError:
+                CHANNEL_IDS.append(new_cid)
+            if old_cid in _active_ch_ref:
+                _active_ch_ref[_active_ch_ref.index(old_cid)] = new_cid
+            _dead_channels_ref.discard(old_cid)
+            _next_post_ref[new_cid] = time.time() + random.uniform(20, 45)
+            _controller_reply(cid, f"✅ Channel updated: `{old_cid}` → `#{new_name}` (`{new_cid}`). Scheduler will resume safely.")
+        else:
+            if new_cid not in CHANNEL_IDS:
+                CHANNEL_IDS.append(new_cid)
+            _ch_names_ref[new_cid] = new_name
+            _slowmodes_ref[new_cid] = int(info.get("rate_limit_per_user") or 0)
+            if _stats_ref is not None:
+                _stats_ref.setdefault(new_cid, {"sent": 0, "errors": 0, "skipped": 0,
+                                               "cooldown": 0, "img": 0, "txt": 0, "edits": 0})
+            if new_cid not in _active_ch_ref:
+                _active_ch_ref.append(new_cid)
+            _dead_channels_ref.discard(new_cid)
+            _next_post_ref[new_cid] = time.time() + random.uniform(20, 45)
+            _controller_reply(cid, f"✅ Channel added/updated: **#{new_name}** (`{new_cid}`). Scheduler state updated live.")
+        event_log("CONTROL", f"channel runtime update by controller: {old_cid or 'new'} -> {new_cid}")
     elif cmd == "sync":
         # Re-read Gist config + blocklist
         load_blocked_from_gist()
@@ -2433,14 +2574,14 @@ def _handle_controller_dm(cid, author_id, content):
         save_blocked_to_gist(force=True)
         _controller_reply(cid, f"✅ Sync complete. Blocklist + control gist reloaded.")
     elif cmd == "help":
-        _controller_reply(cid, "Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !sync !ping")
+        _controller_reply(cid, "Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !setchannel <id> [name] !replacechannel <old> <new> !setinterval <3|5> !setruntime <6|12|18|24|48> !sync !ping")
     else:
         _controller_reply(cid, f"❓ Unknown command `{cmd}`. Try !help")
     return True
 
 
 # --------------------------------------------------------------------------- #
-# Gist-driven config sync (v5.5)                                              #
+# Gist-driven config sync (V6)                                              #
 # --------------------------------------------------------------------------- #
 def _sync_control_gist(force=False):
     """Poll CONTROL_GIST_ID for a file `control.json` of shape:
@@ -2500,6 +2641,10 @@ def _sync_control_gist(force=False):
         dbg(f"[SYNC] control gist error: {e}")
 
 
+def _get_run_end(default_end):
+    return _runtime_run_end or default_end
+
+
 def _get_active_message():
     """Return the effective ad message (original or runtime override)."""
     return _runtime_message if _runtime_message else MESSAGE
@@ -2514,7 +2659,7 @@ def _get_active_rate():
 
 
 # --------------------------------------------------------------------------- #
-# Heartbeat webhook (v5.5)                                                    #
+# Heartbeat webhook (V6)                                                    #
 # --------------------------------------------------------------------------- #
 def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
                     my_last_msg_id, stats, total_sent, total_err, total_skip,
@@ -2575,11 +2720,17 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
         "ad_type": _get_active_ad_type(),
         "rate": _get_active_rate(),
         "rate_currency": "$/1k",
+        "interval_min": INTERVAL_MIN,
+        "runtime_hours": _runtime_hours or max(1, round(TOTAL_RUN_MIN / 60)),
         "message_preview": _get_active_message().split("\n")[0][:120],
         "total_sent": total_sent,
         "total_errors": total_err,
         "total_skips": total_skip,
         "total_edits": total_edits,
+        "deal_alerts": _deal_alerts_sent,
+        "last_deal_ts": _last_deal_ts,
+        "last_error": _last_error,
+        "log_counts": dict(_log_counts),
         "uptime_sec": now - _run_start_epoch if _run_start_epoch else 0,
         "active_channels": len([c for c in active_channels_list if dead_channels is None or c not in dead_channels]),
         "total_channels": len(CHANNEL_IDS),
@@ -2607,6 +2758,7 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
             {"name": "Status", "value": f"{title_dot} `{status}`", "inline": True},
             {"name": "Rate", "value": f"${_get_active_rate()}/1k" if _get_active_rate() else "—", "inline": True},
             {"name": "Sent / Err", "value": f"{total_sent} / {total_err}", "inline": True},
+            {"name": "Deals", "value": str(_deal_alerts_sent), "inline": True},
             {"name": "Uptime", "value": f"{(now-_run_start_epoch)/60:.1f} min" if _run_start_epoch else "—", "inline": True},
             {"name": "Channels", "value": f"{len(active_channels_list)}/{len(CHANNEL_IDS)}", "inline": True},
         ],
@@ -2628,8 +2780,8 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
             return raw
         minimal_keys = (
             "heartbeat", "type", "version", "alt_id", "alt_name", "ad_type",
-            "rate", "rate_currency", "total_sent", "total_errors", "total_skips",
-            "total_edits", "active_channels", "total_channels", "last_post_ts",
+            "rate", "rate_currency", "interval_min", "runtime_hours", "total_sent", "total_errors", "total_skips",
+            "total_edits", "deal_alerts", "last_deal_ts", "active_channels", "total_channels", "last_post_ts",
             "status", "ts",
         )
         minimal = {k: candidate.get(k) for k in minimal_keys if k in candidate}
@@ -2799,7 +2951,7 @@ class GatewayThread(threading.Thread):
             content = d.get("content") or ""
             attachments = d.get("attachments") or []
             is_me = (author.get("id") == _me_cache.get("id"))
-            # v5.5: Incoming DM from the control bot — handle commands
+            # V6: Incoming DM from the control bot — handle commands
             # (never forward these to the buyer-DM webhook)
             if not is_me and author.get("id") in CONTROLLER_USER_IDS:
                 try:
@@ -3582,7 +3734,7 @@ def self_test():
     assert "everyone" not in payload["allowed_mentions"]["parse"]
     print("✅ allowed_mentions blocks @everyone/@here pings")
 
-    # v5.2: DM pause mechanics
+    # V6: DM pause mechanics
     global _public_pause_until, _consecutive_deletions
     with _state_lock:
         saved = _public_pause_until
@@ -3597,7 +3749,7 @@ def self_test():
         _public_pause_until = saved
     print("✅ DM public-pause mechanics work")
 
-    # v5.2: strike/blacklist
+    # V6: strike/blacklist
     with _state_lock:
         before = len(_blocked_variations)
         _consecutive_deletions = 0
@@ -3610,7 +3762,7 @@ def self_test():
         _consecutive_deletions = 0
     print("✅ Strike/blacklist logic works")
 
-    # v5.2: webhook payload builder (avatar URLs)
+    # V6: webhook payload builder (avatar URLs)
     class _FakeUser(dict): pass
     fu = _FakeUser(id="123", avatar="abc123", username="tester", discriminator="0001")
     av = _avatar_url(fu)
@@ -3626,20 +3778,22 @@ def self_test():
 # Main loop                                                                   #
 # --------------------------------------------------------------------------- #
 def main():
+    global CHANNEL_IDS
     global _ksleeper, _gw_thread
     global total_sent, total_err, total_skip, total_img, total_edits, total_distractions
-    global _run_start_epoch, _runtime_message, _runtime_rate, _runtime_ad_type
+    global _run_start_epoch, _runtime_run_end, _runtime_hours, _runtime_message, _runtime_rate, _runtime_ad_type
     global _active_ch_ref, _ch_names_ref, _slowmodes_ref, _last_sent_ref, _my_last_msg_id_ref, _stats_ref
+    global _next_post_ref, _dead_channels_ref
     global _last_variation_base, _variations_cache
     _ksleeper = _KeepaliveSleep()
 
     # Reset runtime counters at start of run
     total_sent = total_err = total_skip = total_img = total_edits = 0
     total_distractions = 0
+    _runtime_hours = 0
     _runtime_message = None
     _runtime_rate = None
     _runtime_ad_type = None
-
     # Verify the route before any Discord warmup request can expose the runner
     # IP. The same configured SESSION is used for this check and all later REST
     # and webhook traffic.
@@ -3648,6 +3802,8 @@ def main():
 
     start = time.time()
     run_end = start + TOTAL_RUN_MIN * 60
+    _runtime_run_end = run_end
+    _runtime_hours = max(1, round(TOTAL_RUN_MIN / 60))
     variations = build_variations(MESSAGE)
     _last_variation_base = MESSAGE
     _variations_cache = variations
@@ -3684,7 +3840,7 @@ def main():
     last_gist_save = 0
     returning_from_afk = False
 
-    # v5.5: publish mutable refs for the heartbeat/controller thread
+    # V6: publish mutable refs for the heartbeat/controller thread
     # (set properly after channel browse; placeholder for now)
 
     log("=" * 66)
@@ -3711,7 +3867,7 @@ def main():
         + (f" (auto-pause public activity {DM_PAUSE_MINUTES:.0f} min when buyer DMs)" if DM_WEBHOOK_URL else ""))
     log(f"📋 LOG WEBHOOK   : {'ON' if LOG_WEBHOOK_URL else 'OFF (optional action-log channel)'}")
     log(f"📊 DASHBOARD    : {'ON (periodic summaries)' if DASHBOARD_WEBHOOK_URL else 'OFF (optional)'}")
-    log(f"🔥 DEAL ALERTS    : {'ON → dashboard webhook' if DASHBOARD_WEBHOOK_URL else 'OFF (no dashboard webhook)'}")
+    log(f"🔥 DEAL ALERTS    : {'ON → separate deals webhook' if DEAL_WEBHOOK_URL else 'OFF (no DEAL_WEBHOOK_URL)'}", kind="DEAL")
     log(f"⏱️  WEBHOOK T/O   : {WEBHOOK_TIMEOUT}s (control); {DM_WEBHOOK_TIMEOUT}s (DM forward)")
     log(f"🧠 AUTO-LEARN    : strikes={BLOCKED_STRIKES}, safety_stop={BLOCKED_SAFETY_STOP}"
         + (f", gist={GIST_ID[:8]}... (persisted across runs)" if GIST_ID else " (no gist persistence — resets each run)"))
@@ -3769,15 +3925,18 @@ def main():
     log(f"   EMAIL VERIFIED: {'✅ YES' if verified else '❌ NO — higher flag risk! Verify email before long runs.'}")
     log(f"   2FA ENABLED   : {'✅ YES' if mfa else '⚠️ NO — tip: enabling 2FA raises account trust score.'}")
 
+    if not _resolve_channel_keywords():
+        log("❌ No usable channel targets remain after safe resolution. Aborting.")
+        sys.exit(1)
     start_gateway()
     time.sleep(random.uniform(2, 5))
     set_status()
 
-    # v5.3: start background safety daemons
+    # V6: start background safety daemons
     _start_ip_health_monitor()
     _start_panic_checker()
 
-    # v5.5: start the control-gist sync daemon (polls for remote config changes)
+    # V6: start the control-gist sync daemon (polls for remote config changes)
     if CONTROL_GIST_ID and GIST_TOKEN:
         threading.Thread(target=_controller_heartbeat_daemon, daemon=True, name="ctrl-sync").start()
         log(f"🎛️  Remote control: DM commands + gist sync every {SYNC_GIST_INTERVAL_SEC}s (control gist configured).")
@@ -3789,7 +3948,7 @@ def main():
     if DASHBOARD_WEBHOOK_URL and HEARTBEAT_INTERVAL_SEC:
         log(f"💓 Heartbeat      : ON → pushes JSON+embed status every {HEARTBEAT_INTERVAL_SEC}s to dashboard webhook ({ALT_NAME} id={ALT_ID}).")
     elif DASHBOARD_WEBHOOK_URL:
-        log(f"💓 Heartbeat      : ON (legacy periodic summaries; no DASHBOARD_WEBHOOK v5.5 structured format).")
+        log(f"💓 Heartbeat      : ON (legacy periodic summaries; no DASHBOARD_WEBHOOK V6 structured format).")
     else:
         log(f"💓 Heartbeat      : OFF (no DASHBOARD_WEBHOOK_URL set).")
     # Mark run start
@@ -3849,13 +4008,14 @@ def main():
         ok_count += 1
 
     active_channels = [c for c in CHANNEL_IDS if c not in dead_channels]
-    # v5.5: publish refs for heartbeat/controller
+    # V6: publish refs for heartbeat/controller
     _active_ch_ref = active_channels
     _ch_names_ref = ch_names
     _slowmodes_ref = slowmodes
     _last_sent_ref = last_sent
     _my_last_msg_id_ref = my_last_msg_id
     _stats_ref = stats
+    _dead_channels_ref = dead_channels
     if ok_count == 0 and not active_channels:
         log("❌ FATAL: No accessible channels. Verify the alt is in the servers and CHANNEL_IDS are correct. Aborting.")
         sys.exit(1)
@@ -3920,6 +4080,8 @@ def main():
         # (replaces the "final pre-post pause"), so channels don't all fire
         # at t=0. Staggered by a 3-10s gap so messages aren't simultaneous.
         next_post_time = {}
+        _next_post_ref = next_post_time
+        _dead_channels_ref = dead_channels
         stagger = 0.0
         for cid in active_channels:
             next_post_time[cid] = time.time() + random.uniform(12, 30) + stagger
@@ -3943,7 +4105,7 @@ def main():
         log("   slow channels no longer block fast ones. Initial stagger set.")
         log("")
 
-        while time.time() < run_end:
+        while time.time() < _get_run_end(run_end):
             now = time.time()
 
             # F-32: panic event — exit main loop immediately
@@ -3972,7 +4134,7 @@ def main():
                 log(f"👋 BACK FROM AFK — re-orienting for {ret_wait:.0f}s (catching up on missed messages, simulating reopening Discord)...")
                 sleep_chunked(ret_wait, run_end)
                 for _cid in active_channels:
-                    if time.time() >= run_end:
+                    if time.time() >= _get_run_end(run_end):
                         break
                     if public_activity_allowed():
                         _n = ch_names.get(_cid, _cid)
@@ -3997,7 +4159,7 @@ def main():
                 total_distractions += 1
                 log(f"💭 DISTRACTION PAUSE — pausing public activity for {dist:.0f}s (simulating checking DMs / another server / tabbing away).")
                 sleep_with_keepalive(dist, run_end)
-                if time.time() >= run_end:
+                if time.time() >= _get_run_end(run_end):
                     break
                 continue
 
@@ -4030,7 +4192,7 @@ def main():
                 continue  # loop back to re-check AFK/DM/runtime
 
             # If we reach here, wait_sec <= 0: the channel is due.
-            remaining_min = (run_end - time.time()) / 60
+            remaining_min = (_get_run_end(run_end) - time.time()) / 60
             cycle += 1  # "post attempts" counter
 
             # ---------- Direction + warmup status header (every ~10 posts) --
@@ -4074,20 +4236,17 @@ def main():
                 last_author = last_author_obj.get("username") or last_author_obj.get("global_name") or "?"
                 last_snip = (last2.get("content") or "").replace("\n", " ")[:50] or "<embed/image/empty>"
 
-            # ---------- Deletion detection (last 20 msgs) ------------------
+            # ---------- Deletion detection ---------------------------------
+            # A finite recent-message page cannot prove deletion: a busy
+            # channel can bury a message in seconds. The exact-message
+            # verification thread is authoritative and only a confirmed 404
+            # can enter caution mode. Missing/failed recent reads are ignored.
             prev_id = my_last_msg_id.get(cid)
             deleted_detected = False
             if prev_id and recent is not None:
                 recent_ids = {m.get("id") for m in recent}
                 if prev_id not in recent_ids:
-                    # Only treat as deleted if it's within 3 min of posting;
-                    # otherwise it's just buried by chat velocity.
-                    age_s = time.time() - last_sent.get(cid, 0) if cid in last_sent else 999
-                    if age_s < 180:
-                        deleted_detected = True
-                        log(f"   ⚠️  {ch_tag}: PREVIOUS AD VANISHED (sent {age_s:.0f}s ago, not in last 20 msgs). Likely deleted by anti-spam. Force-reposting.")
-                    else:
-                        dbg(f"[SCHED] {ch_tag}: prev msg {prev_id} not in last 20 but age={age_s:.0f}s (buried, not deleted)")
+                    dbg(f"[VERIFY] {ch_tag}: previous message is outside the recent page; awaiting exact-message verification")
 
             # ---------- Safety-net: never go completely silent -------------
             force_post = False
@@ -4132,7 +4291,7 @@ def main():
                 next_post_time[cid] = time.time() + random.uniform(30, 90)
                 continue
 
-            # ---------- v5.5: Rebuild variations if controller changed message
+            # ---------- V6: Rebuild variations if controller changed message
             active_msg = _get_active_message()
             if active_msg != _last_variation_base:
                 log(f"📝 Active ad message updated by controller — rebuilding variations.")
@@ -4234,7 +4393,6 @@ def main():
                 send_log_webhook(
                     f"✅ **SEND** {ch_tag} | {'📷img' if attach_this_post else '💬txt'} | total=`{total_sent}` | id=`{new_msg_id}`"
                 )
-
                 if new_msg_id and not channel_in_caution(cid):
                     # maybe_typo_edit performs the single configured-probability
                     # roll. Keeping no outer roll makes 18% the effective rate.
@@ -4291,7 +4449,7 @@ def main():
                         if cid in next_post_time:
                             del next_post_time[cid]
                 elif code == 404:
-                    # v5.4: attempt auto-discovery BEFORE marking dead
+                    # V6: attempt auto-discovery BEFORE marking dead
                     _disc_ctx = {
                         "ch_names": ch_names, "slowmodes": slowmodes,
                         "last_sent": last_sent, "my_last_msg_id": my_last_msg_id,
@@ -4315,7 +4473,7 @@ def main():
                         if cid in next_post_time:
                             del next_post_time[cid]
 
-            if time.time() >= run_end:
+            if time.time() >= _get_run_end(run_end):
                 log("   ⏱️ Runtime limit reached; exiting scheduler.")
                 break
 
@@ -4337,7 +4495,7 @@ def main():
                 total_distractions += 1
                 log(f"   💭 {ch_tag}: MID-SESSION DISTRACTION — pausing {mid_dist:.0f}s (DM / phone / app-switch).")
                 sleep_with_keepalive(mid_dist, run_end)
-                if time.time() >= run_end:
+                if time.time() >= _get_run_end(run_end):
                     break
             elif random.random() < 0.40 and len(active_channels) > 1:
                 other = random.choice([c for c in active_channels if c != cid])
@@ -4359,7 +4517,7 @@ def main():
                 log(f"   👀 {ch_tag}: waiting {g:.0f}s before moving on...")
                 sleep_chunked(g, run_end)
 
-            # ---------- Periodic heartbeat (v5.5 unified dashboard) ------
+            # ---------- Periodic heartbeat (V6 unified dashboard) ------
             _send_heartbeat(active_channels, ch_names, slowmodes, last_sent,
                             my_last_msg_id, stats, total_sent, total_err, total_skip,
                             total_img, total_edits, dead_channels=dead_channels,

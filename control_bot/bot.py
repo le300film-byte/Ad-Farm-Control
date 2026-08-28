@@ -1,15 +1,14 @@
 """control_bot/bot.py — official Discord control bot.
 
 Responsibilities:
-  * Slash commands (/run, /pause, /resume, /stop, /status, /setprice, /setmode,
-    /setmessage, /sync, /logs) with dropdowns/text/number inputs.
-  * Permission-gated (OWNER_IDS) + 5s per-user cooldown.
+  * V6 slash commands for run/stop/pause/resume, validated message/rate/mode
+    changes, live channel updates, interval/runtime updates, sync, status,
+    typed logs, deals, refresh, dashboard, and a complete private help guide.
+  * Permission-gated by comma-separated OWNER_IDS (fail closed) plus cooldown.
   * GitHub Actions dispatch/cancel via the shared GitHub CLI token.
-  * DMs commands to alts (send_message to the alt's user id), parses ack
-    replies from alts, forwards them to #control.
-  * Listens in #dashboard and the shared #farm-logs channel for webhook
-    messages sent by the alts, parses embeds/content, and keeps state updated.
-  * Periodically pushes a refreshed 3-embed unified dashboard.
+  * DMs commands to alts and reports the exact remote acknowledgement privately.
+  * Parses dashboard heartbeats, typed action logs, and a separate deal webhook.
+  * Periodically refreshes live GitHub/heartbeat data into a stable three-embed dashboard.
 """
 from __future__ import annotations
 
@@ -47,6 +46,7 @@ state = AltStateManager(
 )
 
 _cooldowns: dict[int, float] = {}
+_processed_webhook_ids: set[int] = set()
 
 
 def _is_owner(inter: discord.Interaction) -> bool:
@@ -155,547 +155,274 @@ async def _check_perms(inter: discord.Interaction) -> bool:
     return True
 
 
-def _set_selected_option(select: discord.ui.Select, selected: str) -> None:
-    """Keep a select menu's visible checkmark in sync after an edit."""
-    for option in select.options:
-        option.default = option.value == selected
+async def _hydrate_discord_state() -> None:
+    """Rebuild live state from recent dedicated webhook messages after a restart."""
+    channel_ids = [
+        config.DASHBOARD_CH_ID,
+        config.LOG_CH_ID,
+        config.DEALS_CH_ID,
+    ]
+    seen: set[int] = set()
+    for channel_id in channel_ids:
+        if not channel_id or channel_id in seen:
+            continue
+        seen.add(channel_id)
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception as exc:
+                print(f"[STATE] Could not fetch channel {channel_id}: {type(exc).__name__}: {exc}")
+                continue
+        try:
+            messages = [message async for message in channel.history(limit=100)]
+        except Exception as exc:
+            print(f"[STATE] Could not read channel {channel_id}: {type(exc).__name__}: {exc}")
+            continue
+        # Discord returns newest first. Apply oldest-to-newest so a stale
+        # heartbeat cannot overwrite a newer counter or workflow view.
+        for message in reversed(messages):
+            await _handle_guild_webhook_message(message)
+
+
+async def _fresh_state() -> None:
+    """Refresh GitHub and recent webhook state before showing current data."""
+    try:
+        await asyncio.gather(
+            asyncio.to_thread(github_api.refresh_all_run_statuses, state),
+            _hydrate_discord_state(),
+        )
+    except Exception as exc:
+        print(f"[STATE] Live refresh failed: {type(exc).__name__}: {exc}")
+
+
+class RunDetailsModal(discord.ui.Modal):
+    def __init__(self, view: "RunStartView"):
+        super().__init__(title=f"V6 {view.ad_type} ad details")
+        self.parent_view = view
+        if view.ad_type == "sell":
+            self.rate = discord.ui.TextInput(label="Sell rate (example: 2.5$)", custom_id="sell_rate", placeholder="2.5", max_length=20, required=True)
+            self.extra = discord.ui.TextInput(label="Extra sell text", custom_id="sell_extra", placeholder="DM ME QUICK...", max_length=500, required=False, style=discord.TextStyle.paragraph)
+            self.image = discord.ui.TextInput(label="Attach image? yes or no", custom_id="attach_image", placeholder="yes", max_length=3, required=True, default="yes")
+            self.add_item(self.rate)
+            self.add_item(self.extra)
+            self.add_item(self.image)
+        else:
+            self.rate = discord.ui.TextInput(label="Token rate", custom_id="buy_rate", placeholder="2.2", max_length=20, required=True)
+            self.rap = discord.ui.TextInput(label="RAP rate", custom_id="buy_rate_rap", placeholder="1.8", max_length=20, required=True)
+            self.simple_text = discord.ui.TextInput(label="Simple buy text (only for simple style)", custom_id="buy_simple_text", max_length=1900, required=False, style=discord.TextStyle.paragraph)
+            self.style = discord.ui.TextInput(label="Buy style: detailed or simple", custom_id="buy_style", placeholder="detailed", max_length=8, required=True, default="detailed")
+            self.image = discord.ui.TextInput(label="Attach image? yes or no", custom_id="attach_image", placeholder="yes", max_length=3, required=True, default="yes")
+            self.add_item(self.rate)
+            self.add_item(self.rap)
+            self.add_item(self.simple_text)
+            self.add_item(self.style)
+            self.add_item(self.image)
+
+    async def on_submit(self, inter: discord.Interaction):
+        def value_of(name: str, default: str = "") -> str:
+            item = getattr(self, name, None)
+            return str(getattr(item, "value", item if item is not None else default) or default)
+
+        values = {
+            "alt_id": str(self.parent_view.alt_id or ""),
+            "ad_type": self.parent_view.ad_type or "",
+            "interval_min": str(self.parent_view.interval_min),
+            "total_hours": str(self.parent_view.total_hours),
+            "attach_image": value_of("image", self.parent_view.attach_image).strip().lower(),
+            "buy_style": value_of("style", self.parent_view.buy_style).strip().lower(),
+            "sell_rate": value_of("rate"),
+            "sell_extra": value_of("extra"),
+            "buy_rate": value_of("rate"),
+            "buy_rate_rap": value_of("rap"),
+            "buy_simple_text": value_of("simple_text"),
+        }
+        errors, parsed = _validate_run_values(values)
+        if errors:
+            await inter.response.send_message("❌ " + "\n".join(errors), ephemeral=True)
+            return
+        await _dispatch_run_from_modal(inter, values, parsed)
 
 
 class RunStartView(discord.ui.View):
-    """Private first step of /run: choose an actual configured alt and mode.
-
-    A modal submit cannot open another modal in Discord. This view deliberately
-    uses select menus and a button for the first step; the button interaction
-    can safely open the mode-specific details modal.
-    """
-
+    """Private component step; only the Continue button opens the modal."""
     def __init__(self, owner_id: int):
         super().__init__(timeout=300)
         self.owner_id = owner_id
         self.alt_id: int | None = None
         self.ad_type: str | None = None
-
-        alt_options = []
-        for alt_id in state.alt_ids[:25]:
-            alt = state.get(alt_id)
-            label = (alt.name if alt else f"Alt {alt_id}")[:100]
-            description = (f"{alt.ad_type} mode" if alt and alt.ad_type else "Configured alt")[:100]
-            alt_options.append(
-                discord.SelectOption(
-                    label=label,
-                    value=str(alt_id),
-                    description=description,
-                    emoji=_ad_icon(alt.ad_type if alt else ""),
-                )
-            )
+        self.interval_min = 5
+        self.total_hours = 6
+        self.attach_image = "yes"
+        self.buy_style = "detailed"
         self.alt_select = discord.ui.Select(
-            placeholder="1. Choose an alt…",
-            min_values=1,
-            max_values=1,
-            options=alt_options,
-            row=0,
-        )
-        self.alt_select.callback = self._select_alt
-        self.add_item(self.alt_select)
-
+            placeholder="1. Choose configured alt…", min_values=1, max_values=1,
+            options=[discord.SelectOption(label=(state.get(i).name if state.get(i) else f"Alt {i}")[:100], value=str(i)) for i in state.alt_ids[:25]], row=0)
         self.mode_select = discord.ui.Select(
-            placeholder="2. Choose sell or buy…",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(label="Sell", value="sell", emoji="💰",
-                                     description="Post a selling ad"),
-                discord.SelectOption(label="Buy", value="buy", emoji="🛒",
-                                     description="Post a buying ad"),
-            ],
-            row=1,
-        )
-        self.mode_select.callback = self._select_mode
-        self.add_item(self.mode_select)
-
-        self.continue_button = discord.ui.Button(
-            label="Continue",
-            style=discord.ButtonStyle.primary,
-            emoji="➡️",
-            row=2,
-        )
+            placeholder="2. Choose sell or buy…", min_values=1, max_values=1,
+            options=[discord.SelectOption(label="Sell", value="sell", emoji="💰"), discord.SelectOption(label="Buy", value="buy", emoji="🛒")], row=1)
+        self.interval_select = discord.ui.Select(
+            placeholder="3. Interval: 3 or 5 minutes", min_values=1, max_values=1,
+            options=[discord.SelectOption(label="3 minutes", value="3"), discord.SelectOption(label="5 minutes", value="5")], row=2)
+        self.runtime_select = discord.ui.Select(
+            placeholder="4. Runtime: 6/12/18/24/48 hours", min_values=1, max_values=1,
+            options=[discord.SelectOption(label=f"{h} hours", value=str(h)) for h in (6, 12, 18, 24, 48)], row=3)
+        # Image yes/no and detailed/simple are modal fields. Keeping them in
+        # the modal preserves all choices without exceeding Discord's five-row
+        # view limit.
+        self.alt_select.callback = self._alt_callback
+        self.mode_select.callback = self._mode_callback
+        self.interval_select.callback = self._interval_callback
+        self.runtime_select.callback = self._runtime_callback
+        for item in (self.alt_select, self.mode_select, self.interval_select, self.runtime_select):
+            self.add_item(item)
+        self.continue_button = discord.ui.Button(label="Continue to ad text", style=discord.ButtonStyle.primary, row=4)
         self.continue_button.callback = self._continue
         self.add_item(self.continue_button)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, row=4)
+        cancel.callback = self._cancel
+        self.add_item(cancel)
 
-        self.cancel_button = discord.ui.Button(
-            label="Cancel",
-            style=discord.ButtonStyle.secondary,
-            row=2,
-        )
-        self.cancel_button.callback = self._cancel
-        self.add_item(self.cancel_button)
-
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
+    async def _guard(self, inter):
         if inter.user.id != self.owner_id:
-            await inter.response.send_message(
-                "🔒 This private /run form belongs to another operator.", ephemeral=True
-            )
+            await inter.response.send_message("🔒 This private form belongs to its operator.", ephemeral=True)
             return False
         return True
 
-    async def _select_alt(self, inter: discord.Interaction) -> None:
+    async def _alt_callback(self, inter):
+        if not await self._guard(inter): return
         self.alt_id = int(self.alt_select.values[0])
-        _set_selected_option(self.alt_select, str(self.alt_id))
         await inter.response.edit_message(embed=_run_start_embed(self), view=self)
 
-    async def _select_mode(self, inter: discord.Interaction) -> None:
+    async def _mode_callback(self, inter):
+        if not await self._guard(inter): return
         self.ad_type = self.mode_select.values[0]
-        _set_selected_option(self.mode_select, self.ad_type)
         await inter.response.edit_message(embed=_run_start_embed(self), view=self)
 
-    async def _continue(self, inter: discord.Interaction) -> None:
-        if self.alt_id is None or self.ad_type is None:
-            await inter.response.send_message(
-                "❌ Choose both an alt and an ad type first.", ephemeral=True
-            )
+    async def _interval_callback(self, inter):
+        if not await self._guard(inter): return
+        self.interval_min = int(self.interval_select.values[0])
+        await inter.response.edit_message(embed=_run_start_embed(self), view=self)
+
+    async def _runtime_callback(self, inter):
+        if not await self._guard(inter): return
+        self.total_hours = int(self.runtime_select.values[0])
+        await inter.response.edit_message(embed=_run_start_embed(self), view=self)
+
+    async def _continue(self, inter):
+        if not await self._guard(inter): return
+        if not self.alt_id or self.ad_type not in {"sell", "buy"}:
+            await inter.response.send_message("❌ Select an alt and sell/buy mode first.", ephemeral=True)
             return
-        await inter.response.send_modal(
-            RunDetailsModal(owner_id=self.owner_id, alt_id=self.alt_id, ad_type=self.ad_type)
-        )
+        await inter.response.send_modal(RunDetailsModal(self))
 
-    async def _cancel(self, inter: discord.Interaction) -> None:
-        for item in self.children:
-            item.disabled = True
-        await inter.response.edit_message(
-            content="🛑 Run setup cancelled.", embed=None, view=self
-        )
-
-
-class RunDetailsModal(discord.ui.Modal):
-    """Mode-specific second step, opened by a button interaction."""
-
-    def __init__(self, *, owner_id: int, alt_id: int, ad_type: str):
-        super().__init__(title=f"{ad_type.title()} ad details", timeout=300)
-        self.owner_id = owner_id
-        self.alt_id = alt_id
-        self.ad_type = ad_type
-
-        if ad_type == "sell":
-            self.rate_input = discord.ui.TextInput(
-                label="Sell rate (for example 2.5$)",
-                custom_id="sell_rate",
-                placeholder="2.5$",
-                default="2.5$",
-                required=True,
-                max_length=20,
-            )
-            self.extra_input = discord.ui.TextInput(
-                label="Extra text after the rate",
-                custom_id="sell_extra",
-                placeholder="DM ME QUICK CAN DO SMALL AND BIG AMOUNTS",
-                default="DM ME QUICK CAN DO SMALL AND BIG AMOUNTS",
-                required=False,
-                max_length=500,
-            )
-            self.add_item(self.rate_input)
-            self.add_item(self.extra_input)
-        else:
-            self.rate_input = discord.ui.TextInput(
-                label="Token rate (for example 2.2)",
-                custom_id="buy_rate",
-                placeholder="2.2",
-                default="2.2",
-                required=True,
-                max_length=20,
-            )
-            self.rap_input = discord.ui.TextInput(
-                label="RAP rate (for example 1.8)",
-                custom_id="buy_rate_rap",
-                placeholder="1.8",
-                default="1.8",
-                required=True,
-                max_length=20,
-            )
-            self.style_input = discord.ui.TextInput(
-                label="Buy style: detailed or simple",
-                custom_id="buy_style",
-                placeholder="detailed",
-                default="detailed",
-                required=True,
-                max_length=8,
-            )
-            self.simple_input = discord.ui.TextInput(
-                label="Simple buy text (only for simple style)",
-                custom_id="buy_simple_text",
-                placeholder="BUYING ALL BLADE BALL DM ME QUICK",
-                required=False,
-                max_length=1900,
-            )
-            for item in (self.rate_input, self.rap_input, self.style_input, self.simple_input):
-                self.add_item(item)
-
-    async def on_submit(self, inter: discord.Interaction) -> None:
-        if inter.user.id != self.owner_id:
-            await inter.response.send_message(
-                "🔒 This private /run form belongs to another operator.", ephemeral=True
-            )
-            return
-        try:
-            values = {
-                "alt_id": str(self.alt_id),
-                "ad_type": self.ad_type,
-                "interval_min": "5",
-                "total_hours": "6",
-                "attach_image": "yes",
-            }
-            if self.ad_type == "sell":
-                values.update({
-                    "sell_rate": self.rate_input.value.strip(),
-                    "sell_extra": self.extra_input.value.strip(),
-                })
-            else:
-                values.update({
-                    "buy_rate": self.rate_input.value.strip(),
-                    "buy_rate_rap": self.rap_input.value.strip(),
-                    "buy_style": self.style_input.value.strip().lower(),
-                    "buy_simple_text": self.simple_input.value.strip(),
-                })
-            errors, parsed = _validate_run_values(values)
-            if errors:
-                await inter.response.send_message(
-                    "❌ " + " ".join(errors), ephemeral=True
-                )
-                return
-            settings = RunSettingsView(owner_id=self.owner_id, values=values, parsed=parsed)
-            await inter.response.send_message(
-                embed=settings.embed(), view=settings, ephemeral=True
-            )
-        except Exception as exc:
-            await _private_interaction_error(inter, f"❌ Could not prepare the run form: {exc}")
-
-
-class RunSettingsView(discord.ui.View):
-    """Private final step: common timing/image choices and Start button."""
-
-    def __init__(self, *, owner_id: int, values: dict[str, str], parsed: dict[str, object]):
-        super().__init__(timeout=300)
-        self.owner_id = owner_id
-        self.values = dict(values)
-        self.parsed = dict(parsed)
-
-        self.interval_select = discord.ui.Select(
-            placeholder="Interval: 5 minutes",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(label="3 minutes", value="3"),
-                discord.SelectOption(label="5 minutes", value="5", default=True),
-            ],
-            row=0,
-        )
-        self.interval_select.callback = self._select_interval
-        self.add_item(self.interval_select)
-
-        self.hours_select = discord.ui.Select(
-            placeholder="Runtime: 6 hours",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(label=f"{hours} hours", value=str(hours), default=hours == 6)
-                for hours in (6, 12, 18, 24, 48)
-            ],
-            row=1,
-        )
-        self.hours_select.callback = self._select_hours
-        self.add_item(self.hours_select)
-
-        self.image_select = discord.ui.Select(
-            placeholder="Image: yes",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(label="Attach image after warmup", value="yes", emoji="🖼️", default=True),
-                discord.SelectOption(label="Text only", value="no", emoji="💬"),
-            ],
-            row=2,
-        )
-        self.image_select.callback = self._select_image
-        self.add_item(self.image_select)
-
-        self.start_button = discord.ui.Button(
-            label="Start run",
-            style=discord.ButtonStyle.success,
-            emoji="🚀",
-            row=3,
-        )
-        self.start_button.callback = self._start
-        self.add_item(self.start_button)
-
-        self.cancel_button = discord.ui.Button(
-            label="Cancel",
-            style=discord.ButtonStyle.secondary,
-            row=3,
-        )
-        self.cancel_button.callback = self._cancel
-        self.add_item(self.cancel_button)
-
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
-        if inter.user.id != self.owner_id:
-            await inter.response.send_message(
-                "🔒 This private /run form belongs to another operator.", ephemeral=True
-            )
-            return False
-        return True
-
-    async def _select_interval(self, inter: discord.Interaction) -> None:
-        self.values["interval_min"] = self.interval_select.values[0]
-        self.parsed["interval"] = int(self.values["interval_min"])
-        _set_selected_option(self.interval_select, self.values["interval_min"])
-        await inter.response.edit_message(embed=self.embed(), view=self)
-
-    async def _select_hours(self, inter: discord.Interaction) -> None:
-        self.values["total_hours"] = self.hours_select.values[0]
-        self.parsed["hours"] = int(self.values["total_hours"])
-        _set_selected_option(self.hours_select, self.values["total_hours"])
-        await inter.response.edit_message(embed=self.embed(), view=self)
-
-    async def _select_image(self, inter: discord.Interaction) -> None:
-        self.values["attach_image"] = self.image_select.values[0]
-        _set_selected_option(self.image_select, self.values["attach_image"])
-        await inter.response.edit_message(embed=self.embed(), view=self)
-
-    async def _start(self, inter: discord.Interaction) -> None:
-        try:
-            errors, parsed = _validate_run_values(self.values)
-            if errors:
-                await inter.response.send_message("❌ " + " ".join(errors), ephemeral=True)
-                return
-            await _dispatch_run_from_modal(inter, self.values, parsed)
-        except Exception as exc:
-            await _private_interaction_error(inter, f"❌ Could not start the run: {exc}")
-
-    async def _cancel(self, inter: discord.Interaction) -> None:
-        for item in self.children:
-            item.disabled = True
-        await inter.response.edit_message(
-            content="🛑 Run setup cancelled.", embed=None, view=self
-        )
-
-    def embed(self) -> discord.Embed:
-        alt = state.get(int(self.values["alt_id"]))
-        alt_name = alt.name if alt else f"Alt {self.values['alt_id']}"
-        embed = discord.Embed(
-            title="⚙️ Run settings",
-            description=f"**{alt_name}** · {_ad_icon(self.values['ad_type'])} `{self.values['ad_type']}`\n"
-                        "Choose the common settings, then press **Start run**.",
-            color=0x5865F2,
-        )
-        if self.values["ad_type"] == "sell":
-            detail = f"Rate: `{self.values.get('sell_rate', '')}`\nExtra: `{self.values.get('sell_extra', '')[:180]}`"
-        else:
-            detail = (
-                f"Tokens: `{self.values.get('buy_rate', '')}` · RAP: `{self.values.get('buy_rate_rap', '')}`\n"
-                f"Style: `{self.values.get('buy_style', '')}`\n"
-                f"Text: `{self.values.get('buy_simple_text', '')[:180]}`"
-            )
-        embed.add_field(name="Ad details", value=detail[:1000] or "—", inline=False)
-        embed.add_field(name="Interval", value=f"`{self.values.get('interval_min', '5')} min`", inline=True)
-        embed.add_field(name="Runtime", value=f"`{self.values.get('total_hours', '6')} h`", inline=True)
-        embed.add_field(name="Image", value=f"`{self.values.get('attach_image', 'yes')}`", inline=True)
-        return embed
+    async def _cancel(self, inter):
+        if not await self._guard(inter): return
+        self.stop()
+        await inter.response.edit_message(content="Cancelled.", embed=None, view=None)
 
 
 def _run_start_embed(view: RunStartView) -> discord.Embed:
-    alt_text = "not selected"
-    if view.alt_id is not None:
-        alt = state.get(view.alt_id)
-        alt_text = f"{alt.name} (Alt {view.alt_id})" if alt else f"Alt {view.alt_id}"
-    mode_text = view.ad_type or "not selected"
-    return discord.Embed(
-        title="🚀 Start an alt run · Step 1 of 3",
-        description=(
-            "This private setup is visible only to you.\n\n"
-            f"Alt: **{alt_text}**\n"
-            f"Ad type: **{_ad_icon(view.ad_type or '')} {mode_text}**\n\n"
-            "Choose both values, then press **Continue**."
-        ),
-        color=0x5865F2,
-    )
-
-
-async def _private_interaction_error(inter: discord.Interaction, text: str) -> None:
-    """Keep /run errors private whether the interaction was already deferred."""
-    try:
-        if inter.response.is_done():
-            await inter.followup.send(text, ephemeral=True)
-        else:
-            await inter.response.send_message(text, ephemeral=True)
-    except Exception:
-        # There is no useful second response if Discord rejected the first one.
-        pass
-
-
-def _validate_run_page_one(values: dict[str, str]) -> list[str]:
-    """Compatibility helper for callers that validate only ad details."""
-    return _validate_run_values({
-        **values,
-        "interval_min": values.get("interval_min", "5"),
-        "total_hours": values.get("total_hours", "6"),
-        "attach_image": values.get("attach_image", "yes"),
-    })[0]
+    alt = state.get(view.alt_id) if view.alt_id else None
+    embed = discord.Embed(title="🚀 V6 start a sender run", color=0x5865F2)
+    embed.description = "Choose every runtime setting below, then enter the ad text/rates. This form is private and owner-only."
+    embed.add_field(name="Alt", value=alt.name if alt else "not selected", inline=True)
+    embed.add_field(name="Mode", value=view.ad_type or "not selected", inline=True)
+    embed.add_field(name="Interval / runtime", value=f"{view.interval_min} min / {view.total_hours} h", inline=True)
+    embed.add_field(name="Image / buy style", value=f"{view.attach_image} / {view.buy_style} (confirm in modal)", inline=True)
+    return embed
 
 
 def _validate_run_values(values: dict[str, str]) -> tuple[list[str], dict[str, object]]:
-    errors: list[str] = []
-    raw_alt_id = values.get("alt_id", "").strip()
-    if raw_alt_id not in {str(i) for i in state.alt_ids}:
-        errors.append("Choose one of the configured alts.")
-    try:
-        parsed_alt_id = int(raw_alt_id)
-    except (TypeError, ValueError):
-        parsed_alt_id = 0
-
-    ad_type = values.get("ad_type", "").strip().lower()
-    if ad_type not in ("sell", "buy"):
-        errors.append("ad_type must be sell or buy.")
-
+    errors = []
+    try: alt_id = int(values.get("alt_id", ""))
+    except (TypeError, ValueError): alt_id = 0
+    if alt_id not in state.alt_ids: errors.append("Choose a configured alt.")
+    ad_type = values.get("ad_type", "").lower().strip()
+    if ad_type not in {"sell", "buy"}: errors.append("Mode must be sell or buy.")
     if ad_type == "sell":
         rate = _extract_price(values.get("sell_rate", ""))
-        if rate is None or not 0 < rate <= 20:
-            errors.append("Sell rate must contain a number between 0 and 20, for example 2.5$.")
-        if len(values.get("sell_extra", "")) > 500:
-            errors.append("Sell extra text is limited to 500 characters.")
+        if rate is None or not 0 < rate <= 20: errors.append("Sell rate must be between 0 and 20.")
         rap = None
+        if len(values.get("sell_extra", "")) > 500: errors.append("Sell extra text is limited to 500 characters.")
     elif ad_type == "buy":
-        rate = _extract_price(values.get("buy_rate", ""))
-        if rate is None or not 0 < rate <= 20:
-            errors.append("Token rate must contain a number between 0 and 20, for example 2.2.")
-        rap = _extract_price(values.get("buy_rate_rap", ""))
-        if rap is None or not 0 < rap <= 20:
-            errors.append("RAP rate must contain a number between 0 and 20, for example 1.8.")
-        style = values.get("buy_style", "").strip().lower()
-        if style not in ("detailed", "simple"):
-            errors.append("Buy style must be detailed or simple.")
-        simple_text = values.get("buy_simple_text", "").strip()
-        if style == "simple" and not simple_text:
-            errors.append("Simple buy text is required when using simple style.")
-        if len(simple_text) > 1900:
-            errors.append("Simple buy text is limited to 1900 characters.")
-    else:
-        rate = None
-        rap = None
-
-    try:
-        interval = int(values.get("interval_min", ""))
-        if interval not in (3, 5):
-            errors.append("Interval must be 3 or 5 minutes.")
-    except (TypeError, ValueError):
-        interval = 0
-        errors.append("Interval must be 3 or 5 minutes.")
-
-    try:
-        hours = int(values.get("total_hours", ""))
-        if hours not in (6, 12, 18, 24, 48):
-            errors.append("Runtime must be 6, 12, 24,  or 48 hours.")
-    except (TypeError, ValueError):
-        hours = 0
-        errors.append("Runtime must be 6, 12, 18, 24, or 48 hours.")
-
-    attach_image = values.get("attach_image", "").strip().lower()
-    if attach_image not in ("yes", "no"):
-        errors.append("Image setting must be yes or no.")
-
-    parsed = {
-        "alt_id": parsed_alt_id,
-        "rate": rate,
-        "rap": rap,
-        "interval": interval,
-        "hours": hours,
-    }
-    return errors, parsed
+        rate = _extract_price(values.get("buy_rate", "")); rap = _extract_price(values.get("buy_rate_rap", ""))
+        if rate is None or not 0 < rate <= 20: errors.append("Token rate must be between 0 and 20.")
+        if rap is None or not 0 < rap <= 20: errors.append("RAP rate must be between 0 and 20.")
+        if values.get("buy_style") not in {"simple", "detailed"}: errors.append("Buy style must be simple or detailed.")
+        if values.get("buy_style") == "simple" and not values.get("buy_simple_text", "").strip(): errors.append("Simple buy text is required for simple style.")
+        if len(values.get("buy_simple_text", "")) > 1900: errors.append("Simple buy text is limited to 1900 characters.")
+    else: rate = rap = None
+    try: interval = int(values.get("interval_min", ""))
+    except (TypeError, ValueError): interval = 0
+    if interval not in {3, 5}: errors.append("Interval must be 3 or 5 minutes.")
+    try: hours = int(values.get("total_hours", ""))
+    except (TypeError, ValueError): hours = 0
+    if hours not in {6, 12, 18, 24, 48}: errors.append("Runtime must be 6, 12, 18, 24, or 48 hours.")
+    if values.get("attach_image") not in {"yes", "no"}: errors.append("Image setting must be yes or no.")
+    return errors, {"alt_id": alt_id, "rate": rate, "rap": rap, "interval": interval, "hours": hours}
 
 
-async def _dispatch_run_from_modal(
-    inter: discord.Interaction, values: dict[str, str], parsed: dict[str, object]
-) -> None:
-    """Cancel the previous run, dispatch the new workflow, and acknowledge it."""
+async def _dispatch_run_from_modal(inter: discord.Interaction, values: dict[str, str], parsed: dict[str, object]) -> None:
     if not _is_owner(inter):
-        await _private_interaction_error(
-            inter, "🔒 You aren't authorized to run control commands."
-        )
+        await inter.response.send_message("🔒 You aren't authorized to run control commands.", ephemeral=True)
         return
-    if not inter.response.is_done():
-        await inter.response.defer(ephemeral=True)
-    alt_id = int(parsed["alt_id"])
-    a = state.get(alt_id)
-    if not a:
-        await inter.followup.send(f"❓ Unknown alt {alt_id}.", ephemeral=True)
-        return
-    if not config.GITHUB_TOKEN:
-        await inter.followup.send(
-            "❌ GitHub control is not configured: GH_TOKEN is missing.", ephemeral=True
-        )
-        return
-    if not config.GITHUB_OWNER or not config.ALT_REPOS:
-        await inter.followup.send(
-            "❌ GitHub control is not configured: ALT_GITHUB_OWNER/ALT_REPOS are missing. "
-            "Update the core Control Bot workflow and restart it.",
-            ephemeral=True,
-        )
-        return
-
-    ad_type = values["ad_type"]
-    rate = float(parsed["rate"])
-    rap = float(parsed["rap"] or 0)
+    if not inter.response.is_done(): await inter.response.defer(ephemeral=True)
+    alt_id = int(parsed["alt_id"]); alt = state.get(alt_id)
+    if not alt: return await inter.followup.send("❓ Unknown alt.", ephemeral=True)
+    if not config.GITHUB_TOKEN or not config.GITHUB_OWNER or alt_id not in config.ALT_REPOS:
+        return await inter.followup.send("❌ GitHub control is not configured for this alt.", ephemeral=True)
     inputs = {
-        "ad_type": ad_type,
-        "interval_min": str(parsed["interval"]),
-        "total_hours": str(parsed["hours"]),
-        "attach_image": values["attach_image"],
-        "channel_1": "",
-        "channel_2": "",
-        "channel_1_name": "",
-        "channel_2_name": "",
+        "ad_type": values["ad_type"], "interval_min": str(parsed["interval"]), "total_hours": str(parsed["hours"]),
+        "attach_image": values["attach_image"], "channel_1": "", "channel_2": "", "channel_1_name": "", "channel_2_name": "",
     }
-    if ad_type == "sell":
-        inputs.update({
-            "sell_rate": values["sell_rate"],
-            "sell_extra": values.get("sell_extra", ""),
-        })
-    else:
-        inputs.update({
-            "buy_style": values["buy_style"],
-            "buy_rate": f"{rate:g}",
-            "buy_rate_rap": f"{rap:g}",
-            "buy_simple_text": values.get("buy_simple_text", ""),
-        })
-
+    if values["ad_type"] == "sell": inputs.update({"sell_rate": values["sell_rate"], "sell_extra": values.get("sell_extra", "")})
+    else: inputs.update({"buy_style": values["buy_style"], "buy_rate": str(parsed["rate"]), "buy_rate_rap": str(parsed["rap"]), "buy_simple_text": values.get("buy_simple_text", "")})
     try:
         await asyncio.to_thread(github_api.cancel_run, alt_id)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1)
         ok, msg = await asyncio.to_thread(github_api.dispatch_workflow, alt_id, inputs)
     except Exception as exc:
-        await inter.followup.send(
-            f"❌ Failed to start {a.name}: {type(exc).__name__}: {exc}",
-            ephemeral=True,
-        )
-        return
-    if not ok:
-        await inter.followup.send(f"❌ Failed to start {a.name}: {msg}", ephemeral=True)
-        return
-
-    state.set_workflow(alt_id, run_id=None, status="queued", conclusion="")
-    preview = values.get("sell_extra", "") if ad_type == "sell" else (
-        values.get("buy_simple_text", "") or f"BUYING BLADE BALL TOKENS {rate:g}/1K RAP {rap:g}/1K"
-    )
-    state.set_run_config(alt_id, ad_type=ad_type, rate=rate, message=preview)
-    rate_str = values.get("sell_rate", "") if ad_type == "sell" else f"tok {rate:g} / rap {rap:g}"
-    log_line = (
-        f"🚀 **{a.name}** STARTED — {ad_type} {rate_str} · "
-        f"{values['interval_min']}min × {values['total_hours']}h · img={values['attach_image']}\n{msg}"
-    )
-    await inter.followup.send(log_line, ephemeral=True)
-    await _log_control(log_line)
-    state.append_log(
+        return await inter.followup.send(f"❌ Dispatch failed: {type(exc).__name__}: {exc}", ephemeral=True)
+    if not ok: return await inter.followup.send(f"❌ Dispatch failed: {msg}", ephemeral=True)
+    rate = parsed["rate"]
+    state.set_workflow(alt_id, None, "queued", "")
+    state.set_run_config(
         alt_id,
-        f"Started: {ad_type} {rate_str} {values['interval_min']}m×{values['total_hours']}h img={values['attach_image']}",
-        emoji="🚀", color=0x57F287,
+        ad_type=values["ad_type"],
+        rate=rate,
+        message=values.get("sell_extra") or values.get("buy_simple_text"),
+        interval_min=parsed["interval"],
+        runtime_hours=parsed["hours"],
     )
+    text = f"🚀 **{alt.name}** queued privately: {values['ad_type']} · {parsed['interval']}min × {parsed['hours']}h · image={values['attach_image']}\n{msg}"
+    await inter.followup.send(text, ephemeral=True)
+    await _log_control(text)
+    state.append_log(alt_id, text, emoji="🚀", color=0x57F287, kind="CONTROL")
+
+
+async def _finish_dm_control(inter: discord.Interaction, alt_id: int,
+                             command: str, label: str, *, update=None) -> None:
+    """Send a DM control command and report the exact remote acknowledgement privately."""
+    alt = state.get(alt_id)
+    if not alt:
+        await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=True)
+    ack = await _send_dm_wait_ack(alt_id, command, timeout=20)
+    failed = ack.startswith(("❌", "⏰"))
+    if not failed and update:
+        update()
+    status = "Remote alt acknowledged the command." if not failed else "Remote alt did not confirm the change."
+    text = (
+        f"{'✅' if not failed else '⚠️'} **{alt.name}** — {label}\n"
+        f"Command sent: `{command[:900]}`\n"
+        f"Acknowledgement: `{ack[:900]}`\n{status}"
+    )
+    await inter.followup.send(text, ephemeral=True)
+    await _log_control(text)
+    state.append_log(alt_id, f"{label}: {ack}", emoji="✅" if not failed else "⚠️",
+                      color=0x57F287 if not failed else 0xFEE75C, kind="CONTROL")
 
 
 @bot.tree.command(name="run", description="Start an alt run using a private 3-step form.")
@@ -725,225 +452,269 @@ async def cmd_run(inter: discord.Interaction):
     await inter.response.send_message(embed=_run_start_embed(view), view=view, ephemeral=True)
 
 
-# Alt autocomplete: alt parameter on commands that take an int
-async def alt_autocomplete(inter: discord.Interaction, current: str):
-    cur = current.lower()
-    out = []
-    for i in state.alt_ids:
-        a = state.get(i)
-        label = _alt_label(i)
-        if not cur or cur in label.lower():
-            out.append(app_commands.Choice(name=label, value=i))
-    return out[:25]
-
-
-# Decorator to add autocomplete to the right params
-def alt_param(fn):
-    # We apply choices via autocomplete at registration time — see cmd registration below.
-    return fn
-
-
-@bot.tree.command(name="stop", description="Stop (cancel) an alt's current GitHub run.")
-@app_commands.describe(alt="Which alt")
+@bot.tree.command(name="stop", description="Stop one alt's current run and public activity.")
+@app_commands.describe(alt="Configured alt to stop")
 async def cmd_stop(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
         return
     a = state.get(alt)
     if not a:
         return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-    # Defer before any network work so a slow Discord DM cannot exceed the
-    # interaction's three-second initial-response window.
-    await inter.response.defer(ephemeral=False)
-    # Try sending !stop DM too (graceful shutdown via v5.3 panic)
-    await _send_dm(alt, "!stop")
-    await asyncio.sleep(1.0)
+    await inter.response.defer(ephemeral=True)
+    dm_ack = await _send_dm_wait_ack(alt, "!stop", timeout=15)
     ok, msg = await asyncio.to_thread(github_api.cancel_run, alt)
-    state.set_workflow(alt, run_id=None, status="cancelled" if ok else state.get(alt).workflow_status,
-                      conclusion="cancelled" if ok else "")
-    text = f"🛑 **{a.name}** stop requested. {msg}"
-    await inter.followup.send(text)
+    state.set_workflow(alt, run_id=None, status="cancelled" if ok else a.workflow_status,
+                       conclusion="cancelled" if ok else "")
+    text = f"🛑 **{a.name}** stop requested. DM acknowledgement: `{dm_ack}`\nGitHub: {msg}"
+    await inter.followup.send(text, ephemeral=True)
     await _log_control(text)
-    state.append_log(alt, "Stop requested via /stop", emoji="🛑", color=0xED4245)
+    state.append_log(alt, text, emoji="🛑", color=0xED4245, kind="CONTROL")
 
 
-@bot.tree.command(name="pause", description="Ask an alt to pause public posting (sends !pause DM).")
-@app_commands.describe(alt="Which alt")
+@bot.tree.command(name="pause", description="Pause one alt's public posting through its DM control channel.")
+@app_commands.describe(alt="Configured alt to pause")
 async def cmd_pause(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
         return
-    a = state.get(alt)
-    if not a:
-        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-    await inter.response.defer(ephemeral=False)
-    ack = await _send_dm_wait_ack(alt, "!pause", timeout=15)
-    text = f"⏸️ **{a.name}** pause sent. Reply: `{ack}`"
-    await inter.followup.send(text)
-    await _log_control(text)
-    state.append_log(alt, "Paused via DM", emoji="⏸️", color=0xFEE75C)
+    await _finish_dm_control(inter, alt, "!pause", "pause requested")
 
 
-@bot.tree.command(name="resume", description="Resume a paused alt (sends !resume DM).")
-@app_commands.describe(alt="Which alt")
+@bot.tree.command(name="resume", description="Resume one paused alt through its DM control channel.")
+@app_commands.describe(alt="Configured alt to resume")
 async def cmd_resume(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
         return
-    a = state.get(alt)
-    if not a:
-        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-    await inter.response.defer(ephemeral=False)
-    ack = await _send_dm_wait_ack(alt, "!resume", timeout=15)
-    text = f"▶️ **{a.name}** resume sent. Reply: `{ack}`"
-    await inter.followup.send(text)
-    await _log_control(text)
-    state.append_log(alt, "Resumed via DM", emoji="▶️", color=0x57F287)
+    await _finish_dm_control(inter, alt, "!resume", "resume requested")
 
 
-@bot.tree.command(name="setprice", description="Change an alt's rate mid-run.")
-@app_commands.describe(alt="Which alt", new_price="e.g. 2.3 or 2.3$")
+@bot.tree.command(name="setprice", description="Validate and change one alt's price; confirmation is private.")
+@app_commands.describe(alt="Configured alt", new_price="Positive price, 0 < value <= 20; example 2.30")
 async def cmd_setprice(inter: discord.Interaction, alt: int, new_price: str):
     if not await _check_perms(inter):
         return
-    a = state.get(alt)
-    if not a:
-        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-    price_val = _extract_price(new_price)
-    if price_val is None or not 0 < price_val <= 20:
-        return await inter.response.send_message(
-            "❌ new_price must contain a number between 0 and 20, for example `2.3$`.",
-            ephemeral=True,
-        )
-    await inter.response.defer(ephemeral=False)
-    ack = await _send_dm_wait_ack(alt, f"!setprice {new_price}", timeout=20)
-    text = f"💰 **{a.name}** setprice → `{new_price}`. Reply: `{ack}`"
-    await inter.followup.send(text)
-    await _log_control(text)
-    if price_val is not None:
-        state.set_run_config(alt, rate=price_val)
-    state.append_log(alt, f"Price changed to {new_price}", emoji="💰", color=0x5865F2)
+    value = _extract_price(new_price)
+    if value is None or not 0 < value <= 20:
+        return await inter.response.send_message("❌ Price must be a number greater than 0 and no more than 20; example `2.30`.", ephemeral=True)
+    await _finish_dm_control(
+        inter, alt, f"!setprice {value:g}", f"price validated at ${value:.2f}/1k",
+        update=lambda: state.set_run_config(alt, rate=value),
+    )
 
 
-@bot.tree.command(name="setmode", description="Switch an alt between sell/buy mid-run.")
-@app_commands.describe(alt="Which alt", mode="sell or buy")
-@app_commands.choices(mode=[app_commands.Choice(name="sell", value="sell"),
-                           app_commands.Choice(name="buy", value="buy")])
+@bot.tree.command(name="setmode", description="Validate and switch one alt between sell and buy.")
+@app_commands.describe(alt="Configured alt", mode="sell or buy")
+@app_commands.choices(mode=[app_commands.Choice(name="sell", value="sell"), app_commands.Choice(name="buy", value="buy")])
 async def cmd_setmode(inter: discord.Interaction, alt: int, mode: str):
     if not await _check_perms(inter):
         return
-    a = state.get(alt)
-    if not a:
-        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-    await inter.response.defer(ephemeral=False)
-    ack = await _send_dm_wait_ack(alt, f"!setmode {mode}", timeout=20)
-    text = f"🔄 **{a.name}** setmode → `{mode}`. Reply: `{ack}`"
-    await inter.followup.send(text)
-    await _log_control(text)
-    state.set_run_config(alt, ad_type=mode)
-    state.append_log(alt, f"Mode set to {mode}", emoji="🔄", color=0x5865F2)
+    mode = mode.lower().strip()
+    if mode not in {"sell", "buy"}:
+        return await inter.response.send_message("❌ Mode must be `sell` or `buy`.", ephemeral=True)
+    await _finish_dm_control(
+        inter, alt, f"!setmode {mode}", f"mode validated as `{mode}`",
+        update=lambda: state.set_run_config(alt, ad_type=mode),
+    )
 
 
-@bot.tree.command(name="setmessage", description="Change an alt's ad text mid-run.")
-@app_commands.describe(alt="Which alt", new_message="New full ad message")
+@bot.tree.command(name="setmessage", description="Validate and replace one alt's message text.")
+@app_commands.describe(alt="Configured alt", new_message="Non-empty message, max 1900 characters")
 async def cmd_setmessage(inter: discord.Interaction, alt: int, new_message: str):
     if not await _check_perms(inter):
         return
-    a = state.get(alt)
-    if not a:
-        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+    new_message = new_message.strip()
+    if not new_message:
+        return await inter.response.send_message("❌ Message cannot be empty.", ephemeral=True)
     if len(new_message) > 1900:
-        return await inter.response.send_message("❌ Message too long (max 1900 chars).", ephemeral=True)
-    await inter.response.defer(ephemeral=False)
-    ack = await _send_dm_wait_ack(alt, f"!setmessage {new_message}", timeout=20)
-    text = f"📝 **{a.name}** setmessage. Reply: `{ack}`"
-    await inter.followup.send(text)
-    await _log_control(text)
-    state.set_run_config(alt, message=new_message)
-    state.append_log(alt, "Message updated via DM", emoji="📝", color=0x5865F2)
+        return await inter.response.send_message("❌ Message too long; maximum is 1900 characters.", ephemeral=True)
+    await _finish_dm_control(
+        inter, alt, f"!setmessage {new_message}", f"message validated ({len(new_message)} characters)",
+        update=lambda: state.set_run_config(alt, message=new_message),
+    )
 
 
-@bot.tree.command(name="sync", description="Force all alts to reload their Gist blocklist + config.")
+@bot.tree.command(name="setchannel", description="Verify and add/update one channel ID on an alt at runtime.")
+@app_commands.describe(alt="Configured alt", channel_id="Numeric Discord channel ID", name="Optional channel label")
+async def cmd_setchannel(inter: discord.Interaction, alt: int, channel_id: str, name: str = ""):
+    if not await _check_perms(inter):
+        return
+    cid = channel_id.strip()
+    if not cid.isdigit():
+        return await inter.response.send_message("❌ Channel ID must contain digits only.", ephemeral=True)
+    label = re.sub(r"[\r\n]", " ", name.strip())[:80]
+    await _finish_dm_control(
+        inter, alt, f"!setchannel {cid}{(' ' + label) if label else ''}", f"channel ID validated: `{cid}`",
+        update=lambda: state.set_channel(alt, cid, label),
+    )
+
+
+@bot.tree.command(name="replacechannel", description="Replace one channel ID with another after remote verification.")
+@app_commands.describe(alt="Configured alt", old_id="Old numeric channel ID", new_id="New numeric channel ID", name="Optional label")
+async def cmd_replacechannel(inter: discord.Interaction, alt: int, old_id: str, new_id: str, name: str = ""):
+    if not await _check_perms(inter):
+        return
+    if not old_id.isdigit() or not new_id.isdigit():
+        return await inter.response.send_message("❌ Both channel IDs must contain digits only.", ephemeral=True)
+    label = re.sub(r"[\r\n]", " ", name.strip())[:80]
+    await _finish_dm_control(
+        inter, alt, f"!replacechannel {old_id} {new_id}{(' ' + label) if label else ''}",
+        f"channel replacement validated: `{old_id}` → `{new_id}`",
+        update=lambda: state.replace_channel(alt, old_id, new_id, label),
+    )
+
+
+@bot.tree.command(name="setinterval", description="Change an alt's interval for the current/next runtime.")
+@app_commands.describe(alt="Configured alt", interval="Allowed interval: 3 or 5 minutes")
+@app_commands.choices(interval=[app_commands.Choice(name="3 minutes", value=3), app_commands.Choice(name="5 minutes", value=5)])
+async def cmd_setinterval(inter: discord.Interaction, alt: int, interval: int):
+    if not await _check_perms(inter):
+        return
+    if interval not in {3, 5}:
+        return await inter.response.send_message("❌ Interval must be 3 or 5 minutes.", ephemeral=True)
+    await _finish_dm_control(
+        inter, alt, f"!setinterval {interval}", f"interval validated at {interval} minutes",
+        update=lambda: state.set_run_config(alt, interval_min=interval),
+    )
+
+
+@bot.tree.command(name="setruntime", description="Change an alt's runtime; preserves the 6/12/18/24/48-hour choices.")
+@app_commands.describe(alt="Configured alt", hours="Allowed runtime: 6, 12, 18, 24, or 48 hours")
+@app_commands.choices(hours=[app_commands.Choice(name=f"{h} hours", value=h) for h in (6, 12, 18, 24, 48)])
+async def cmd_setruntime(inter: discord.Interaction, alt: int, hours: int):
+    if not await _check_perms(inter):
+        return
+    if hours not in {6, 12, 18, 24, 48}:
+        return await inter.response.send_message("❌ Runtime must be 6, 12, 18, 24, or 48 hours.", ephemeral=True)
+    await _finish_dm_control(
+        inter, alt, f"!setruntime {hours}", f"runtime validated at {hours} hours",
+        update=lambda: state.set_run_config(alt, runtime_hours=hours),
+    )
+
+
+@bot.tree.command(name="sync", description="Ask every configured alt to reload shared Gist state.")
 async def cmd_sync(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
-    await inter.response.defer(ephemeral=False)
+    await inter.response.defer(ephemeral=True)
     results = []
-    for i in state.alt_ids:
-        a = state.get(i)
-        ack = await _send_dm_wait_ack(i, "!sync", timeout=12)
-        results.append(f"**{a.name}**: `{ack}`")
-    text = "🔄 **Sync sent to all alts**\n" + "\n".join(results)
-    await inter.followup.send(text)
+    for alt_id in state.alt_ids:
+        alt = state.get(alt_id)
+        ack = await _send_dm_wait_ack(alt_id, "!sync", timeout=12)
+        results.append(f"**{alt.name}**: `{ack}`")
+        state.append_log(alt_id, f"sync: {ack}", emoji="🔄", color=0x5865F2, kind="CONTROL")
+    text = "🔄 **Sync sent to all configured alts**\n" + "\n".join(results)
+    await inter.followup.send(text, ephemeral=True)
     await _log_control(text)
 
 
-@bot.tree.command(name="status", description="Show detailed status for all alts or a specific one.")
-@app_commands.describe(alt="Which alt (or All)")
+@bot.tree.command(name="status", description="Show current heartbeat, counters, alerts, and GitHub state.")
+@app_commands.describe(alt="Configured alt, or All alts")
 async def cmd_status(inter: discord.Interaction, alt: int = 0):
     if not await _check_perms(inter):
         return
+    await _fresh_state()
     if alt == 0:
-        embeds = build_all(state)
-        await inter.response.send_message(embeds=embeds[:10], ephemeral=False)
+        await inter.response.send_message(embeds=build_all(state)[:10], ephemeral=True)
     else:
-        em = build_single_alt_embed(state, alt)
-        await inter.response.send_message(embed=em, ephemeral=False)
+        await inter.response.send_message(embed=build_single_alt_embed(state, alt), ephemeral=True)
 
 
-@bot.tree.command(name="logs", description="Show recent log lines for an alt.")
-@app_commands.describe(alt="Which alt", limit="Number of lines (5-50)")
-async def cmd_logs(inter: discord.Interaction, alt: int, limit: int = 10):
+@bot.tree.command(name="logs", description="Show typed operational logs for an alt.")
+@app_commands.describe(alt="Configured alt", limit="Number of lines (5-50)", kind="ALL, ERROR, DEAL, CONTROL, CHANNEL, CAUTION, or DEBUG")
+@app_commands.choices(kind=[app_commands.Choice(name=k, value=k) for k in ("ALL", "ERROR", "DEAL", "CONTROL", "CHANNEL", "CAUTION", "DEBUG")])
+async def cmd_logs(inter: discord.Interaction, alt: int, limit: int = 10, kind: str = "ALL"):
     if not await _check_perms(inter):
         return
     a = state.get(alt)
     if not a:
         return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-    limit = max(5, min(50, limit))
-    entries = state.recent_logs(alt, limit)
+    entries = state.recent_logs(alt, max(5, min(50, limit)), kind)
     if not entries:
-        return await inter.response.send_message(f"No buffered logs for {a.name} yet (logs populate when webhooks fire).", ephemeral=True)
-    lines = []
-    for ts, emo, _col, txt in entries:
-        t = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-        lines.append(f"`[{t}]` {emo} {txt}")
-    body = "\n".join(lines)
-    if len(body) > 1900:
-        body = body[-1900:]
-    em = discord.Embed(title=f"📜 {a.name} — last {len(entries)} log lines",
-                       color=0x2F3136, description=body[:4000])
-    await inter.response.send_message(embed=em, ephemeral=False)
-
-
-@bot.tree.command(name="dashboard", description="(Re)post the unified dashboard in #dashboard.")
-async def cmd_dashboard(inter: discord.Interaction):
-    if not await _check_perms(inter):
-        return
-    await inter.response.defer(ephemeral=False)
-    embeds = build_all(state)
-    msg = await _post_dashboard(embeds)
-    await inter.followup.send(f"✅ Dashboard refreshed → {msg.jump_url if msg else '(failed)'}")
-
-
-@bot.tree.command(name="help", description="List the available farm-control commands.")
-async def cmd_help(inter: discord.Interaction):
-    """Show the command reference privately to an authorized operator."""
-    if not await _check_perms(inter):
-        return
-    lines = []
-    for command in sorted(bot.tree.get_commands(), key=lambda item: item.name):
-        lines.append(f"**/{command.name}** — {command.description}")
-    embed = discord.Embed(
-        title="🛠️ Farm control commands",
-        description="\n".join(lines),
-        color=0x5865F2,
-    )
+        return await inter.response.send_message(f"No `{kind}` logs buffered for {a.name}.", ephemeral=True)
+    lines = [f"`[{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}]` {emo} {txt}" for ts, emo, _col, txt in entries]
+    body = "\n".join(lines)[-3900:]
+    embed = discord.Embed(title=f"📜 {a.name} · {kind} logs", description=body, color=0x2F3136)
     await inter.response.send_message(embed=embed, ephemeral=True)
 
 
-# Register autocomplete for the "alt" int parameter on every command that takes it
-for cmd in (cmd_stop, cmd_pause, cmd_resume, cmd_setprice, cmd_setmode, cmd_setmessage, cmd_logs, cmd_status):
-    # We do this by wrapping autocomplete at command-tree level — easier:
-    # use a choice list with Alt 1..4 at minimum so the dropdown works even
-    # without autocomplete, and add autocomplete dynamically.
-    pass
+@bot.tree.command(name="deals", description="Show the latest separate deal-alert counter and timestamp.")
+@app_commands.describe(alt="Configured alt, or All alts")
+async def cmd_deals(inter: discord.Interaction, alt: int = 0):
+    if not await _check_perms(inter):
+        return
+    chosen = state.all() if alt == 0 else ([state.get(alt)] if state.get(alt) else [])
+    if not chosen:
+        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+    lines = []
+    for item in chosen:
+        last = datetime.fromtimestamp(item.last_deal_ts, timezone.utc).isoformat() if item.last_deal_ts else "never"
+        lines.append(f"**{item.name}** — alerts: `{item.deal_alerts}` · last: `{last}`")
+    await inter.response.send_message(embed=discord.Embed(title="📈 Separate deal scanner state", description="\n".join(lines), color=0x57F287), ephemeral=True)
+
+
+@bot.tree.command(name="refresh", description="Refresh GitHub run state and the live dashboard immediately.")
+async def cmd_refresh(inter: discord.Interaction):
+    if not await _check_perms(inter):
+        return
+    await inter.response.defer(ephemeral=True)
+    await _fresh_state()
+    await _refresh_dashboard_now()
+    await inter.followup.send("✅ GitHub heartbeat state and dashboard refreshed from current data.", ephemeral=True)
+
+
+@bot.tree.command(name="dashboard", description="Refresh the live three-embed dashboard in the dashboard channel.")
+async def cmd_dashboard(inter: discord.Interaction):
+    if not await _check_perms(inter):
+        return
+    await inter.response.defer(ephemeral=True)
+    await _fresh_state()
+    msg = await _post_dashboard(build_all(state))
+    await inter.followup.send(f"✅ Dashboard snapshot posted → {msg.jump_url if msg else '(failed)'}", ephemeral=True)
+
+
+_COMMAND_GUIDE = {
+    "run": ("No slash arguments; private form.", "Choose one configured alt, sell/buy, price/style, image yes/no, interval 3/5, and runtime 6/12/18/24/48h. Dispatches its GitHub workflow."),
+    "stop": ("`/stop alt:<alt>`", "Privately sends !stop and cancels the matching GitHub run."),
+    "pause": ("`/pause alt:<alt>`", "Privately sends !pause; public posting should stop after the remote ack."),
+    "resume": ("`/resume alt:<alt>`", "Privately sends !resume and reports the remote ack."),
+    "setprice": ("`/setprice alt:<alt> new_price:<0..20>`", "Validates the value, sends !setprice, and updates live dashboard state only after an ack."),
+    "setmode": ("`/setmode alt:<alt> mode:<sell|buy>`", "Sends !setmode and updates live mode after an ack."),
+    "setmessage": ("`/setmessage alt:<alt> new_message:<text>`", "Rejects empty/text over 1900 chars, sends !setmessage, and updates the preview after an ack."),
+    "setchannel": ("`/setchannel alt:<alt> channel_id:<digits> [name]`", "Sends !setchannel; the sender verifies the channel before adding it to its runtime scheduler."),
+    "replacechannel": ("`/replacechannel alt:<alt> old_id:<digits> new_id:<digits> [name]`", "Sends !replacechannel; the sender verifies the replacement and safely rewrites scheduler state."),
+    "setinterval": ("`/setinterval alt:<alt> interval:<3|5>`", "Sends !setinterval. The sender keeps the permitted 3/5-minute constraint."),
+    "setruntime": ("`/setruntime alt:<alt> hours:<6|12|18|24|48>`", "Sends !setruntime. The sender caps all runtime to 48 hours."),
+    "sync": ("`/sync`", "Sends !sync to every configured alt to reload shared control/Gist state."),
+    "status": ("`/status [alt:<alt>|All alts]`", "Refreshes GitHub state and shows current heartbeat, workflow, counters, channels, errors, and alerts."),
+    "logs": ("`/logs alt:<alt> [limit] [kind]`", "Shows typed buffered logs. Filter kinds include ERROR, DEAL, CONTROL, CHANNEL, CAUTION, and DEBUG."),
+    "deals": ("`/deals [alt:<alt>|All alts]`", "Shows deal-alert counters from the separate deal webhook/state path."),
+    "refresh": ("`/refresh`", "Fetches current GitHub run state and updates the persistent dashboard message."),
+    "dashboard": ("`/dashboard`", "Posts a fresh dashboard snapshot; it does not run the sender or scan deals."),
+    "help": ("`/help`", "Shows this private complete command reference."),
+}
+
+
+@bot.tree.command(name="help", description="Private complete reference with arguments, permissions, examples, and effects.")
+async def cmd_help(inter: discord.Interaction):
+    if not await _check_perms(inter):
+        return
+    registered = {cmd.name: cmd for cmd in bot.tree.get_commands()}
+    embeds = []
+    for name in sorted(registered):
+        usage, effect = _COMMAND_GUIDE.get(name, ("No arguments documented.", "No effect documented."))
+        embed = discord.Embed(title=f"/{name}", color=0x5865F2)
+        embed.add_field(name="Arguments / example", value=usage, inline=False)
+        embed.add_field(name="Permission and effect", value=f"Owner IDs only. {effect}", inline=False)
+        embeds.append(embed)
+    # Discord permits ten embeds per message; command docs remain complete by
+    # splitting the list into a short private page set.
+    for offset in range(0, len(embeds), 10):
+        page = discord.Embed(title=f"🛠️ V6 control reference · page {offset // 10 + 1}/{(len(embeds)+9)//10}", color=0x5865F2)
+        for item in embeds[offset:offset + 10]:
+            page.add_field(name=item.title, value="\n".join(field.value for field in item.fields), inline=False)
+        if offset == 0:
+            await inter.response.send_message(embed=page, ephemeral=True)
+        else:
+            await inter.followup.send(embed=page, ephemeral=True)
 
 
 # Add autocomplete for each alt:int parameter. Use a factory so the command
@@ -968,7 +739,9 @@ def make_alt_autocompleter(command_name: str):
 for command_name, command in (
     ("stop", cmd_stop), ("pause", cmd_pause), ("resume", cmd_resume),
     ("setprice", cmd_setprice), ("setmode", cmd_setmode),
-    ("setmessage", cmd_setmessage), ("logs", cmd_logs), ("status", cmd_status),
+    ("setmessage", cmd_setmessage), ("setchannel", cmd_setchannel), ("replacechannel", cmd_replacechannel),
+    ("setinterval", cmd_setinterval), ("setruntime", cmd_setruntime), ("logs", cmd_logs),
+    ("deals", cmd_deals), ("status", cmd_status),
 ):
     command.autocomplete("alt")(make_alt_autocompleter(command_name))
 
@@ -1031,7 +804,7 @@ async def _send_dm_wait_ack(alt_id: int, text: str, timeout: float = 15.0) -> st
 @bot.event
 async def on_message(message: discord.Message):
     # Ignore self
-    if message.author.id == bot.user.id:
+    if bot.user and message.author.id == bot.user.id:
         return
 
     # ---- Handle DM replies FROM alts ----
@@ -1088,9 +861,39 @@ async def _handle_guild_webhook_message(message: discord.Message):
     webhook username to ALT_NAME, so the author name is the primary routing
     key; the Alt N fallback keeps older messages readable during migration.
     """
+    # Only process webhook/bot-authored traffic in the dedicated ingestion
+    # channels. A normal user's message must never become a phantom deal or
+    # heartbeat just because its display name resembles an alt.
+    if not getattr(message, "webhook_id", None) and not getattr(message.author, "bot", False):
+        return
+    message_id = getattr(message, "id", None)
+    if message_id is not None:
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            message_id = None
+        if message_id is not None:
+            if message_id in _processed_webhook_ids:
+                return
+            _processed_webhook_ids.add(message_id)
+            if len(_processed_webhook_ids) > 5000:
+                _processed_webhook_ids.clear()
+                _processed_webhook_ids.add(message_id)
     ch_id = message.channel.id
     if ch_id == config.DASHBOARD_CH_ID:
         _parse_dashboard_message(message)
+
+    if config.DEALS_CH_ID and ch_id == config.DEALS_CH_ID:
+        names = [getattr(message.author, "display_name", ""), getattr(message.author, "name", "")]
+        alt_id = next((_match_alt_name(name) for name in names if name), None)
+        if alt_id is None:
+            for embed in message.embeds:
+                footer = getattr(embed.footer, "text", "") if embed.footer else ""
+                alt_id = _match_alt_name(footer)
+                if alt_id is not None:
+                    break
+        if alt_id is not None:
+            _parse_deal_message(alt_id, message)
 
     if config.LOG_CH_ID and ch_id == config.LOG_CH_ID:
         names = [
@@ -1111,9 +914,24 @@ async def _handle_guild_webhook_message(message: discord.Message):
             print(f"⚠️ Could not map farm-log webhook username to an alt: {names!r}")
 
 
+def _parse_deal_message(alt_id: int, message: discord.Message):
+    """Record only deal-webhook events; never let them overwrite heartbeat state."""
+    title = ""
+    snippet = message.content or ""
+    for embed in message.embeds:
+        title = getattr(embed, "title", "") or title
+        for field in embed.fields or []:
+            if getattr(field, "name", "").lower() in {"snippet", "user", "price"}:
+                snippet += f" {field.name}: {field.value}"
+    # Heartbeat deal_alerts is the authoritative total. This separate path
+    # updates recency and typed logs without double-counting the same event.
+    state.mark_deal_seen(alt_id)
+    state.append_log(alt_id, f"{title or 'Deal alert'} {snippet[:300]}", emoji="📈", color=0x57F287, kind="DEAL")
+
+
 def _parse_dashboard_message(message: discord.Message):
-    """Extract per-alt heartbeat from structured embeds (v5.5 alts send JSON+embed)."""
-    # Try JSON in content first — v5.5 wraps it in ```json ... ``` code fence
+    """Extract live V6 heartbeat from structured dashboard webhook content."""
+    # Try JSON in content first — V6 wraps it in a JSON code fence
     if message.content:
         raw = message.content.strip()
         # Strip code fence if present
@@ -1187,7 +1005,17 @@ def _parse_log_message(alt_id: int, message: discord.Message):
         emoji, color = "🏁", 0x5865F2
     elif "📩" in body or "DM" in body:
         emoji, color = "📩", 0x5865F2
-    state.append_log(alt_id, body[:300], emoji=emoji, color=color)
+    kind = "INFO"
+    match = re.search(r"\[([A-Z][A-Z0-9_-]{1,23})\]", body)
+    if match:
+        kind = match.group(1)
+    elif "DEAL" in body.upper():
+        kind = "DEAL"
+    elif "CAUTION" in body.upper():
+        kind = "CAUTION"
+    elif "ERROR" in body.upper() or "FAIL" in body.upper():
+        kind = "ERROR"
+    state.append_log(alt_id, body[:300], emoji=emoji, color=color, kind=kind)
     # Try to detect success counts from "total=`N`"
     m = re.search(r"total[`=]\s*(\d+)", body)
     if m:
@@ -1246,6 +1074,7 @@ _dash_message: discord.Message | None = None
 
 @tasks.loop(seconds=config.DASHBOARD_REFRESH_SEC)
 async def refresh_dashboard():
+    await _fresh_state()
     await _refresh_dashboard_now()
 
 

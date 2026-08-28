@@ -76,9 +76,11 @@ class Bootstrap:
         self.bot_token = ""
         self.bot_user: dict[str, Any] = {}
         self.owner_id = ""
+        self.owner_ids: list[str] = []
         self.guild_id = ""
         self.github_owner = ""
         self.core_repo = ""
+        self.existing_repo_names: set[str] = set()
         self.alts: list[dict[str, str]] = []
         self.channels: dict[str, str] = {}
         self.webhooks: dict[str, str] = {}
@@ -236,9 +238,17 @@ class Bootstrap:
         bot_name = self.bot_user.get("username") or self.bot_user.get("global_name") or "?"
         print(f"✓ Official bot validated as @{bot_name}")
 
-        self.owner_id = self.ask("Your Discord user ID", env="OWNER_ID")
-        if not self.owner_id.isdigit():
-            raise SetupError("OWNER_ID must be a numeric Discord ID.")
+        owner_default = os.environ.get("OWNER_IDS", "").strip() or os.environ.get("OWNER_ID", "").strip()
+        owner_raw = self.ask(
+            "Authorized owner Discord IDs (comma-separated)",
+            default=owner_default,
+            env="OWNER_IDS",
+        )
+        owner_parts = [part.strip() for part in owner_raw.split(",") if part.strip()]
+        if not owner_parts or not all(part.isdigit() for part in owner_parts):
+            raise SetupError("OWNER_IDS must contain one or more comma-separated numeric Discord IDs.")
+        self.owner_ids = list(dict.fromkeys(owner_parts))
+        self.owner_id = self.owner_ids[0]  # legacy compatibility for prompts/logs
 
         requested = os.environ.get("GUILD_ID", "").strip()
         if requested:
@@ -275,12 +285,13 @@ class Bootstrap:
             raise SetupError("GUILD_ID must be a numeric Discord ID.")
 
         self.channel_ids = self.ask(
-            "Trading channel IDs (comma-separated; used by every alt)",
+            "Trading channel IDs (comma-separated; blank if using names)",
+            required=False,
             env="CHANNEL_IDS",
         )
         channel_parts = [part.strip() for part in self.channel_ids.split(",") if part.strip()]
-        if not channel_parts or not all(part.isdigit() for part in channel_parts):
-            raise SetupError("CHANNEL_IDS must contain one or more comma-separated numeric channel IDs.")
+        if channel_parts and not all(part.isdigit() for part in channel_parts):
+            raise SetupError("CHANNEL_IDS must contain only comma-separated numeric IDs.")
         self.channel_ids = ",".join(channel_parts)
         self.channel_names = self.ask(
             "Trading channel names (same order, optional; e.g. trading,market)",
@@ -288,8 +299,10 @@ class Bootstrap:
             env="CHANNEL_NAMES",
         )
         name_parts = [part.strip() for part in self.channel_names.split(",") if part.strip()]
-        if name_parts and len(name_parts) != len(channel_parts):
+        if name_parts and channel_parts and len(name_parts) != len(channel_parts):
             raise SetupError("CHANNEL_NAMES must be empty or have one name for each CHANNEL_IDS entry, in the same order.")
+        if not channel_parts and not name_parts:
+            raise SetupError("Provide CHANNEL_IDS or CHANNEL_NAMES so sender targets are not empty.")
         self.channel_names = ",".join(name_parts)
 
     def ensure_channel(self, name: str) -> str:
@@ -392,21 +405,71 @@ class Bootstrap:
         return self.webhook_url(hook)
 
     def provision_discord(self) -> None:
-        print("\nCreating private control channels and three shared webhooks…")
-        for channel_name in ("control", "dashboard", "dm-inbox", "farm-logs"):
+        print("\nCreating/reusing private control channels and four shared webhooks…")
+        for channel_name in ("control", "dashboard", "dm-inbox", "farm-logs", "deals"):
             self.channels[channel_name] = self.ensure_channel(channel_name)
         self.webhooks = {
             "LOG_WEBHOOK_URL": self.ensure_webhook(self.channels["farm-logs"], "Farm Logs"),
             "DASHBOARD_WEBHOOK_URL": self.ensure_webhook(self.channels["dashboard"], "Farm Dashboard"),
             "DM_WEBHOOK_URL": self.ensure_webhook(self.channels["dm-inbox"], "Farm DM Inbox"),
+            "DEAL_WEBHOOK_URL": self.ensure_webhook(self.channels["deals"], "Farm Deals"),
         }
 
     # ---------- alt accounts and GitHub resources ----------
+    def discover_existing_repositories(self) -> set[str]:
+        """List repository names without assuming the canonical alt names exist."""
+        result = self.run_command(
+            ["gh", "repo", "list", self.github_owner, "--limit", "100",
+             "--json", "name", "--jq", ".[].name"],
+            check=False,
+        )
+        if result.returncode != 0:
+            print("⚠️ Could not list repositories for dynamic reuse; explicit ALT_REPO_N values are still honored.")
+            return set()
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+    def existing_alt_count(self) -> int:
+        """Infer 1–4 configured alts from common alt repository naming patterns."""
+        indexes = set()
+        for name in self.existing_repo_names:
+            lowered = name.lower()
+            for index in range(1, 5):
+                if (f"alt{index}" in lowered or f"alt-{index}" in lowered
+                        or f"alt_{index}" in lowered):
+                    indexes.add(index)
+        return len(indexes)
+
+    def select_alt_repository(self, index: int, ad_type: str) -> str:
+        explicit = os.environ.get(f"ALT_REPO_{index}", "").strip()
+        default = f"alt{index}-{ad_type}"
+        if explicit:
+            return explicit
+        if default in self.existing_repo_names:
+            return default
+        candidates = sorted(
+            name for name in self.existing_repo_names
+            if any(token in name.lower() for token in (f"alt{index}", f"alt-{index}", f"alt_{index}"))
+        )
+        if len(candidates) == 1:
+            print(f"  ✓ reusing detected repository for alt {index}: {candidates[0]}")
+            return candidates[0]
+        if not self.non_interactive:
+            return self.ask(
+                f"Alt {index} repository name",
+                default=candidates[0] if candidates else default,
+                env=f"ALT_REPO_{index}",
+            )
+        return default
+
     def collect_alt_inputs(self) -> None:
+        inferred_count = self.existing_alt_count()
         if self.non_interactive:
-            raw_count = os.environ.get("ALT_COUNT", "4").strip() or "4"
+            raw_count = os.environ.get("ALT_COUNT", "").strip() or str(inferred_count or 4)
         else:
-            raw_count = self.ask("Number of alts to configure (1-4)", default="4", env="ALT_COUNT")
+            raw_count = self.ask(
+                "Number of alts to configure (1-4)",
+                default=str(inferred_count or 4), env="ALT_COUNT",
+            )
         try:
             count = int(raw_count)
         except ValueError as exc:
@@ -446,7 +509,7 @@ class Bootstrap:
                 "discord_id": str(body["id"]),
                 "name": name,
                 "ad_type": ad_type,
-                "repo": f"alt{index}-{ad_type}",
+                "repo": self.select_alt_repository(index, ad_type),
             })
             alt_username = body.get("username") or body.get("global_name") or "?"
             print(f"✓ Alt {index} validated as @{alt_username} (ID captured)")
@@ -471,6 +534,9 @@ class Bootstrap:
         )
         if "/" in self.github_owner or not self.github_owner:
             raise SetupError("GITHUB_OWNER must be a username or organization name, not owner/repo.")
+        self.existing_repo_names = self.discover_existing_repositories()
+        if self.existing_repo_names:
+            print(f"✓ detected {len(self.existing_repo_names)} existing repositories under {self.github_owner}; reuse will be preferred")
 
     def ensure_alt_repo(self, repo_name: str) -> str:
         full = f"{self.github_owner}/{repo_name}"
@@ -517,62 +583,6 @@ class Bootstrap:
         )
         if status not in (200, 201) or not isinstance(response, dict) or not response.get("id"):
             message = response.get("message", "") if isinstance(response, dict) else ""
-            raise SetupError(f"Could not create {filename} Gist (HTTP {status}): {message}")
-        return str(response["id"])
-
-    def provision_github(self) -> None:
-        self.determine_github_owner()
-        print("\nCreating alt repositories and installing the canonical templates…")
-        # Install the sender first. self_check.yml is uploaded only after
-        # secrets are in place below, because its push trigger would otherwise
-        # run immediately against an unconfigured repository.
-        templates = [
-            "send_ads.py",
-            ".github/workflows/send_ads.yml",
-        ]
-        for alt in self.alts:
-            repo = self.ensure_alt_repo(alt["repo"])
-            alt["full_repo"] = repo
-            for relative in templates:
-                self.upload_template(repo, relative)
-
-        existing_blocklist = self.ask(
-            "Existing blocklist Gist ID (blank to create one)",
-            required=False, env="GIST_ID",
-        )
-        if existing_blocklist:
-            self.gists["GIST_ID"] = existing_blocklist
-            print(f"  ✓ using existing blocklist Gist {existing_blocklist}")
-        else:
-            self.gists["GIST_ID"] = self.create_gist(
-                "blocked_variations.json", '{"version": 1, "blocked": []}\n',
-                "Ad Farm shared blocked variation list",
-            )
-        existing_control = self.ask(
-            "Existing control Gist ID (blank to create one)",
-            required=False, env="CONTROL_GIST_ID",
-        )
-        if existing_control:
-            self.gists["CONTROL_GIST_ID"] = existing_control
-            print(f"  ✓ using existing control Gist {existing_control}")
-        else:
-            self.gists["CONTROL_GIST_ID"] = self.create_gist(
-                "control.json", "{}\n", "Ad Farm shared runtime control",
-            )
-        print("  ✓ created/selected two private Gists")
-
-    # ---------- repository configuration ----------
-    def existing_names(self, repo: str, kind: str) -> set[str]:
-        """List names only; GitHub never returns secret values."""
-        cache_key = (repo, kind)
-        if cache_key in self._existing_cache:
-            return self._existing_cache[cache_key]
-        if kind == "secret":
-            command = ["gh", "secret", "list", "--repo", repo, "--json", "name", "--jq", ".[].name"]
-        else:
-            command = ["gh", "variable", "list", "--repo", repo, "--json", "name", "--jq", ".[].name"]
-        result = self.run_command(command, check=False)
-        if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             raise SetupError(f"Could not inspect existing {kind}s on {repo}: {detail[:400]}")
         names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
@@ -610,22 +620,25 @@ class Bootstrap:
             detail = (result.stderr or result.stdout).strip()
             raise SetupError(f"Could not set secret {name} on {repo}: {detail[:400]}")
 
-    def set_variable(self, repo: str, name: str, value: str) -> None:
-        if not value or not self.should_write(repo, name, "variable"):
+    def clear_secret(self, repo: str, name: str) -> None:
+        """Remove a stale secret when the operator explicitly selects names-only mode."""
+        if name not in self.existing_names(repo, "secret"):
             return
         result = self.run_command(
-            ["gh", "variable", "set", name, "--repo", repo, "--body", value],
+            ["gh", "secret", "delete", name, "--repo", repo, "--yes"],
             check=False,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
-            raise SetupError(f"Could not set variable {name} on {repo}: {detail[:400]}")
+            raise SetupError(f"Could not clear secret {name} on {repo}: {detail[:400]}")
+        self._existing_cache[(repo, "secret")].discard(name)
+        print(f"  ✓ cleared stale secret {name} on {repo}")
 
     def configure_repositories(self) -> None:
         repo_map = ",".join(f"{a['id']}:{a['repo']}" for a in self.alts)
         id_map = ",".join(f"{a['id']}:{a['discord_id']}" for a in self.alts)
         name_map = ",".join(f"{a['id']}:{a['name']}" for a in self.alts)
-        controller_ids = f"{self.bot_user['id']},{self.owner_id}"
+        controller_ids = ",".join(dict.fromkeys([str(self.bot_user["id"]), *self.owner_ids]))
 
         core_secrets = {
             "BOT_TOKEN": self.bot_token,
@@ -633,8 +646,11 @@ class Bootstrap:
             "CONTROL_CH_ID": self.channels["control"],
             "DASHBOARD_CH_ID": self.channels["dashboard"],
             "LOG_CH_ID": self.channels["farm-logs"],
-            "OWNER_IDS": self.owner_id,
+            "DEALS_CH_ID": self.channels["deals"],
+            "OWNER_IDS": ",".join(self.owner_ids),
             "GH_TOKEN": self.gh_token,
+            # GitHub reserves the GITHUB_ prefix for built-in names, so keep
+            # the selected alt-repository owner under an allowed secret name.
             "ALT_GITHUB_OWNER": self.github_owner,
             "ALT_REPOS": repo_map,
             "ALT_DISCORD_IDS": id_map,
@@ -646,7 +662,7 @@ class Bootstrap:
         # These are aggregate maps, not independent credentials. Always refresh
         # them from the current validated alt list so rerunning bootstrap with a
         # larger ALT_COUNT actually registers the new alts with the control bot.
-        mapping_names = {"ALT_REPOS", "ALT_DISCORD_IDS", "ALT_NAMES"}
+        mapping_names = {"ALT_REPOS", "ALT_DISCORD_IDS", "ALT_NAMES", "OWNER_IDS"}
         for name, value in core_secrets.items():
             self.set_secret(
                 self.core_repo,
@@ -662,23 +678,37 @@ class Bootstrap:
             "LOG_WEBHOOK_URL": self.webhooks["LOG_WEBHOOK_URL"],
             "DASHBOARD_WEBHOOK_URL": self.webhooks["DASHBOARD_WEBHOOK_URL"],
             "DM_WEBHOOK_URL": self.webhooks["DM_WEBHOOK_URL"],
+            "DEAL_WEBHOOK_URL": self.webhooks["DEAL_WEBHOOK_URL"],
             "GIST_TOKEN": self.gh_token,
             "GIST_ID": self.gists["GIST_ID"],
             "CONTROL_GIST_ID": self.gists["CONTROL_GIST_ID"],
             "CONTROLLER_USER_IDS": controller_ids,
-            "PANIC_TRUSTED_IDS": self.owner_id,
-            "CONFIRM_USER_IDS": self.owner_id,
+            "PANIC_TRUSTED_IDS": ",".join(self.owner_ids),
+            "CONFIRM_USER_IDS": ",".join(self.owner_ids),
         }
         if self.tuning_json:
             common_alt_secrets["TUNING_JSON"] = self.tuning_json
         for alt in self.alts:
             repo = alt["full_repo"]
             print(f"  configuring {repo}…")
+            # CHANNEL_IDS and CHANNEL_NAMES are mutually optional. Clear the
+            # opposite stale secret so a deliberate names-only (or IDs-only)
+            # rerun is actually honored instead of leaving the sender with
+            # an old preferred target list.
+            if not self.channel_ids:
+                self.clear_secret(repo, "CHANNEL_IDS")
+            if not self.channel_names:
+                self.clear_secret(repo, "CHANNEL_NAMES")
             self.set_variable(repo, "ALT_ID", alt["id"])
             self.set_variable(repo, "ALT_NAME", alt["name"])
             self.set_secret(repo, "USER_TOKEN", alt["token"])
             for name, value in common_alt_secrets.items():
-                self.set_secret(repo, name, value)
+                self.set_secret(
+                    repo,
+                    name,
+                    value,
+                    replace_existing=name in {"CONTROLLER_USER_IDS", "PANIC_TRUSTED_IDS", "CONFIRM_USER_IDS"},
+                )
             # Upload last so the workflow's push trigger sees a fully
             # configured repository on its first automatic run.
             self.upload_template(repo, ".github/workflows/self_check.yml")
@@ -794,15 +824,16 @@ class Bootstrap:
             print("✅ AD FARM BOOTSTRAP COMPLETE")
         print("=" * 70)
         print(f"Control server: {self.guild_id}")
-        print("Channels: #control, #dashboard, #dm-inbox, #farm-logs")
+        print("Channels: #control, #dashboard, #dm-inbox, #farm-logs, #deals")
         print(f"Alt repositories: {len(self.alts)}")
-        print("Three webhooks configured: DMs, dashboard, and consolidated logs")
+        print("Four webhooks configured: DMs, dashboard, consolidated logs, and separate deals")
         print("\nInvite link (if the bot still needs to be added to another server):")
         print(invite)
         print("\nNext steps:")
         print("  1. Start the '🤖 Control Bot' workflow in the core repository.")
-        print("  2. Use /run in #control; it opens the two-page run modal.")
-        print("  3. Check #dashboard and #farm-logs for heartbeats and actions.")
+        print("  2. Start the V6 control bot; it chains six-hour jobs for 24/7 operation.")
+        print("  3. Use /run in #control; it opens the private settings form.")
+        print("  4. Check #dashboard, #farm-logs, and #deals for live state and typed events.")
         if not self.self_check_failures:
             print("✅ Farm ready! Start the control bot from Actions or run /run in Discord.")
         else:
@@ -811,6 +842,7 @@ class Bootstrap:
     def run(self) -> None:
         self.preflight()
         self.collect_discord_inputs()
+        self.determine_github_owner()
         self.collect_alt_inputs()
         self.provision_discord()
         self.provision_github()

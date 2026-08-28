@@ -97,6 +97,9 @@ jobs:
 
       - name: Cloudflare WARP
         if: steps.warp_check.outputs.should_warp == 'true'
+        # This third-party action has a brittle one-shot `warp=on` assertion.
+        # Let the independent egress check below decide whether routing is
+        # actually safe; it still fails closed on an unverified/datacenter IP.
         continue-on-error: true
         uses: sebst/actions-warp@v1
         with:
@@ -117,6 +120,7 @@ jobs:
           LOG_WEBHOOK_URL: ${{ secrets.LOG_WEBHOOK_URL }}
           DASHBOARD_WEBHOOK_URL: ${{ secrets.DASHBOARD_WEBHOOK_URL }}
           DM_WEBHOOK_URL: ${{ secrets.DM_WEBHOOK_URL }}
+          DEAL_WEBHOOK_URL: ${{ secrets.DEAL_WEBHOOK_URL }}
           TUNING_JSON: ${{ secrets.TUNING_JSON }}
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
@@ -171,10 +175,16 @@ jobs:
           # Import send_ads for AST/self-test. We have to do a compile-only check
           # because full import will try to run.
           print("\n━━━━━ 1. Required secrets present ━━━━━")
-          for req in ["USER_TOKEN", "CHANNEL_IDS"]:
+          for req in ["USER_TOKEN"]:
               v = os.environ.get(req, "").strip()
               if v: ok(f"{req} is set ({len(v)} chars)")
               else: fail(f"{req} is MISSING (required)")
+          channel_ids_raw = os.environ.get("CHANNEL_IDS", "").strip()
+          channel_names_raw = os.environ.get("CHANNEL_NAMES", "").strip()
+          if channel_ids_raw or channel_names_raw:
+              ok("CHANNEL_IDS/CHANNEL_NAMES target configuration is present")
+          else:
+              fail("CHANNEL_IDS or CHANNEL_NAMES is MISSING (required)")
 
           if FAILED:
               print(f"\n{RED}Cannot continue — required secrets missing.{RST}")
@@ -197,8 +207,10 @@ jobs:
 
           # CHANNEL_IDS parse
           print("\n━━━━━ 3. Channels reachable ━━━━━")
-          ch_str = os.environ["CHANNEL_IDS"]
+          ch_str = os.environ.get("CHANNEL_IDS", "")
           channels = [c.strip() for c in ch_str.split(",") if c.strip()]
+          if not channels:
+              info("No numeric channel IDs; sender will resolve CHANNEL_NAMES safely after authentication.")
           for cid in channels:
               if not cid.isdigit():
                   fail(f"channel '{cid}' is not a numeric snowflake")
@@ -286,6 +298,7 @@ jobs:
           check_webhook("logs", "LOG_WEBHOOK_URL")
           check_webhook("dashboard", "DASHBOARD_WEBHOOK_URL")
           check_webhook("dm-forward", "DM_WEBHOOK_URL")
+          check_webhook("deals", "DEAL_WEBHOOK_URL")
 
           # Gist checks
           print("\n━━━━━ 6. Gist access ━━━━━")
@@ -331,8 +344,8 @@ jobs:
                   fail(f"{name} contains non-snowflake values: {bad}")
               else:
                   ok(f"{name} format OK ({len(ids)} IDs)")
-          if os.environ.get("CHANNEL_NAMES", "").strip() and not os.environ.get("CONFIRM_USER_IDS", "").strip():
-              fail("CHANNEL_NAMES is configured but CONFIRM_USER_IDS is empty — auto-discovery would be disabled/fail-closed")
+          if os.environ.get("CHANNEL_NAMES", "").strip() and os.environ.get("CHANNEL_IDS", "").strip() and not os.environ.get("CONFIRM_USER_IDS", "").strip():
+              fail("CHANNEL_NAMES with numeric IDs requires CONFIRM_USER_IDS for safe 404 recovery")
 
           # IP health
           print("\n━━━━━ 8. Outbound IP / routing ━━━━━")

@@ -78,10 +78,11 @@ GUILD_ID = _snowflake("GUILD_ID")
 CONTROL_CH_ID = _snowflake("CONTROL_CH_ID")
 DASHBOARD_CH_ID = _snowflake("DASHBOARD_CH_ID")
 LOG_CH_ID = _snowflake("LOG_CH_ID")
+DEALS_CH_ID = _snowflake("DEALS_CH_ID")
 
 # ---------- Authorized users ----------
 OWNER_IDS: set[int] = set()
-for uid in _split("OWNER_IDS"):
+for uid in (_split("OWNER_IDS") or _split("OWNER_ID")):
     try:
         OWNER_IDS.add(int(uid))
     except ValueError:
@@ -93,7 +94,7 @@ CMD_COOLDOWN_SEC = _int("CMD_COOLDOWN_SEC", 5)
 
 # ---------- GitHub ----------
 # One shared token from `gh auth token` is used for dispatch, sync, and Gists.
-GITHUB_TOKEN = _env("GH_TOKEN")
+GITHUB_TOKEN = _env("GH_TOKEN") or _env("GITHUB_PAT")
 GITHUB_OWNER = _env("GITHUB_OWNER")
 CONTROL_HTTP_TIMEOUT = _int("CONTROL_HTTP_TIMEOUT", 20)
 

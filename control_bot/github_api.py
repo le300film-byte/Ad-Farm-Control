@@ -11,7 +11,7 @@ from . import config
 
 
 # Control-server HTTP timeout (seconds). Matches WEBHOOK_TIMEOUT=20 on the
-# self-bot side (v5.5.1). Override via CONTROL_HTTP_TIMEOUT if needed.
+# self-bot side (V6). Override via CONTROL_HTTP_TIMEOUT if needed.
 _HTTP_TIMEOUT = config.CONTROL_HTTP_TIMEOUT
 
 

@@ -8,6 +8,7 @@
 #   BOOTSTRAP_ALT_TOKEN_1..4 alt user tokens (provide as many as ALT_COUNT)
 #   BOOTSTRAP_GIST_ID        existing shared blocklist Gist ID (optional)
 #   BOOTSTRAP_CONTROL_GIST_ID existing shared control Gist ID (optional)
+#   BOOTSTRAP_OWNER_IDS is supplied as a masked workflow input (comma-separated)
 #   BOOTSTRAP_TUNING_JSON    optional JSON tuning object
 #
 # The action checks out this core repo, runs the same standard-library
@@ -19,8 +20,8 @@ name: "🧰 Bootstrap Ad Farm"
 on:
   workflow_dispatch:
     inputs:
-      owner_id:
-        description: "Your Discord user ID"
+      owner_ids:
+        description: "Authorized Discord user IDs, comma-separated"
         required: true
         type: string
       guild_id:
@@ -28,18 +29,14 @@ on:
         required: true
         type: string
       alt_count:
-        description: "Number of alt accounts to configure"
-        required: true
-        default: "4"
-        type: choice
-        options:
-          - "1"
-          - "2"
-          - "3"
-          - "4"
+        description: "Number of alt accounts to configure (blank to infer existing alt repositories)"
+        required: false
+        default: ""
+        type: string
       channel_ids:
-        description: "Trading channel IDs, comma-separated"
-        required: true
+        description: "Trading channel IDs, comma-separated (blank when using channel_names)"
+        required: false
+        default: ""
         type: string
       channel_names:
         description: "Trading channel names in the same order (optional)"
@@ -71,7 +68,7 @@ jobs:
       # All token values below are masked repository secrets.
       GH_TOKEN: ${{ secrets.BOOTSTRAP_GH_TOKEN }}
       BOT_TOKEN: ${{ secrets.BOOTSTRAP_BOT_TOKEN }}
-      OWNER_ID: ${{ inputs.owner_id }}
+      OWNER_IDS: ${{ inputs.owner_ids }}
       GUILD_ID: ${{ inputs.guild_id }}
       ALT_COUNT: ${{ inputs.alt_count }}
       ALT_TOKEN_1: ${{ secrets.BOOTSTRAP_ALT_TOKEN_1 }}
@@ -89,7 +86,7 @@ jobs:
       - name: Mask bootstrap secrets
         shell: bash
         run: |
-          for value in "$GH_TOKEN" "$BOT_TOKEN" "$OWNER_ID" "$GUILD_ID" "$ALT_TOKEN_1" "$ALT_TOKEN_2" "$ALT_TOKEN_3" "$ALT_TOKEN_4" "$CHANNEL_IDS" "$CHANNEL_NAMES" "$TUNING_JSON" "$GIST_ID" "$CONTROL_GIST_ID"; do
+          for value in "$GH_TOKEN" "$BOT_TOKEN" "$OWNER_IDS" "$GUILD_ID" "$ALT_TOKEN_1" "$ALT_TOKEN_2" "$ALT_TOKEN_3" "$ALT_TOKEN_4" "$CHANNEL_IDS" "$CHANNEL_NAMES" "$TUNING_JSON" "$GIST_ID" "$CONTROL_GIST_ID"; do
             if [[ -n "$value" ]]; then
               printf '::add-mask::%s\n' "$value"
             fi
