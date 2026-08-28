@@ -152,7 +152,8 @@ class SafetyRegressionTests(unittest.TestCase):
             names,
             {
                 "run", "stop", "pause", "resume", "setprice", "setmode",
-                "setmessage", "sync", "status", "logs", "dashboard", "help",
+                "setmessage", "setchannel", "replacechannel", "setinterval", "setruntime",
+                "sync", "status", "logs", "deals", "refresh", "dashboard", "help",
             },
         )
 

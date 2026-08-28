@@ -41,7 +41,7 @@ DISCORD_API = "https://discord.com/api/v10"
 GITHUB_API = "https://api.github.com"
 ROOT = Path(__file__).resolve().parent
 
-# Discord permission bits used for the four private control channels.
+# Discord permission bits used for the five private control channels.
 MANAGE_CHANNELS = 1 << 4
 VIEW_CHANNEL = 1 << 10
 SEND_MESSAGES = 1 << 11
@@ -145,8 +145,8 @@ class Bootstrap:
                 "GitHub CLI is not authenticated. Run 'gh auth login' and retry."
             )
         if not self.non_interactive and os.environ.get("SETUP_SKIP_AUTH_REFRESH") != "1":
-            print("Refreshing GitHub CLI scopes (workflow and gist)…")
-            self.run_command(["gh", "auth", "refresh", "-s", "workflow,gist"])
+            print("Refreshing GitHub CLI scopes (repo, workflow, and gist)…")
+            self.run_command(["gh", "auth", "refresh", "-h", "github.com", "-s", "repo,workflow,gist"])
         elif self.non_interactive:
             print("Using the masked GitHub CLI token supplied to this workflow.")
         token = self.run_command(["gh", "auth", "token"]).stdout.strip()
@@ -583,6 +583,61 @@ class Bootstrap:
         )
         if status not in (200, 201) or not isinstance(response, dict) or not response.get("id"):
             message = response.get("message", "") if isinstance(response, dict) else ""
+            raise SetupError(f"Could not create {filename} Gist (HTTP {status}): {message}")
+        return str(response["id"])
+
+    def provision_github(self) -> None:
+        print("\nCreating alt repositories and installing the canonical templates…")
+        # Install the sender first. self_check.yml is uploaded only after
+        # secrets are in place below, because its push trigger would otherwise
+        # run immediately against an unconfigured repository.
+        templates = [
+            "send_ads.py",
+            ".github/workflows/send_ads.yml",
+        ]
+        for alt in self.alts:
+            repo = self.ensure_alt_repo(alt["repo"])
+            alt["full_repo"] = repo
+            for relative in templates:
+                self.upload_template(repo, relative)
+
+        existing_blocklist = self.ask(
+            "Existing blocklist Gist ID (blank to create one)",
+            required=False, env="GIST_ID",
+        )
+        if existing_blocklist:
+            self.gists["GIST_ID"] = existing_blocklist
+            print(f"  ✓ using existing blocklist Gist {existing_blocklist}")
+        else:
+            self.gists["GIST_ID"] = self.create_gist(
+                "blocked_variations.json", '{"version": 1, "blocked": []}\n',
+                "Ad Farm shared blocked variation list",
+            )
+        existing_control = self.ask(
+            "Existing control Gist ID (blank to create one)",
+            required=False, env="CONTROL_GIST_ID",
+        )
+        if existing_control:
+            self.gists["CONTROL_GIST_ID"] = existing_control
+            print(f"  ✓ using existing control Gist {existing_control}")
+        else:
+            self.gists["CONTROL_GIST_ID"] = self.create_gist(
+                "control.json", "{}\n", "Ad Farm shared runtime control",
+            )
+        print("  ✓ created/selected two private Gists")
+
+    # ---------- repository configuration ----------
+    def existing_names(self, repo: str, kind: str) -> set[str]:
+        """List names only; GitHub never returns secret values."""
+        cache_key = (repo, kind)
+        if cache_key in self._existing_cache:
+            return self._existing_cache[cache_key]
+        if kind == "secret":
+            command = ["gh", "secret", "list", "--repo", repo, "--json", "name", "--jq", ".[].name"]
+        else:
+            command = ["gh", "variable", "list", "--repo", repo, "--json", "name", "--jq", ".[].name"]
+        result = self.run_command(command, check=False)
+        if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             raise SetupError(f"Could not inspect existing {kind}s on {repo}: {detail[:400]}")
         names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
@@ -619,6 +674,20 @@ class Bootstrap:
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             raise SetupError(f"Could not set secret {name} on {repo}: {detail[:400]}")
+
+    def set_variable(self, repo: str, name: str, value: str,
+                     *, replace_existing: bool = False) -> None:
+        if not value or not self.should_write(
+            repo, name, "variable", replace_existing=replace_existing
+        ):
+            return
+        result = self.run_command(
+            ["gh", "variable", "set", name, "--repo", repo, "--body", value],
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise SetupError(f"Could not set variable {name} on {repo}: {detail[:400]}")
 
     def clear_secret(self, repo: str, name: str) -> None:
         """Remove a stale secret when the operator explicitly selects names-only mode."""
