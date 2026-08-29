@@ -1,3 +1,16 @@
+# Python/cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and test artifacts
+.venv/
+venv/
+.env
+*.log
+
+# Local/private history and generated source archives
+historical_urls.txt
 adfarm-core-AI-v6-source.tar.gz

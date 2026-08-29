@@ -238,6 +238,8 @@ def build_single_alt_embed(mgr: AltStateManager, alt_id: int) -> discord.Embed:
     embed.add_field(name="Sent / errors / skips", value=f"{alt.total_sent} / {alt.total_errors} / {alt.total_skips}", inline=True)
     embed.add_field(name="Edits / deals", value=f"{alt.total_edits} / {alt.deal_alerts}", inline=True)
     embed.add_field(name="Channels", value=f"{alt.active_channels}/{alt.total_channels}", inline=True)
+    embed.add_field(name="Deal scanner", value=f"{'ON' if alt.deal_scan_enabled else 'OFF'} · edge ${alt.deal_alert_delta:.2f}/1k", inline=True)
+    embed.add_field(name="Deal item keywords", value=", ".join(alt.deal_keywords[:20]) or "—", inline=False)
     embed.add_field(name="Uptime", value=_fmt_duration(alt.uptime_sec), inline=True)
     embed.add_field(name="Last heartbeat", value=_fmt_ago(alt.last_heartbeat_ts), inline=True)
     embed.add_field(name="Last post", value=_fmt_ago(alt.last_post_ts), inline=True)

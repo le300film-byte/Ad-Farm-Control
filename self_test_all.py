@@ -72,6 +72,8 @@ REQUIRED_MARKERS = {
     "setup.py": (
         "class Bootstrap",
         "def preflight(",
+        "def set_variable(",
+        "def provision_github(",
         "def run_self_checks(",
         "--non-interactive",
         "--abort-on-failure",

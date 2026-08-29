@@ -1,4 +1,4 @@
-# 📨 Discord Ad Sender — Setup Guide (v5.5.1, single-alt standalone)
+# 📨 Discord Ad Sender — Setup Guide (V6, single-alt standalone)
 
 Posts one ad at a time (SELL or BUY) to your Discord marketplace channels,
 running entirely on **GitHub Actions cloud** (no PC/phone required 24/7).
@@ -62,15 +62,16 @@ its slowmode. Don't post faster than a real human would.
 - Auto-learn blocklist: remembers which variations got deleted and stops
   reusing them (persisted in a Gist across runs; survives workflow
   restarts).
-- v5.4 auto-discovery: after a real posting attempt receives HTTP 404 for a
+- V6 auto-discovery: after a real posting attempt receives HTTP 404 for a
   configured channel, the bot searches the guild for a same-name channel and
   asks a trusted user (via reaction) to confirm the new ID. Startup probes do
   not trigger discovery, and an empty trusted-ID list always fails closed.
-- v5.5 remote control: accept `!setprice`, `!setmode`, `!pause`, `!stop`,
+- V6 remote control: accept `!setprice`, `!setmode`, `!pause`, `!stop`,
   `!sync`, `!status` DMs from trusted IDs; push structured heartbeats to a
   webhook; sync runtime overrides from a shared gist.
-- v5.5.1: deal alerts use `DASHBOARD_WEBHOOK_URL`; all control webhooks
-  use 20s timeout (future-proof `WEBHOOK_TIMEOUT` constant).
+- V6: deal alerts use the separate `DEAL_WEBHOOK_URL`; dashboard heartbeats
+  and deal scanning are independent, and control webhooks use a 20s timeout
+  by default.
 
 ---
 
@@ -98,7 +99,7 @@ alts use:
 - `#💵・market` → `1103759996468080752` (300s slowmode)
 
 Also copy the channel **name** (lowercase, without leading emoji, e.g.
-`trading` and `market`) — used by v5.4 auto-discovery.
+`trading` and `market`) — used by V6 auto-discovery.
 
 ---
 
@@ -162,9 +163,10 @@ behavior.
 | Secret | Default | What it does |
 |---|---|---|
 | `LOG_WEBHOOK_URL` | _(none)_ | Discord webhook URL that receives a stream of plain-text action log lines (startup, sends, failures, DMs, shutdown) — great for monitoring. |
-| `DASHBOARD_WEBHOOK_URL` | _(none)_ | Discord webhook URL that receives rich 💓 heartbeat embeds every 5 min (status, sent/err counts, per-channel alive/dead, rate, uptime). |
-| `WEBHOOK_TIMEOUT` | `20` | v5.5.1 timeout (seconds) for log/dashboard/deal webhooks. |
-| `DM_WEBHOOK_TIMEOUT` | `20` | v5.5.1 timeout (seconds) for the DM-forward webhook. |
+| `DASHBOARD_WEBHOOK_URL` | _(none)_ | Discord webhook URL that receives one updated rich 💓 heartbeat embed per alt (status, sent/err counts, per-channel alive/dead, rate, uptime). |
+| `DEAL_WEBHOOK_URL` | _(none)_ | Separate Discord webhook URL for passive deal matches; it is never used for heartbeat/dashboard state. |
+| `WEBHOOK_TIMEOUT` | `20` | V6 timeout (seconds) for log/dashboard/deal webhooks. |
+| `DM_WEBHOOK_TIMEOUT` | `20` | V6 timeout (seconds) for the DM-forward webhook. |
 
 #### 📌 DM forwarding — see buyer DMs without logging in
 
@@ -189,7 +191,7 @@ behavior.
 |---|---|---|
 | `ALLOWED_COUNTRIES` | _(empty)_ | Optional comma-separated ISO codes (e.g. `FR,ES,NL,DE,IE,GB,PT,MA,IT`). If WARP/proxy exits in a country NOT on this list, the run aborts before posting. Empty disables only the country allow-list; outbound IP and provider verification remain mandatory. |
 
-#### 📌 Deal scanner (v5.3)
+#### 📌 Deal scanner (V6)
 
 Passively scans messages it already fetches (no extra API calls) and
 alerts when someone posts a rate better than yours by ≥ delta.
@@ -200,7 +202,7 @@ alerts when someone posts a rate better than yours by ≥ delta.
 | `DEAL_ALERT_DELTA` | `0.05` | Edge threshold ($ per 1k) to trigger an alert. |
 | `DEAL_MY_RATE` | `0` (auto) | Your current rate. Default 0 = auto-extracted from the ad text at runtime. |
 
-#### 📌 Auto channel discovery (v5.4)
+#### 📌 Auto channel discovery (V6)
 
 If a channel returns 404 (deleted/recreated), the bot browses the guild
 for a same-name channel and DMs the channel a reaction-confirmation
@@ -212,21 +214,22 @@ request.
 | `CONFIRM_USER_IDS` | _(empty)_ | Comma-separated Discord IDs whose ✅ reaction confirms a replacement. Empty means discovery is disabled (fail-closed); it never authorizes everyone. |
 | `CONFIRM_TIMEOUT` | `60` | Seconds to wait for a reaction before giving up. |
 
-#### 📌 Remote control (v5.5)
+#### 📌 Remote control (V6)
 
 Lets you issue DM `!commands` to the alt from trusted Discord user IDs
 (including the central control bot if you use one).
 
 | Secret | Default | What it does |
 |---|---|---|
-| `CONTROLLER_USER_IDS` | _(empty)_ | Comma-separated Discord IDs allowed to send `!setprice`, `!pause`, `!resume`, `!stop`, `!sync`, `!status`, `!setmessage`, `!setmode` via DM. |
-| `CONTROL_GIST_ID` | _(empty)_ | Optional shared gist ID for broadcast overrides. The sender reads it; edit it in GitHub or through a separately authorized integration. The official control bot's slash commands use direct DMs and do not write this gist. |
+| `CONTROLLER_USER_IDS` | _(empty)_ | Comma-separated Discord IDs allowed to send legacy `!setprice`, `!pause`, `!resume`, `!stop`, `!sync`, `!status`, `!setmessage`, `!setmode`, `!setdealkeywords`, `!setchannel`, `!replacechannel`, `!setinterval`, and `!setruntime` via DM. |
+| `CONTROL_GIST_ID` | _(empty)_ | Shared private control queue. The official control bot writes `control_<ALT_ID>.json` here, so slash commands work without adding an alt to the control server. The sender polls and writes an acknowledgement back. `control.json` remains available for broadcast overrides. |
+| `DEAL_ITEM_KEYWORDS` | `Blade Ball,BladeBall,BB token,BB tokens,BB` | Comma-separated, case-insensitive whole-word/phrase aliases required by the separate deal scanner. Runtime `/setdealkeywords` changes this for the active and subsequent runs. |
 | `HEARTBEAT_INTERVAL_SEC` | `300` | Seconds between heartbeat pushes to `DASHBOARD_WEBHOOK_URL` (min 60). |
 | `SYNC_GIST_INTERVAL_SEC` | `45` | Seconds between gist polls (min 15). |
 | `CONTROL_CMD_PREFIX` | `!` | Command prefix character. |
 | `ALT_ID` | `0` | Numeric alt ID shown on heartbeats (use `1`–`N` if you have a control dashboard; drives personality jitter when ≥1). |
 | `ALT_NAME` | `Alt{ALT_ID}` | Friendly name shown on the dashboard. |
-| `PERSONALITY_JITTER` | `0.12` | v5.5.1 — per-ALT_ID deterministic nudge of typo-chance/react-chance/AFK frequency within ±12% so multiple alts don't share an identical behavioral fingerprint. Set `0` to disable. |
+| `PERSONALITY_JITTER` | `0.12` | V6 — per-ALT_ID deterministic nudge of typo-chance/react-chance/AFK frequency within ±12% so multiple alts don't share an identical behavioral fingerprint. Set `0` to disable. |
 
 > Per-run choices (`ad_type`, rate, message, interval, hours, image,
 > channel override) are **inputs on the workflow_dispatch form**, not
@@ -246,7 +249,7 @@ Lets you issue DM `!commands` to the alt from trusted Discord user IDs
    - **[buy detailed]** `buy_rate`, `buy_rate_rap`; or **[buy simple]** `buy_simple_text`.
    - **[optional]** `channel_1` / `channel_2` to post ONLY to those channels for
      this run (overrides `CHANNEL_IDS`). Add `channel_1_name` / `channel_2_name`
-     if you want v5.4 auto-discovery for the override channel(s).
+     if you want V6 auto-discovery for the override channel(s).
    - **interval_min**: minutes between posts per channel (3 or 5 — choose
      5 if you're being cautious).
    - **total_hours**: how long to run (6/12/18/24/48).
@@ -274,7 +277,7 @@ Logs (in the Actions tab or in your log webhook) will look like:
 [14:02:18] ✅ Auth OK — logged in as yodonttryme46 (id 1004...)
 [14:02:42] 🔎 Channel check: #trading (180s slowmode) — ALIVE ✅
 [14:02:42] 🔎 Channel check: #💵・market (300s slowmode) — ALIVE ✅
-[14:03:05] 🟢 STARTED v5.5.1
+[14:03:05] 🟢 STARTED V6
 [14:03:05] 📋 Channels active: 2/2 (target: 5 min/ch ±jitter)
 [14:08:14] 📝 [sell|#trading] variation #12 (len=142) — typing 5.3s → posted ✅
 [14:08:20] ✏️  Typo edit: "quick" → "quik" → "quick"
@@ -314,7 +317,7 @@ mean the token is invalid, the channel is dead, or WARP failed.
 - Fetches each configured channel and reads its slowmode/read access. It
   does not post during startup probing.
 - If the first real posting attempt for a channel returns 404, auto-discovery
-  can run (v5.4): it browses the guild's channel list, fuzzy-matches by name,
+  can run (V6): it browses the guild's channel list, fuzzy-matches by name,
   sends a confirmation message, and waits for a trusted ✅/❌ reaction. An
   empty `CONFIRM_USER_IDS` list disables recovery rather than authorizing
   everyone.
@@ -365,34 +368,41 @@ the workflow job exits.
 
 ---
 
-## 9. Remote DM commands (v5.5)
+## 9. Remote runtime commands (V6)
 
-If you set `CONTROLLER_USER_IDS` to include your main account's Discord
-ID (or the control bot's application ID), you can DM the alt:
+The official control bot uses the shared private `CONTROL_GIST_ID` queue by
+default, so an alt does **not** need to join the control server or share a
+mutual server with the bot. The sender polls its targeted
+`control_<ALT_ID>.json` file and writes a bounded acknowledgement back.
+`CONTROLLER_USER_IDS` remains available for direct owner-to-alt DM commands or
+legacy installations without the Gist queue.
 
 | DM command | Effect |
 |---|---|
 | `!setprice 2.7` | Update rate in-memory (regex auto-updates ad text). |
 | `!setmode sell` or `!setmode buy` | Switch ad type on the fly. |
 | `!setmessage <full text>` | Switch to entirely new ad copy. |
+| `!setdealkeywords Blade Ball, BB token, BB` | Require one of the comma-separated item aliases before a deal alert. |
+| `!setdealscan on` or `!setdealscan off` | Toggle the deal scanner without toggling ad posting. |
+| `!setdealdelta 0.05` | Require at least $0.05/1k edge before a matching offer alerts. |
 | `!pause` | Pause public posting (status goes 🟡). |
 | `!resume` | Resume. |
 | `!stop` | Trigger panic → shut down the run cleanly. |
 | `!sync` | Force a gist reload now. |
 | `!status` | Reply with a short status embed (rate, sent/err, uptime, active channels). |
 
-Slash-command runtime overrides (price/mode/message/pause) are applied
-**in-memory** to the current run — they don't persist across workflow runs (the
-next `/run` starts with whatever you filled into the workflow form). That's
-intentional: direct-DM tweaks don't overwrite your saved defaults.
+Slash-command runtime commands are queued in the private Gist and applied
+on the next sender poll (15–45 seconds depending on `SYNC_GIST_INTERVAL_SEC`).
+The sender writes an acknowledgement to the targeted file and the next
+heartbeat shows the resulting state. Settings such as message, mode, rate,
+interval, runtime, channel mapping, and deal keywords are retained in that
+per-alt command file for the next workflow run. `!stop` is protected from
+being replayed into a later run when its timestamp is stale.
 
-If you configure `CONTROL_GIST_ID`, the sender also polls that private Gist for
-an optional persistent or broadcast override object such as
-`{"paused":true,"alt_id":2}`. The official control bot treats this Gist as a
-read path; it does not write it. Edit the Gist only through GitHub or another
-explicitly authorized integration, and use `/sync` to force all running alts to
-reload it. If `CONTROL_GIST_ID` or `GIST_TOKEN` is absent, the sender simply
-continues with direct-DM control and no Gist override path.
+If `CONTROL_GIST_ID` or `GIST_TOKEN` is absent, the sender falls back to
+legacy direct-DM control. In that mode the bot must have a mutual Discord
+server with the alt before it can initiate a DM; direct owner-to-alt DM can
+still work independently.
 
 ---
 
@@ -435,12 +445,14 @@ connect.
 **"Channel not found" / 403 on send?**
 The alt doesn't have permission to see/post in that channel. Confirm the
 alt joined the server and has the right role. If the channel was deleted,
-set `CHANNEL_NAMES` so v5.4 auto-discovery finds the new one.
+set `CHANNEL_NAMES` so V6 auto-discovery finds the new one.
 
 **Posts aren't sending but no errors?**
 You're probably in **caution mode** or **DM pause** — check the heartbeat
-status. Caution means consecutive sends have been silently deleted; the
-bot doubles the interval and waits for 3 successful sends to exit.
+status. Caution means exact-message verification confirmed deletions; the
+bot doubles the interval and waits for 3 successful sends to exit. A buried
+recent-page result, transient API failure, or permission response is not a
+deletion and cannot create a caution strike.
 
 **"Message blocked" / instant delete?**
 You're likely shadowbanned or the auto-mod is filtering your ad. Try a
@@ -458,7 +470,7 @@ The old one invalidates. Update the `USER_TOKEN` secret and re-run.
   the ad text by regex — works for standard `$2.35/1k` / `2.35$`
   formats; if you write rates unusually, set `DEAL_MY_RATE` explicitly.
 - The edge must be ≥ `DEAL_ALERT_DELTA` (default $0.05/k).
-- Alerts go to `DASHBOARD_WEBHOOK_URL` (make sure that webhook is set).
+- Alerts go to `DEAL_WEBHOOK_URL` (make sure that webhook is set).
 
 **Workflows won't start / "Workflow not found"?**
 Make sure the file is exactly at `.github/workflows/send_ads.yml`
@@ -475,8 +487,9 @@ If you later expand to multiple alts via the control bot (see
 - Give each alt a **different base MESSAGE** (different wording, emoji
   placement, formatting). Even small differences get multiplied by the
   variation generator into a hundred unique variants per alt.
-- Give each alt a **different image** (re-saved with at least one pixel
-  of difference or a tiny overlay). The bot already strips EXIF,
+- Give each alt a **different image** (place it as `ad.png` in that alt
+  repository, or set the optional `IMAGE_FILENAME` secret to another path;
+  upload a separate file to each alt). The bot already strips EXIF,
   randomizes filenames, jitters ~30 random pixels ±1 RGB, and randomizes
   JPEG quality on every send — but if the source file is byte-identical
   and the jitter RNG happens to overlap, the outputs can still look
@@ -494,20 +507,21 @@ If you later expand to multiple alts via the control bot (see
 See [`SETUP_CONTROL.md`](./SETUP_CONTROL.md) §12 for the full
 multi-alt-oriented table. The short version for single-alt use:
 
-- **Required:** `USER_TOKEN`, `CHANNEL_IDS`.
+- **Required:** `USER_TOKEN` and either `CHANNEL_IDS` or `CHANNEL_NAMES`.
+  `CHANNEL_NAMES` is safe keyword resolution; numeric IDs remain preferred.
 - **Webhooks (optional):** `LOG_WEBHOOK_URL`, `DASHBOARD_WEBHOOK_URL`,
-  `DM_WEBHOOK_URL` (deal alerts use the dashboard webhook).
-- **Timeouts (v5.5.1, optional):** `WEBHOOK_TIMEOUT` (default 20),
+  `DM_WEBHOOK_URL`, `DEAL_WEBHOOK_URL` (deals are separate from dashboard).
+- **Timeouts (V6, optional):** `WEBHOOK_TIMEOUT` (default 20),
   `DM_WEBHOOK_TIMEOUT` (default 20).
 - **DM pause:** `DM_PAUSE_MINUTES` (default 2), `FORWARD_OWN_DMS` (true).
 - **Blocklist:** `GIST_TOKEN`, `GIST_ID`, `BLOCKED_STRIKES` (2),
   `BLOCKED_SAFETY_STOP` (5).
 - **Geo:** `ALLOWED_COUNTRIES`.
 - **Deals:** `DEAL_SCAN_ENABLED` (true), `DEAL_ALERT_DELTA` (0.05),
-  `DEAL_MY_RATE` (0=auto).
-- **Discovery (v5.4):** `CHANNEL_NAMES`, `CONFIRM_USER_IDS`,
+  `DEAL_MY_RATE` (0=auto), `DEAL_WEBHOOK_URL` (separate destination).
+- **Discovery (V6):** `CHANNEL_NAMES`, `CONFIRM_USER_IDS`,
   `CONFIRM_TIMEOUT` (60).
-- **Control (v5.5):** `CONTROLLER_USER_IDS`, `CONTROL_GIST_ID`,
+- **Control (V6):** `CONTROLLER_USER_IDS` (comma-separated), `CONTROL_GIST_ID`,
   `HEARTBEAT_INTERVAL_SEC` (300), `SYNC_GIST_INTERVAL_SEC` (45),
   `CONTROL_CMD_PREFIX` (!), `ALT_ID` (0), `ALT_NAME`.
 - **Safety/steering:** `INTERVAL_MIN` (per-run input), `TOTAL_RUN_MIN`

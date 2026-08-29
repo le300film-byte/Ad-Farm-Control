@@ -46,6 +46,9 @@ class AltState:
     ip_country: str = ""
     deal_alerts: int = 0
     last_deal_ts: float = 0.0
+    deal_keywords: list[str] = field(default_factory=list)
+    deal_scan_enabled: bool = True
+    deal_alert_delta: float = 0.05
     last_error: str = ""
     log_counts: dict = field(default_factory=dict)
 
@@ -74,6 +77,33 @@ class AltStateManager:
     def get(self, alt_id: int) -> Optional[AltState]:
         with self._lock:
             return self._alts.get(alt_id)
+
+    def add_alt(self, alt_id: int, name: str) -> bool:
+        """Add one validated alt to the live control-bot registry."""
+        with self._lock:
+            if alt_id in self._alts:
+                return False
+            self._alts[alt_id] = AltState(alt_id, str(name).strip()[:80] or f"Alt {alt_id}")
+            self._log_buffer[alt_id] = []
+            return True
+
+    def update_identity(self, alt_id: int, *, name: str | None = None) -> bool:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return False
+            if name is not None and str(name).strip():
+                alt.name = str(name).strip()[:80]
+            return True
+
+    def remove_alt(self, alt_id: int) -> bool:
+        """Remove an alt from the live registry without touching GitHub."""
+        with self._lock:
+            if alt_id not in self._alts:
+                return False
+            self._alts.pop(alt_id, None)
+            self._log_buffer.pop(alt_id, None)
+            return True
 
     def all(self) -> list[AltState]:
         with self._lock:
@@ -152,6 +182,17 @@ class AltStateManager:
             alt.ip_country = self._text_value(payload, "ip_country", alt.ip_country, 20)
             if isinstance(payload.get("last_error"), str):
                 alt.last_error = payload["last_error"][:300]
+            if isinstance(payload.get("deal_keywords"), list):
+                alt.deal_keywords = [str(item)[:60] for item in payload["deal_keywords"][:20] if str(item).strip()]
+            if isinstance(payload.get("deal_scan_enabled"), bool):
+                alt.deal_scan_enabled = payload["deal_scan_enabled"]
+            if "deal_alert_delta" in payload:
+                try:
+                    delta = float(payload["deal_alert_delta"])
+                    if math.isfinite(delta) and 0 <= delta <= 5:
+                        alt.deal_alert_delta = delta
+                except (TypeError, ValueError, OverflowError):
+                    pass
             if isinstance(payload.get("log_counts"), dict):
                 alt.log_counts = {
                     str(key)[:40]: self._int_value(value)
@@ -212,6 +253,27 @@ class AltStateManager:
                 alt.interval_min = int(interval_min)
             if runtime_hours in {6, 12, 18, 24, 48}:
                 alt.runtime_hours = int(runtime_hours)
+
+    def set_deal_keywords(self, alt_id: int, keywords: list[str]) -> None:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if alt:
+                alt.deal_keywords = [str(item).strip()[:60] for item in keywords[:20] if str(item).strip()]
+
+    def set_deal_config(self, alt_id: int, *, enabled=None, delta=None) -> None:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return
+            if isinstance(enabled, bool):
+                alt.deal_scan_enabled = enabled
+            if delta is not None:
+                try:
+                    value = float(delta)
+                    if math.isfinite(value) and 0 <= value <= 5:
+                        alt.deal_alert_delta = value
+                except (TypeError, ValueError, OverflowError):
+                    pass
 
     def set_error(self, alt_id: int, text: str) -> None:
         with self._lock:

@@ -119,6 +119,8 @@ jobs:
           OWNER_IDS: ${{ secrets.OWNER_IDS || secrets.OWNER_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_PAT }}
           GITHUB_OWNER: ${{ secrets.ALT_GITHUB_OWNER }}
+          CORE_REPO: ${{ github.repository }}
+          CONTROL_GIST_ID: ${{ secrets.CONTROL_GIST_ID }}
           ALT_REPOS: ${{ secrets.ALT_REPOS }}
           ALT_DISCORD_IDS: ${{ secrets.ALT_DISCORD_IDS }}
           ALT_NAMES: ${{ secrets.ALT_NAMES }}

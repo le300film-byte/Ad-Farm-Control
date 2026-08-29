@@ -6,13 +6,13 @@ alt workflows, and the bootstrap utility.
 
 By the end you will have:
 
-- one private control server with `#control`, `#dashboard`, `#dm-inbox`, and
-  `#farm-logs`;
+- one private control server with `#control`, `#dashboard`, `#dm-inbox`,
+  `#farm-logs`, and the separate `#deals` channel;
 - one official Discord bot running in a GitHub Actions job;
 - one private repository per configured alt, with its own Actions job and
   Cloudflare WARP step;
 - two private Gists for the blocklist and live control overrides; and
-- three webhooks total: DM inbox, dashboard, and consolidated farm logs.
+- four webhooks total: DM inbox, dashboard, consolidated farm logs, and separate deals.
 
 > **Important:** Discord user-account automation is not an official Discord
 > bot feature and can violate Discord's Terms of Service. Use only accounts
@@ -24,16 +24,17 @@ By the end you will have:
 - `python setup.py` is the primary setup path.
 - GitHub CLI authentication supplies one shared GitHub token. No separate
   tokens need to be created for dispatch, sync, and Gists.
-- `/run` has no slash-command arguments. It opens a two-page modal containing
-  the ten run fields. Discord allows only five text-input rows per modal, so
-  the second form opens immediately after the first is submitted.
+- `/run` has no slash-command arguments. Its private component form chooses
+  the configured alt, sell/buy mode, interval 3/5, and runtime 6/12/18/24/48;
+  a button then opens one mode-specific modal for rates, message text, image
+  yes/no, and detailed/simple buy style. It never opens a modal from a modal
+  submission, which Discord rejects.
 - Seller/buyer presentation is derived from the latest alt heartbeat
   `ad_type` (`sell` or `buy`), not from a static mapping.
 - `TUNING_JSON` is an optional JSON secret. All tuning values have safe code
   defaults, and an explicitly supplied individual environment value wins over
   the JSON value.
-- Deal alerts go to the dashboard webhook; they do not require a fourth
-  webhook or a separate channel.
+- Deal alerts use the separate `DEAL_WEBHOOK_URL` and `#deals` channel; they never share the dashboard webhook.
 
 ## Before you begin
 
@@ -96,13 +97,13 @@ python3 setup.py
 The script will:
 
 1. verify `gh` and run `gh auth refresh -s workflow,gist`;
-2. ask for the official bot token, your Discord ID, trading channel IDs, and
-   up to four alt tokens;
+2. ask for the official bot token, one or more authorized owner IDs, trading
+   channel IDs/names, and up to four alt tokens;
 3. validate the official bot and every alt through `/users/@me`;
 4. discover the control server, or ask for its ID when the bot is in several
    servers;
-5. create or reuse the four private control channels;
-6. create or reuse exactly three webhook destinations;
+5. create or reuse the five private control channels;
+6. create or reuse exactly four webhook destinations (including separate deals);
 7. create private `altN-sell`/`altN-buy` repositories under the selected
    GitHub owner and upload `send_ads.py`, `send_ads.yml`, and
    `self_check.yml` through the Contents API;
@@ -117,8 +118,10 @@ is what the dashboard uses.
 
 The script finishes by printing a bot invite URL and the next Actions steps.
 If a rerun finds an existing repository, channel, or named webhook, it reuses
-it where the API exposes the resource and does not create a duplicate. Existing
-GitHub secrets and variables are preserved by default. To intentionally replace
+it where the API exposes the resource and does not create a duplicate. When
+`ALT_COUNT` is omitted, the bootstrap infers the current 1–4 alt count from
+existing alt repository names; set `ALT_REPO_1` … `ALT_REPO_4` for non-standard
+repository names. Existing GitHub secrets and variables are preserved by default. To intentionally replace
 them, add `--force`; to make any self-check failure fatal, add
 `--abort-on-failure`:
 
@@ -139,9 +142,10 @@ channel names in the same order, such as `trading,market`, enable the existing
 
 For a non-interactive local run, values can be supplied as environment
 variables, but tokens should still be entered through a protected shell
-mechanism. The supported names are `BOT_TOKEN`, `OWNER_ID`, `GUILD_ID`,
+mechanism. The supported names are `BOT_TOKEN`, `OWNER_IDS` (comma-separated), `GUILD_ID`,
 `ALT_COUNT`, `ALT_TOKEN_1` through `ALT_TOKEN_4`, `ALT_NAME_1` through
-`ALT_NAME_4`, `ALT_TYPE_1` through `ALT_TYPE_4`, `CHANNEL_IDS`,
+`ALT_NAME_4`, `ALT_TYPE_1` through `ALT_TYPE_4`, optional `ALT_REPO_1` through
+`ALT_REPO_4`, `CHANNEL_IDS`,
 `CHANNEL_NAMES`, `GITHUB_OWNER`, and `TUNING_JSON`.
 
 ## Adding an alt later
@@ -158,8 +162,8 @@ optional `GIST_ID` and `CONTROL_GIST_ID` environment values (or
 `BOOTSTRAP_GIST_ID` and `BOOTSTRAP_CONTROL_GIST_ID` secrets in the cloud
 workflow). During an interactive local rerun, enter those existing IDs when
 prompted. Otherwise the bootstrap creates private Gists for it. The bootstrap
-then creates the new
-`altN-sell`/`altN-buy` repository, configures its mappings, uploads the three
+then creates or reuses the selected
+`altN-sell`/`altN-buy` repository, configures its mappings, uploads both
 workflow files, and runs its self-check.
 
 Do not paste tokens into workflow inputs or commit them. For the cloud path,
@@ -177,7 +181,7 @@ The bootstrap places the workflow files in every alt repository and runs
 
 - the alt token and its Discord identity;
 - each configured marketplace channel;
-- the three shared webhook URLs;
+- the four shared webhook URLs;
 - both Gists and trusted Discord IDs;
 - WARP/proxy routing; and
 - the `send_ads.py --self-test` suite.
@@ -194,75 +198,92 @@ When the canonical `send_ads.py` or an alt workflow changes in the core repo,
 ## Step 4 — Start the control bot on GitHub Actions
 
 The official bot runs only in the core repository's **🤖 Control Bot**
-workflow. It is intentionally a six-hour Actions chunk; alt jobs are
-independent and continue posting or forwarding webhook events when the
-control-bot chunk ends.
+workflow. It runs in chained six-hour Actions chunks so the bot stays online
+around the clock; the daily schedule starts the chain and the next chunk is
+queued rather than cancelling the active one. Alt jobs are independent and
+continue posting or forwarding webhook events when a control-bot chunk ends.
 
 1. Open the core repository's **Actions** tab.
 2. Select **🤖 Control Bot → Run workflow**.
-3. Select `6` hours and run it.
+3. Choose the requested session length: `6`, `12`, `18`, `24`, or `48` hours.
 4. Wait for the bot to log in and sync guild commands.
 
-The optional cron in `control_bot.yml` starts a daily chunk. Cancel the
-workflow from Actions when you want the official bot offline. While it is
-offline, webhook heartbeats, logs, deal alerts, and DM forwarding can still
-arrive; slash commands and dashboard editing require the bot to be online.
+Cancel the workflow from Actions when you want the official bot offline. While
+it is offline, webhook heartbeats, logs, deal alerts, and DM forwarding can
+still arrive; slash commands and dashboard editing require the bot to be online.
 
 The bot requires these core settings, all created by the bootstrap:
 
 | Setting | Purpose |
 |---|---|
 | `BOT_TOKEN` | Official Discord bot token |
-| `GUILD_ID`, `CONTROL_CH_ID`, `DASHBOARD_CH_ID`, `LOG_CH_ID` | Control server routing |
+| `GUILD_ID`, `CONTROL_CH_ID`, `DASHBOARD_CH_ID`, `LOG_CH_ID`, `DEALS_CH_ID` | Control server routing |
 | `OWNER_IDS` | Authorized Discord operators |
 | `GH_TOKEN`, `ALT_GITHUB_OWNER`, `ALT_REPOS` | GitHub dispatch and sync |
-| `ALT_DISCORD_IDS`, `ALT_NAMES` | DM routing and display names |
+| `CORE_REPO` | Core repository where the aggregate alt registry secrets are persisted (normally provided automatically by Actions) |
+| `CONTROL_GIST_ID` | Private command queue used when alts are not in the control server |
+| `ALT_DISCORD_IDS`, `ALT_NAMES` | Alt identity mapping and display names; direct DM is legacy fallback |
 | `TUNING_JSON` | Optional shared bot tuning object |
 
 ## Step 5 — Run and operate the farm
 
-In `#control`, type `/run`. The command opens page 1 with:
+In `#control`, type `/run`. The private setup has three steps:
 
-- `alt_id` — `1` through `4`;
-- `ad_type` — `sell` or `buy`;
-- `sell_rate` — for example `2.5$` (in buy mode this is the token rate);
-- `sell_extra` — text appended to a sell ad; and
-- `buy_rate_rap` — for example `1.8`.
-
-Submit page 1. Page 2 asks for:
-
-- `buy_style` — `detailed` or `simple`;
-- `buy_simple_text` — the complete simple-buy message;
-- `interval_min` — `3` or `5`;
-- `total_hours` — `6`, `12`, `18`, `24`, or `48`; and
-- `attach_image` — `yes` or `no`.
+1. Choose a configured alt from the dropdown and choose `Sell` or `Buy`.
+2. Fill the mode-specific details:
+   - Sell: rate (for example `2.5$`) and optional extra text.
+   - Buy: token rate, RAP rate, `detailed` or `simple` style, and optional
+     simple-buy text.
+3. Choose the common settings from dropdowns:
+   - interval: `3` or `5` minutes;
+   - runtime: `6`, `12`, `18`, `24`, or `48` hours; and
+   - image: attach after warmup or text-only.
 
 The form rejects unknown alts, invalid prices, unsupported durations,
 unsupported intervals, invalid modes, overlong messages, and a missing
-simple-buy message. After the final submit, the bot cancels the latest run for
-that alt, dispatches `send_ads.yml`, and posts the run ID/result in `#control`.
+simple-buy message. After the final **Start run** action, the bot cancels the
+latest run for that alt, dispatches `send_ads.yml`, and posts the run result
+privately. The form and its errors are visible only to the operator who opened
+it.
 
 Other commands are still available:
 
 | Command | Function |
 |---|---|
+| `/altadd` | Add an existing prepared alt through a private modal; stores USER_TOKEN and the aggregate mapping |
+| `/altupdate` | Privately update an alt token, repository, Discord ID, or display name |
+| `/altlist` | List configured alts without exposing secrets |
+| `/altremove` | Remove an alt from the registry; optionally permanently delete its repository after explicit confirmation |
 | `/status` | Unified dashboard, or detailed status for one alt |
+| `/pingalt` | Test the control-Gist/DM command transport without changing settings |
+| `/selfcheck` | Dispatch the selected alt's self-check workflow |
+| `/runs` | Show recent GitHub Actions runs for an alt |
+| `/clearlogs` | Clear only the local control-bot log buffer for an alt |
 | `/pause` / `/resume` | Send the corresponding remote command |
 | `/stop` | Gracefully stop and cancel the alt workflow |
 | `/setprice` | Change the current rate |
 | `/setmode` | Change `sell`/`buy` for the current run |
 | `/setmessage` | Change the current ad text |
+| `/setdealkeywords` | Set comma-separated item aliases required by the separate deal scanner |
+| `/setdealscan` | Enable or disable deal scanning independently of ad posting |
+| `/setdealdelta` | Set the minimum price edge required for a deal alert |
 | `/sync` | Reload the blocklist and control Gist on all alts |
-| `/logs` | Show buffered lines for an alt |
-| `/dashboard` | Force an immediate dashboard refresh |
-| `/help` | Ephemeral list of every registered command and its description |
+| `/setchannel` / `/replacechannel` | Verify and update channel IDs live |
+| `/setinterval` | Set the permitted 3/5-minute interval |
+| `/setruntime` | Set the permitted 6/12/18/24/48-hour runtime |
+| `/logs` | Show typed/filterable buffered lines for an alt |
+| `/deals` | Show separate deal-alert counters and latest timestamps |
+| `/refresh` | Refresh GitHub state and the persistent dashboard |
+| `/dashboard` | Post a fresh dashboard snapshot |
+| `/help` | Private complete reference with args, examples, permissions, and effects |
 
-`CONTROL_GIST_ID` is optional. Running alts read that private Gist for
-persistent or broadcast overrides; the official control bot does not write it.
-The slash commands above use direct DMs and keep their changes in the current
-run. Edit the Gist only through GitHub or another explicitly authorized
-integration, then use `/sync` to force a reload. Without the Gist ID/token,
-blocklist persistence and direct-DM control continue independently.
+`CONTROL_GIST_ID` is the preferred command transport. The official control
+bot writes one targeted `control_<ALT_ID>.json` file per alt, and the sender
+polls it with its existing `GIST_TOKEN`; this works without adding an alt to
+the control server. The sender writes a bounded acknowledgement back to that
+file, and the next heartbeat confirms the resulting state. `control.json`
+remains available for broadcast overrides. If the control Gist is not
+configured, the legacy direct-DM route is used instead.
 
 The summary uses the latest heartbeat mode: 💰 for `sell`, 🛒 for `buy`, and
 ❔ until an alt has reported a mode. All action messages in `#farm-logs` use
@@ -357,22 +378,24 @@ webhook URLs, or the GitHub token in this object.
 - If WARP routing fails, rerun the self-check or the alt workflow. Do not
   continue a run whose routing check reports a known cloud datacenter.
 - Alts do not need to join the private control server. They send data to the
-  three webhooks and receive remote commands by direct message.
+  four webhooks and receive slash-command changes through the private control
+  Gist queue; direct DM is only a legacy fallback when the Gist is absent.
 
 ## Architecture at a glance
 
 | Component | Location | Function |
 |---|---|---|
-| Official control bot | Core `control_bot.yml` Actions job | Slash commands, dashboard, DM routing, dispatch |
+| Official control bot | Core `control_bot.yml` Actions job | Slash commands, dashboard, control-Gist queue, legacy DM fallback, dispatch |
 | Alt sender | One alt repo per account | Marketplace posting, WARP, gateway, heartbeats |
 | Self-check | Each alt repo | Token, channels, webhooks, Gists, routing, self-test |
 | Sync | Core `sync_to_alts.yml` | Copies canonical sender/workflows to each alt |
-| Dashboard webhook | `#dashboard` | Heartbeats and deal alerts |
-| Log webhook | `#farm-logs` | All action logs, labelled by webhook username |
+| Dashboard webhook | `#dashboard` | Heartbeat state and dashboard summaries |
+| Log webhook | `#farm-logs` | Typed action logs, labelled by webhook username |
+| Deal webhook | `#deals` | Separate deal-scanner alerts only |
 | DM webhook | `#dm-inbox` | Buyer and alt DM forwarding |
 | Blocklist Gist | Private GitHub Gist | Cross-run blocked-variation state |
-| Control Gist | Private GitHub Gist | Runtime pause/rate/mode/message overrides |
+| Control Gist | Private GitHub Gist | Runtime overrides plus per-alt command queue/acknowledgements |
 
-The sender jobs are independent of the official bot's six-hour runtime. This
+The sender jobs are independent of the official bot's chained runtime. This
 keeps posting and webhook delivery separate from command availability while
 making the setup reproducible from one bootstrap script.

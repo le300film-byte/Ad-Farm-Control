@@ -724,6 +724,7 @@ class Bootstrap:
             "ALT_REPOS": repo_map,
             "ALT_DISCORD_IDS": id_map,
             "ALT_NAMES": name_map,
+            "CONTROL_GIST_ID": self.gists["CONTROL_GIST_ID"],
         }
         if self.tuning_json:
             core_secrets["TUNING_JSON"] = self.tuning_json
@@ -731,7 +732,7 @@ class Bootstrap:
         # These are aggregate maps, not independent credentials. Always refresh
         # them from the current validated alt list so rerunning bootstrap with a
         # larger ALT_COUNT actually registers the new alts with the control bot.
-        mapping_names = {"ALT_REPOS", "ALT_DISCORD_IDS", "ALT_NAMES", "OWNER_IDS"}
+        mapping_names = {"ALT_REPOS", "ALT_DISCORD_IDS", "ALT_NAMES", "OWNER_IDS", "CONTROL_GIST_ID"}
         for name, value in core_secrets.items():
             self.set_secret(
                 self.core_repo,
@@ -748,6 +749,7 @@ class Bootstrap:
             "DASHBOARD_WEBHOOK_URL": self.webhooks["DASHBOARD_WEBHOOK_URL"],
             "DM_WEBHOOK_URL": self.webhooks["DM_WEBHOOK_URL"],
             "DEAL_WEBHOOK_URL": self.webhooks["DEAL_WEBHOOK_URL"],
+            "DEAL_ITEM_KEYWORDS": "Blade Ball,BladeBall,BB token,BB tokens,BB",
             "GIST_TOKEN": self.gh_token,
             "GIST_ID": self.gists["GIST_ID"],
             "CONTROL_GIST_ID": self.gists["CONTROL_GIST_ID"],

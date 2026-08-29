@@ -1,12 +1,15 @@
 """control_bot/bot.py — official Discord control bot.
 
 Responsibilities:
-  * V6 slash commands for run/stop/pause/resume, validated message/rate/mode
-    changes, live channel updates, interval/runtime updates, sync, status,
-    typed logs, deals, refresh, dashboard, and a complete private help guide.
+  * V6 slash commands for run/stop/pause/resume, alt add/update/list/remove,
+    validated message/rate/mode changes, deal keywords/toggle/threshold,
+    live channel updates, interval/runtime updates, sync, status, typed logs,
+    deals, health/self-check/run history, refresh, dashboard, and a complete
+    private help guide.
   * Permission-gated by comma-separated OWNER_IDS (fail closed) plus cooldown.
   * GitHub Actions dispatch/cancel via the shared GitHub CLI token.
-  * DMs commands to alts and reports the exact remote acknowledgement privately.
+  * Queues commands through the shared private Gist (no alt server membership
+    required), with a legacy DM fallback when the Gist is unavailable.
   * Parses dashboard heartbeats, typed action logs, and a separate deal webhook.
   * Periodically refreshes live GitHub/heartbeat data into a stable three-embed dashboard.
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -70,6 +74,23 @@ def _ad_icon(ad_type: str) -> str:
     if (ad_type or "").lower() == "buy":
         return "🛒"
     return "❔"
+
+
+def _fmt_ago(ts: float) -> str:
+    try:
+        value = float(ts)
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+    if value <= 0:
+        return "never"
+    delta = max(0.0, time.time() - value)
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{delta / 3600:.1f}h ago"
+    return f"{delta / 86400:.1f}d ago"
 
 
 def _alt_label(alt_id: int) -> str:
@@ -363,6 +384,171 @@ def _validate_run_values(values: dict[str, str]) -> tuple[list[str], dict[str, o
     return errors, {"alt_id": alt_id, "rate": rate, "rap": rap, "interval": interval, "hours": hours}
 
 
+def _valid_repo_name(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?", value or ""))
+
+
+def _alt_registry_values(repos: dict[int, str], discord_ids: dict[int, int], names: dict[int, str]) -> dict[str, str]:
+    """Build the aggregate core-secret values without including any token."""
+    ids = sorted(set(repos) | set(discord_ids) | set(names))
+    return {
+        "ALT_REPOS": ",".join(f"{i}:{repos[i]}" for i in ids if i in repos),
+        "ALT_DISCORD_IDS": ",".join(f"{i}:{discord_ids[i]}" for i in ids if i in discord_ids),
+        "ALT_NAMES": ",".join(f"{i}:{names[i]}" for i in ids if i in names),
+    }
+
+
+async def _persist_alt_registry(repos: dict[int, str], discord_ids: dict[int, int], names: dict[int, str]) -> tuple[bool, str]:
+    """Persist the live alt registry to the core repository before mutating state."""
+    if not config.CORE_REPO:
+        return False, "CORE_REPO is missing; the control bot cannot persist the alt registry."
+    if not config.GITHUB_TOKEN:
+        return False, "GH_TOKEN is missing; the control bot cannot persist the alt registry."
+    values = _alt_registry_values(repos, discord_ids, names)
+    for secret_name, value in values.items():
+        if value:
+            ok, detail = await asyncio.to_thread(
+                github_api.set_repository_secret, config.CORE_REPO, secret_name, value
+            )
+        else:
+            ok, detail = await asyncio.to_thread(
+                github_api.delete_repository_secret, config.CORE_REPO, secret_name
+            )
+        if not ok:
+            return False, f"Could not update core secret `{secret_name}`: {detail}"
+    return True, "Core alt registry persisted."
+
+
+def _apply_alt_registry(repos: dict[int, str], discord_ids: dict[int, int], names: dict[int, str]) -> None:
+    config.ALT_REPOS.clear()
+    config.ALT_REPOS.update(repos)
+    config.ALT_DISCORD_IDS.clear()
+    config.ALT_DISCORD_IDS.update(discord_ids)
+    config.ALT_NAMES.clear()
+    config.ALT_NAMES.update(names)
+
+
+class AltAddModal(discord.ui.Modal, title="Add prepared alt"):
+    alt_id = discord.ui.TextInput(label="Alt ID (1–4)", placeholder="2", max_length=2, required=True)
+    repository = discord.ui.TextInput(label="Existing alt repository", placeholder="owner/alt2-sell or alt2-sell", max_length=100, required=True)
+    discord_user_id = discord.ui.TextInput(label="Alt Discord user ID", placeholder="123456789012345678", max_length=30, required=True)
+    name = discord.ui.TextInput(label="Display name", placeholder="Second seller", max_length=80, required=True)
+    user_token = discord.ui.TextInput(label="Alt user token", max_length=600, required=True)
+
+    async def on_submit(self, inter: discord.Interaction):
+        if not _is_owner(inter):
+            await inter.response.send_message("🔒 You aren't authorized to manage alts.", ephemeral=True)
+            return
+        def value(item) -> str:
+            return str(getattr(item, "value", item) or "").strip()
+        try:
+            alt_id = int(value(self.alt_id))
+        except (TypeError, ValueError):
+            return await inter.response.send_message("❌ Alt ID must be 1, 2, 3, or 4.", ephemeral=True)
+        repo = value(self.repository)
+        did = value(self.discord_user_id)
+        name = re.sub(r"[\r\n]", " ", value(self.name))[:80]
+        token = value(self.user_token)
+        if alt_id not in {1, 2, 3, 4}:
+            return await inter.response.send_message("❌ Alt ID must be between 1 and 4.", ephemeral=True)
+        if alt_id in state.alt_ids:
+            return await inter.response.send_message("❌ That alt ID is already configured. Use `/altupdate` instead.", ephemeral=True)
+        if not _valid_repo_name(repo):
+            return await inter.response.send_message("❌ Repository must be `owner/name` or a simple repository name.", ephemeral=True)
+        if not did.isdigit() or not name or not token:
+            return await inter.response.send_message("❌ Discord ID, display name, and token are required.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        exists, detail = await asyncio.to_thread(github_api.repository_exists, repo)
+        if not exists:
+            return await inter.followup.send(f"❌ Cannot add alt: {detail}", ephemeral=True)
+        ok, detail = await asyncio.to_thread(github_api.set_repository_secret, repo, "USER_TOKEN", token)
+        if not ok:
+            return await inter.followup.send(f"❌ Token was not stored: {detail}", ephemeral=True)
+        repos = dict(config.ALT_REPOS); repos[alt_id] = repo
+        discord_ids = dict(config.ALT_DISCORD_IDS); discord_ids[alt_id] = int(did)
+        names = dict(config.ALT_NAMES); names[alt_id] = name
+        persisted, persist_detail = await _persist_alt_registry(repos, discord_ids, names)
+        if not persisted:
+            await asyncio.to_thread(github_api.delete_repository_secret, repo, "USER_TOKEN")
+            return await inter.followup.send(f"❌ Alt was not registered in the core map: {persist_detail}", ephemeral=True)
+        _apply_alt_registry(repos, discord_ids, names)
+        state.add_alt(alt_id, name)
+        text = (f"✅ Added **{name}** as alt `{alt_id}` using `{repo}`. "
+                "USER_TOKEN was stored without echoing it. The repository must already contain the sender workflow and common secrets; use `/altupdate` for later token/metadata changes.")
+        await inter.followup.send(text, ephemeral=True)
+        await _log_control(text)
+        state.append_log(alt_id, text, emoji="➕", color=0x57F287, kind="CONTROL")
+
+
+class AltUpdateModal(discord.ui.Modal):
+    def __init__(self, alt_id: int):
+        super().__init__(title=f"Update alt {alt_id}")
+        self.alt_id_value = alt_id
+        self.name = discord.ui.TextInput(label="New display name (optional)", max_length=80, required=False)
+        self.repository = discord.ui.TextInput(label="New repository (optional)", max_length=100, required=False)
+        self.discord_user_id = discord.ui.TextInput(label="New Discord user ID (optional)", max_length=30, required=False)
+        self.user_token = discord.ui.TextInput(label="New user token (optional)", max_length=600, required=False)
+        for item in (self.name, self.repository, self.discord_user_id, self.user_token):
+            self.add_item(item)
+
+    async def on_submit(self, inter: discord.Interaction):
+        if not _is_owner(inter):
+            await inter.response.send_message("🔒 You aren't authorized to manage alts.", ephemeral=True)
+            return
+        alt_id = self.alt_id_value
+        if not state.get(alt_id):
+            await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+            return
+        def value(item) -> str:
+            return str(getattr(item, "value", item) or "").strip()
+        old_repo = config.ALT_REPOS.get(alt_id, "")
+        raw_repo = value(self.repository)
+        repo = raw_repo or old_repo
+        name = re.sub(r"[\r\n]", " ", value(self.name))[:80]
+        did = value(self.discord_user_id)
+        token = value(self.user_token)
+        if not any((name, raw_repo, did, token)):
+            await inter.response.send_message("❌ Enter at least one value to update.", ephemeral=True)
+            return
+        if not _valid_repo_name(repo):
+            await inter.response.send_message("❌ Repository must be `owner/name` or a simple repository name.", ephemeral=True)
+            return
+        if did and not did.isdigit():
+            await inter.response.send_message("❌ Discord user ID must contain digits only.", ephemeral=True)
+            return
+        if repo != old_repo and not token:
+            await inter.response.send_message("❌ A repository change also requires the new repository's user token.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        if repo != old_repo:
+            exists, detail = await asyncio.to_thread(github_api.repository_exists, repo)
+            if not exists:
+                return await inter.followup.send(f"❌ Cannot update alt: {detail}", ephemeral=True)
+        if token:
+            ok, detail = await asyncio.to_thread(github_api.set_repository_secret, repo, "USER_TOKEN", token)
+            if not ok:
+                return await inter.followup.send(f"❌ Token was not updated: {detail}", ephemeral=True)
+        repos = dict(config.ALT_REPOS); repos[alt_id] = repo
+        discord_ids = dict(config.ALT_DISCORD_IDS)
+        if did:
+            discord_ids[alt_id] = int(did)
+        names = dict(config.ALT_NAMES)
+        if name:
+            names[alt_id] = name
+        persisted, persist_detail = await _persist_alt_registry(repos, discord_ids, names)
+        if not persisted:
+            return await inter.followup.send(f"❌ Core registry was not updated: {persist_detail}", ephemeral=True)
+        if repo != old_repo and old_repo:
+            await asyncio.to_thread(github_api.delete_repository_secret, old_repo, "USER_TOKEN")
+        _apply_alt_registry(repos, discord_ids, names)
+        state.update_identity(alt_id, name=name or None)
+        label = name or state.get(alt_id).name
+        text = f"✅ Updated **{label}** (alt `{alt_id}`). Token/metadata changes were stored without echoing secrets."
+        await inter.followup.send(text, ephemeral=True)
+        await _log_control(text)
+        state.append_log(alt_id, text, emoji="✏️", color=0x5865F2, kind="CONTROL")
+
+
 async def _dispatch_run_from_modal(inter: discord.Interaction, values: dict[str, str], parsed: dict[str, object]) -> None:
     if not _is_owner(inter):
         await inter.response.send_message("🔒 You aren't authorized to run control commands.", ephemeral=True)
@@ -401,19 +587,102 @@ async def _dispatch_run_from_modal(inter: discord.Interaction, values: dict[str,
     state.append_log(alt_id, text, emoji="🚀", color=0x57F287, kind="CONTROL")
 
 
+@bot.tree.command(name="altadd", description="Add an existing prepared alt through a private owner-only form.")
+async def cmd_altadd(inter: discord.Interaction):
+    if not await _check_perms(inter):
+        return
+    await inter.response.send_modal(AltAddModal())
+
+
+@bot.tree.command(name="altupdate", description="Update an alt's token, repository, Discord ID, or display name privately.")
+@app_commands.describe(alt="Configured alt to update")
+async def cmd_altupdate(inter: discord.Interaction, alt: int):
+    if not await _check_perms(inter):
+        return
+    if not state.get(alt):
+        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+    await inter.response.send_modal(AltUpdateModal(alt))
+
+
+@bot.tree.command(name="altlist", description="List configured alts without showing any token or secret.")
+async def cmd_altlist(inter: discord.Interaction):
+    if not await _check_perms(inter):
+        return
+    rows = []
+    for alt in state.all():
+        repo = config.ALT_REPOS.get(alt.alt_id, "not mapped")
+        dot = {"active": "🟢", "paused": "🟡", "caution": "⚠️", "error": "🔴", "stopped": "🔴"}.get(alt.status, "⚪")
+        rows.append(
+            f"{dot} **{alt.name}** · id `{alt.alt_id}` · "
+            f"repo `{repo}` · `{alt.status}` · heartbeat `{_fmt_ago(alt.last_heartbeat_ts)}`"
+        )
+    embed = discord.Embed(
+        title="👥 Configured alts",
+        description="\n".join(rows) if rows else "_No alts configured._",
+        color=0x5865F2,
+    )
+    embed.set_footer(text="Tokens and private credentials are never displayed.")
+    await inter.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="altremove", description="Remove an alt from the registry, with optional confirmed repository deletion.")
+@app_commands.describe(
+    alt="Configured alt to remove",
+    confirmation="Type DELETE exactly to confirm removal",
+    delete_repository="Also permanently delete the mapped GitHub repository",
+)
+async def cmd_altremove(inter: discord.Interaction, alt: int, confirmation: str, delete_repository: bool = False):
+    if not await _check_perms(inter):
+        return
+    if str(confirmation).strip().upper() != "DELETE":
+        return await inter.response.send_message("❌ Type `DELETE` exactly to confirm alt removal.", ephemeral=True)
+    current = state.get(alt)
+    if not current:
+        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    repo = config.ALT_REPOS.get(alt, "")
+    cancel_ok, cancel_detail = (True, "No repository mapping to cancel.")
+    if repo:
+        cancel_ok, cancel_detail = await asyncio.to_thread(github_api.cancel_run, alt)
+    repos = dict(config.ALT_REPOS); repos.pop(alt, None)
+    discord_ids = dict(config.ALT_DISCORD_IDS); discord_ids.pop(alt, None)
+    names = dict(config.ALT_NAMES); names.pop(alt, None)
+    persisted, persist_detail = await _persist_alt_registry(repos, discord_ids, names)
+    if not persisted:
+        return await inter.followup.send(f"❌ Alt was not removed from the core registry: {persist_detail}", ephemeral=True)
+    cleanup_detail = ""
+    if repo:
+        if delete_repository:
+            cleaned, cleanup_detail = await asyncio.to_thread(github_api.delete_repository, repo)
+        else:
+            cleaned, cleanup_detail = await asyncio.to_thread(github_api.delete_repository_secret, repo, "USER_TOKEN")
+        if not cleaned:
+            cleanup_detail = f"Cleanup warning: {cleanup_detail}"
+    _apply_alt_registry(repos, discord_ids, names)
+    state.remove_alt(alt)
+    deletion = "repository deletion requested" if delete_repository else "USER_TOKEN secret deleted; repository kept"
+    text = f"🗑️ Removed **{current.name}** (alt `{alt}`). {deletion}. {cleanup_detail} Workflow cancellation: {cancel_detail}"
+    await inter.followup.send(text, ephemeral=True)
+    await _log_control(text)
+
+
 async def _finish_dm_control(inter: discord.Interaction, alt_id: int,
                              command: str, label: str, *, update=None) -> None:
-    """Send a DM control command and report the exact remote acknowledgement privately."""
+    """Send a control command through the Gist queue (or legacy DM fallback)."""
     alt = state.get(alt_id)
     if not alt:
         await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
         return
     await inter.response.defer(ephemeral=True)
-    ack = await _send_dm_wait_ack(alt_id, command, timeout=20)
+    ack = await _send_control_wait_ack(alt_id, command, timeout=20)
     failed = ack.startswith(("❌", "⏰"))
+    queued = ack.startswith("🕒")
     if not failed and update:
         update()
-    status = "Remote alt acknowledged the command." if not failed else "Remote alt did not confirm the change."
+    if queued:
+        status = "Queued in the shared control Gist; the alt will apply it on its next poll and confirm through the next heartbeat."
+    else:
+        status = "Remote alt acknowledged the command." if not failed else "Remote alt did not confirm the change."
     text = (
         f"{'✅' if not failed else '⚠️'} **{alt.name}** — {label}\n"
         f"Command sent: `{command[:900]}`\n"
@@ -461,17 +730,17 @@ async def cmd_stop(inter: discord.Interaction, alt: int):
     if not a:
         return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
     await inter.response.defer(ephemeral=True)
-    dm_ack = await _send_dm_wait_ack(alt, "!stop", timeout=15)
+    control_ack = await _send_control_wait_ack(alt, "!stop", timeout=15)
     ok, msg = await asyncio.to_thread(github_api.cancel_run, alt)
     state.set_workflow(alt, run_id=None, status="cancelled" if ok else a.workflow_status,
                        conclusion="cancelled" if ok else "")
-    text = f"🛑 **{a.name}** stop requested. DM acknowledgement: `{dm_ack}`\nGitHub: {msg}"
+    text = f"🛑 **{a.name}** stop requested. Control transport: `{control_ack}`\nGitHub: {msg}"
     await inter.followup.send(text, ephemeral=True)
     await _log_control(text)
     state.append_log(alt, text, emoji="🛑", color=0xED4245, kind="CONTROL")
 
 
-@bot.tree.command(name="pause", description="Pause one alt's public posting through its DM control channel.")
+@bot.tree.command(name="pause", description="Pause one alt's public posting through the control Gist or DM fallback.")
 @app_commands.describe(alt="Configured alt to pause")
 async def cmd_pause(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
@@ -479,7 +748,7 @@ async def cmd_pause(inter: discord.Interaction, alt: int):
     await _finish_dm_control(inter, alt, "!pause", "pause requested")
 
 
-@bot.tree.command(name="resume", description="Resume one paused alt through its DM control channel.")
+@bot.tree.command(name="resume", description="Resume one paused alt through the control Gist or DM fallback.")
 @app_commands.describe(alt="Configured alt to resume")
 async def cmd_resume(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
@@ -532,6 +801,66 @@ async def cmd_setmessage(inter: discord.Interaction, alt: int, new_message: str)
     )
 
 
+@bot.tree.command(name="setdealkeywords", description="Set the comma-separated item keywords used by the separate deal scanner.")
+@app_commands.describe(alt="Configured alt", keywords="Comma-separated item names, for example: Blade Ball, BB token, BB")
+async def cmd_setdealkeywords(inter: discord.Interaction, alt: int, keywords: str):
+    if not await _check_perms(inter):
+        return
+    raw_items = [part.strip() for part in keywords.split(",") if part.strip()]
+    normalized = []
+    seen = set()
+    for item in raw_items:
+        item = re.sub(r"\s+", " ", item)[:60]
+        key = item.casefold()
+        if item and key not in seen:
+            seen.add(key)
+            normalized.append(item)
+    if not normalized:
+        return await inter.response.send_message("❌ Provide at least one comma-separated item keyword.", ephemeral=True)
+    if len(normalized) > 20:
+        return await inter.response.send_message("❌ Use at most 20 item keywords.", ephemeral=True)
+    joined = ", ".join(normalized)
+    if len(joined) > 500:
+        return await inter.response.send_message("❌ Combined keyword length cannot exceed 500 characters.", ephemeral=True)
+    await _finish_dm_control(
+        inter, alt, f"!setdealkeywords {joined}", f"deal item keywords validated ({len(normalized)} keyword(s))",
+        update=lambda: state.set_deal_keywords(alt, normalized),
+    )
+
+
+@bot.tree.command(name="setdealscan", description="Enable or disable the separate item-aware deal scanner.")
+@app_commands.describe(alt="Configured alt", enabled="Turn deal scanning on or off")
+@app_commands.choices(enabled=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
+async def cmd_setdealscan(inter: discord.Interaction, alt: int, enabled: str):
+    if not await _check_perms(inter):
+        return
+    enabled = enabled.casefold().strip()
+    if enabled not in {"on", "off"}:
+        return await inter.response.send_message("❌ Scanner must be `on` or `off`.", ephemeral=True)
+    active = enabled == "on"
+    await _finish_dm_control(
+        inter, alt, f"!setdealscan {enabled}", f"deal scanner queued as `{enabled}`",
+        update=lambda: state.set_deal_config(alt, enabled=active),
+    )
+
+
+@bot.tree.command(name="setdealdelta", description="Set the minimum price edge required for a deal alert.")
+@app_commands.describe(alt="Configured alt", delta="Dollar edge per 1k, from 0 to 5; example 0.05")
+async def cmd_setdealdelta(inter: discord.Interaction, alt: int, delta: str):
+    if not await _check_perms(inter):
+        return
+    try:
+        value = float(delta.strip())
+    except (TypeError, ValueError, AttributeError):
+        value = -1
+    if not math.isfinite(value) or value < 0 or value > 5:
+        return await inter.response.send_message("❌ Delta must be between 0 and 5 dollars per 1k; example `0.05`.", ephemeral=True)
+    await _finish_dm_control(
+        inter, alt, f"!setdealdelta {value:g}", f"deal edge queued at ${value:.2f}/1k",
+        update=lambda: state.set_deal_config(alt, delta=value),
+    )
+
+
 @bot.tree.command(name="setchannel", description="Verify and add/update one channel ID on an alt at runtime.")
 @app_commands.describe(alt="Configured alt", channel_id="Numeric Discord channel ID", name="Optional channel label")
 async def cmd_setchannel(inter: discord.Interaction, alt: int, channel_id: str, name: str = ""):
@@ -542,7 +871,7 @@ async def cmd_setchannel(inter: discord.Interaction, alt: int, channel_id: str, 
         return await inter.response.send_message("❌ Channel ID must contain digits only.", ephemeral=True)
     label = re.sub(r"[\r\n]", " ", name.strip())[:80]
     await _finish_dm_control(
-        inter, alt, f"!setchannel {cid}{(' ' + label) if label else ''}", f"channel ID validated: `{cid}`",
+        inter, alt, f"!setchannel {cid}{(' ' + label) if label else ''}", f"channel ID queued for remote validation: `{cid}`",
         update=lambda: state.set_channel(alt, cid, label),
     )
 
@@ -557,7 +886,7 @@ async def cmd_replacechannel(inter: discord.Interaction, alt: int, old_id: str, 
     label = re.sub(r"[\r\n]", " ", name.strip())[:80]
     await _finish_dm_control(
         inter, alt, f"!replacechannel {old_id} {new_id}{(' ' + label) if label else ''}",
-        f"channel replacement validated: `{old_id}` → `{new_id}`",
+        f"channel replacement queued for remote validation: `{old_id}` → `{new_id}`",
         update=lambda: state.replace_channel(alt, old_id, new_id, label),
     )
 
@@ -598,12 +927,78 @@ async def cmd_sync(inter: discord.Interaction):
     results = []
     for alt_id in state.alt_ids:
         alt = state.get(alt_id)
-        ack = await _send_dm_wait_ack(alt_id, "!sync", timeout=12)
+        ack = await _send_control_wait_ack(alt_id, "!sync", timeout=12)
         results.append(f"**{alt.name}**: `{ack}`")
         state.append_log(alt_id, f"sync: {ack}", emoji="🔄", color=0x5865F2, kind="CONTROL")
     text = "🔄 **Sync sent to all configured alts**\n" + "\n".join(results)
     await inter.followup.send(text, ephemeral=True)
     await _log_control(text)
+
+
+@bot.tree.command(name="pingalt", description="Send a control-path ping to one alt and confirm its next poll.")
+@app_commands.describe(alt="Configured alt to ping")
+async def cmd_pingalt(inter: discord.Interaction, alt: int):
+    if not await _check_perms(inter):
+        return
+    await _finish_dm_control(inter, alt, "!ping", "control-path ping queued")
+
+
+@bot.tree.command(name="selfcheck", description="Run the configured alt self-check workflow without using a DM.")
+@app_commands.describe(alt="Configured alt to validate")
+async def cmd_selfcheck(inter: discord.Interaction, alt: int):
+    if not await _check_perms(inter):
+        return
+    if not state.get(alt):
+        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    ok, detail = await asyncio.to_thread(
+        github_api.dispatch_named_workflow, alt, config.SELF_CHECK_WORKFLOW, {}
+    )
+    if ok:
+        state.set_workflow(alt, None, "queued", "")
+        text = f"🔍 **{state.get(alt).name}** self-check queued. {detail}"
+    else:
+        text = f"❌ Self-check could not be queued: {detail}"
+    await inter.followup.send(text, ephemeral=True)
+    await _log_control(text)
+    state.append_log(alt, text, emoji="🔍" if ok else "❌", color=0x5865F2 if ok else 0xED4245, kind="CONTROL" if ok else "ERROR")
+
+
+@bot.tree.command(name="clearlogs", description="Clear the local buffered logs for one alt; Discord history is not deleted.")
+@app_commands.describe(alt="Configured alt whose local buffer should be cleared")
+async def cmd_clearlogs(inter: discord.Interaction, alt: int):
+    if not await _check_perms(inter):
+        return
+    a = state.get(alt)
+    if not a:
+        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+    state.clear_logs(alt)
+    await inter.response.send_message(f"🧹 Cleared local buffered logs for **{a.name}**. Discord channel history was not deleted.", ephemeral=True)
+
+
+@bot.tree.command(name="runs", description="Show recent GitHub Actions runs for one alt without exposing secrets.")
+@app_commands.describe(alt="Configured alt")
+async def cmd_runs(inter: discord.Interaction, alt: int):
+    if not await _check_perms(inter):
+        return
+    a = state.get(alt)
+    if not a:
+        return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    runs = await asyncio.to_thread(github_api.list_runs, alt, 8)
+    if not runs:
+        return await inter.followup.send(f"No GitHub workflow runs found for **{a.name}**.", ephemeral=True)
+    lines = []
+    for run in runs:
+        status = str(run.get("status") or "?")
+        conclusion = str(run.get("conclusion") or "pending")
+        run_id = run.get("id") or "?"
+        created = str(run.get("created_at") or "")[:16].replace("T", " ")
+        url = str(run.get("html_url") or "")
+        label = f"[{run_id}]({url})" if url else f"`{run_id}`"
+        lines.append(f"{label} · `{status}/{conclusion}` · `{created}Z`")
+    embed = discord.Embed(title=f"🧾 {a.name} · recent runs", description="\n".join(lines)[:4000], color=0x5865F2)
+    await inter.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="status", description="Show current heartbeat, counters, alerts, and GitHub state.")
@@ -647,7 +1042,9 @@ async def cmd_deals(inter: discord.Interaction, alt: int = 0):
     lines = []
     for item in chosen:
         last = datetime.fromtimestamp(item.last_deal_ts, timezone.utc).isoformat() if item.last_deal_ts else "never"
-        lines.append(f"**{item.name}** — alerts: `{item.deal_alerts}` · last: `{last}`")
+        keywords = ", ".join(item.deal_keywords[:20]) or "none configured"
+        scanner = f"{'on' if item.deal_scan_enabled else 'off'} · edge ${item.deal_alert_delta:.2f}/1k"
+        lines.append(f"**{item.name}** — alerts: `{item.deal_alerts}` · last: `{last}` · scanner: `{scanner}` · keywords: `{keywords}`")
     await inter.response.send_message(embed=discord.Embed(title="📈 Separate deal scanner state", description="\n".join(lines), color=0x57F287), ephemeral=True)
 
 
@@ -672,6 +1069,10 @@ async def cmd_dashboard(inter: discord.Interaction):
 
 
 _COMMAND_GUIDE = {
+    "altadd": ("`/altadd` then complete the private modal", "Adds an existing prepared alt repository, stores its USER_TOKEN without echoing it, and persists its repository/Discord ID/name mapping. It does not expose or print secrets."),
+    "altupdate": ("`/altupdate alt:<alt>` then complete the private modal", "Updates an alt's token, repository, Discord ID, and/or display name. Empty fields are left unchanged; a repository move requires a new token."),
+    "altlist": ("`/altlist`", "Lists configured alts and live heartbeat age without displaying any token or secret."),
+    "altremove": ("`/altremove alt:<alt> confirmation:DELETE delete_repository:<true|false>`", "Stops the workflow, removes the alt from the core registry, deletes USER_TOKEN, and keeps the repository unless permanent deletion is explicitly selected."),
     "run": ("No slash arguments; private form.", "Choose one configured alt, sell/buy, price/style, image yes/no, interval 3/5, and runtime 6/12/18/24/48h. Dispatches its GitHub workflow."),
     "stop": ("`/stop alt:<alt>`", "Privately sends !stop and cancels the matching GitHub run."),
     "pause": ("`/pause alt:<alt>`", "Privately sends !pause; public posting should stop after the remote ack."),
@@ -679,14 +1080,21 @@ _COMMAND_GUIDE = {
     "setprice": ("`/setprice alt:<alt> new_price:<0..20>`", "Validates the value, sends !setprice, and updates live dashboard state only after an ack."),
     "setmode": ("`/setmode alt:<alt> mode:<sell|buy>`", "Sends !setmode and updates live mode after an ack."),
     "setmessage": ("`/setmessage alt:<alt> new_message:<text>`", "Rejects empty/text over 1900 chars, sends !setmessage, and updates the preview after an ack."),
+    "setdealkeywords": ("`/setdealkeywords alt:<alt> keywords:<a, b, c>`", "Sets exact case-insensitive item keywords for the separate deal scanner. The sender persists the setting through the shared control Gist."),
+    "setdealscan": ("`/setdealscan alt:<alt> enabled:<on|off>`", "Turns the separate item-aware deal scanner on or off without changing public ad posting."),
+    "setdealdelta": ("`/setdealdelta alt:<alt> delta:<0..5>`", "Sets the minimum price edge per 1k before a matching item offer alerts; the default is $0.05."),
     "setchannel": ("`/setchannel alt:<alt> channel_id:<digits> [name]`", "Sends !setchannel; the sender verifies the channel before adding it to its runtime scheduler."),
     "replacechannel": ("`/replacechannel alt:<alt> old_id:<digits> new_id:<digits> [name]`", "Sends !replacechannel; the sender verifies the replacement and safely rewrites scheduler state."),
     "setinterval": ("`/setinterval alt:<alt> interval:<3|5>`", "Sends !setinterval. The sender keeps the permitted 3/5-minute constraint."),
     "setruntime": ("`/setruntime alt:<alt> hours:<6|12|18|24|48>`", "Sends !setruntime. The sender caps all runtime to 48 hours."),
     "sync": ("`/sync`", "Sends !sync to every configured alt to reload shared control/Gist state."),
+    "pingalt": ("`/pingalt alt:<alt>`", "Sends !ping through the same control transport used by runtime commands; use it to verify the Gist queue without changing ad settings."),
+    "selfcheck": ("`/selfcheck alt:<alt>`", "Dispatches that alt's self-check workflow to validate token, channels, webhooks, Gists, and routing."),
     "status": ("`/status [alt:<alt>|All alts]`", "Refreshes GitHub state and shows current heartbeat, workflow, counters, channels, errors, and alerts."),
+    "runs": ("`/runs alt:<alt>`", "Shows the latest GitHub Actions runs and links without exposing workflow secrets."),
     "logs": ("`/logs alt:<alt> [limit] [kind]`", "Shows typed buffered logs. Filter kinds include ERROR, DEAL, CONTROL, CHANNEL, CAUTION, and DEBUG."),
-    "deals": ("`/deals [alt:<alt>|All alts]`", "Shows deal-alert counters from the separate deal webhook/state path."),
+    "clearlogs": ("`/clearlogs alt:<alt>`", "Clears only the control bot's local in-memory log buffer; it does not delete Discord history or sender logs."),
+    "deals": ("`/deals [alt:<alt>|All alts]`", "Shows deal-alert counters, latest alert time, scanner state, threshold, and active item keywords from the separate deal path."),
     "refresh": ("`/refresh`", "Fetches current GitHub run state and updates the persistent dashboard message."),
     "dashboard": ("`/dashboard`", "Posts a fresh dashboard snapshot; it does not run the sender or scan deals."),
     "help": ("`/help`", "Shows this private complete command reference."),
@@ -738,10 +1146,14 @@ def make_alt_autocompleter(command_name: str):
 
 for command_name, command in (
     ("stop", cmd_stop), ("pause", cmd_pause), ("resume", cmd_resume),
+    ("altupdate", cmd_altupdate), ("altremove", cmd_altremove),
     ("setprice", cmd_setprice), ("setmode", cmd_setmode),
-    ("setmessage", cmd_setmessage), ("setchannel", cmd_setchannel), ("replacechannel", cmd_replacechannel),
+    ("setmessage", cmd_setmessage), ("setdealkeywords", cmd_setdealkeywords),
+    ("setdealscan", cmd_setdealscan), ("setdealdelta", cmd_setdealdelta),
+    ("setchannel", cmd_setchannel), ("replacechannel", cmd_replacechannel),
     ("setinterval", cmd_setinterval), ("setruntime", cmd_setruntime), ("logs", cmd_logs),
-    ("deals", cmd_deals), ("status", cmd_status),
+    ("deals", cmd_deals), ("status", cmd_status), ("pingalt", cmd_pingalt),
+    ("selfcheck", cmd_selfcheck), ("clearlogs", cmd_clearlogs), ("runs", cmd_runs),
 ):
     command.autocomplete("alt")(make_alt_autocompleter(command_name))
 
@@ -799,6 +1211,22 @@ async def _send_dm_wait_ack(alt_id: int, text: str, timeout: float = 15.0) -> st
     finally:
         if _DM_ACKS.get(did) is fut:
             _DM_ACKS.pop(did, None)
+
+
+async def _send_control_wait_ack(alt_id: int, text: str, timeout: float = 15.0) -> str:
+    """Use the shared Gist queue so alts need not join the control server.
+
+    Direct bot-to-user DMs require a mutual Discord server in many cases. The
+    existing private control Gist is already readable by every sender, so it
+    is the reliable transport for runtime commands. DM remains a compatibility
+    fallback only when no control Gist is configured.
+    """
+    if config.CONTROL_GIST_ID:
+        ok, detail = await asyncio.to_thread(github_api.queue_control_command, alt_id, text)
+        if ok:
+            return f"🕒 queued via control Gist (command `{detail}`); polling every 45s"
+        return f"❌ Control Gist queue failed: {detail}"
+    return await _send_dm_wait_ack(alt_id, text, timeout=timeout)
 
 
 @bot.event
@@ -930,59 +1358,114 @@ def _parse_deal_message(alt_id: int, message: discord.Message):
 
 
 def _parse_dashboard_message(message: discord.Message):
-    """Extract live V6 heartbeat from structured dashboard webhook content."""
-    # Try JSON in content first — V6 wraps it in a JSON code fence
-    if message.content:
-        raw = message.content.strip()
-        # Strip code fence if present
-        if raw.startswith("```"):
-            # remove opening ```...\n line and closing ```
-            lines = raw.split("\n")
-            # skip first line (```json)
-            inner = "\n".join(lines[1:])
-            if inner.endswith("```"):
-                inner = inner[:-3]
-            raw = inner.strip()
-        if raw.startswith("{"):
-            try:
-                payload = json.loads(raw)
-                if isinstance(payload, dict) and (payload.get("heartbeat") or payload.get("type") == "heartbeat"):
-                    alt_id = payload.get("alt_id") or _match_alt_name(payload.get("alt_name"))
-                    if alt_id:
-                        state.update_from_heartbeat(alt_id, payload)
-            except Exception as e:
-                dbg = False  # ignore parse errors
-    for embed in message.embeds:
-        # Our new heartbeat embed will have "HEARTBEAT: Alt N" in title/footer
-        # Otherwise, parse per-field alt data from summary embeds.
-        if embed.title and embed.title.lower().startswith("💓 heartbeat"):
-            try:
-                # Footer has alt id encoded
-                alt_id = None
-                if embed.footer and embed.footer.text:
-                    m = re.search(r"alt[_\s-]?(\d+)", embed.footer.text, re.I)
-                    if m:
-                        alt_id = int(m.group(1))
-                if alt_id is None:
-                    for f in embed.fields or []:
-                        if (f.name or "").lower() == "alt_id":
-                            alt_id = int(f.value)
-                # Build payload from embed fields
-                payload = {}
-                for f in embed.fields or []:
-                    payload[f.name] = f.value
-                # Also parse description for key=value pairs
-                if embed.description:
-                    for line in embed.description.split("\n"):
-                        if ":" in line:
-                            k, _, v = line.partition(":")
-                            payload[k.strip().lower()] = v.strip()
+    """Extract live state from a structured heartbeat (old JSON or new embed)."""
+    # Keep compatibility with heartbeat messages written before the readable
+    # embed format was deployed.
+    raw = (message.content or "").strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:])
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and (payload.get("heartbeat") or payload.get("type") == "heartbeat"):
+                alt_id = payload.get("alt_id") or _match_alt_name(payload.get("alt_name"))
                 if alt_id:
                     state.update_from_heartbeat(alt_id, payload)
-            except Exception:
-                pass
-        elif embed.title and embed.title.startswith("✅ **SEND**"):
-            pass  # log webhook per-send message, not a heartbeat
+        except Exception:
+            pass
+    for embed in message.embeds:
+        title = getattr(embed, "title", "") or ""
+        if not title.lower().startswith("💓 heartbeat"):
+            continue
+        try:
+            alt_id = None
+            footer = getattr(embed, "footer", None)
+            footer_text = getattr(footer, "text", "") if footer else ""
+            match = re.search(r"alt[_\s-]?(\d+)", footer_text, re.I)
+            if match:
+                alt_id = int(match.group(1))
+            if alt_id is None:
+                alt_id = _match_alt_name(title)
+            if not alt_id:
+                continue
+            payload = {"heartbeat": True, "type": "heartbeat", "alt_id": alt_id}
+            channels = {}
+            for field in embed.fields or []:
+                name = str(getattr(field, "name", "") or "").strip()
+                value = str(getattr(field, "value", "") or "").strip()
+                key = name.casefold()
+                if key == "status":
+                    m = re.search(r"\b(active|paused|caution|ip_pause|afk|stopped|error|offline|starting|queued)\b", value, re.I)
+                    if m:
+                        payload["status"] = m.group(1).lower()
+                elif key == "mode":
+                    m = re.search(r"\b(sell|buy)\b", value, re.I)
+                    if m:
+                        payload["ad_type"] = m.group(1).lower()
+                elif key == "rate":
+                    m = re.search(r"(\d+(?:\.\d{1,2})?)", value)
+                    if m:
+                        payload["rate"] = float(m.group(1))
+                elif key == "activity":
+                    for label, target in (("sent", "total_sent"), ("errors", "total_errors"), ("skips", "total_skips")):
+                        m = re.search(rf"{label}:?\s*`?(\d+)", value, re.I)
+                        if m:
+                            payload[target] = int(m.group(1))
+                elif key == "deals":
+                    m = re.search(r"(\d+)", value)
+                    if m:
+                        payload["deal_alerts"] = int(m.group(1))
+                elif key == "keywords":
+                    payload["deal_keywords"] = [x.strip() for x in value.split(",") if x.strip() and x.lower() != "none configured"]
+                elif key == "scanner":
+                    payload["deal_scan_enabled"] = value.casefold().startswith("on")
+                    m = re.search(r"edge\s*\$?(\d+(?:\.\d+)?)", value, re.I)
+                    if m:
+                        payload["deal_alert_delta"] = float(m.group(1))
+                elif key == "uptime":
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*min", value, re.I)
+                    if m:
+                        payload["uptime_sec"] = float(m.group(1)) * 60
+                elif key == "channels":
+                    m = re.search(r"(\d+)\s*/\s*(\d+)", value)
+                    if m:
+                        payload["active_channels"], payload["total_channels"] = int(m.group(1)), int(m.group(2))
+                elif key == "message":
+                    payload["message_preview"] = value[:120]
+                elif key in {"latest issue", "latest error"}:
+                    payload["last_error"] = value[:300]
+                elif key == "warnings":
+                    payload["warnings"] = [x for x in value.splitlines() if x.strip()]
+                elif key.startswith("channel:"):
+                    match_cid = re.search(r"channel:\s*(\d+)", name, re.I)
+                    if match_cid:
+                        cid = match_cid.group(1)
+                        ch_name = cid
+                        if "· #" in name:
+                            ch_name = name.split("· #", 1)[1].strip() or cid
+                        sent = re.search(r"sent\s*`?(\d+)", value, re.I)
+                        errors = re.search(r"errors\s*`?(\d+)", value, re.I)
+                        slow = re.search(r"slowmode\s*`?(\d+)", value, re.I)
+                        last = re.search(r"last\s+<t:(\d+):", value, re.I)
+                        channels[cid] = {
+                            "name": ch_name[:80],
+                            "sent": int(sent.group(1)) if sent else 0,
+                            "errors": int(errors.group(1)) if errors else 0,
+                            "slowmode": int(slow.group(1)) if slow else 0,
+                            "alive": "alive" in value.casefold(),
+                            "last_post": int(last.group(1)) if last else 0,
+                        }
+            if channels:
+                payload["channels"] = channels
+            state.update_from_heartbeat(alt_id, payload)
+        except Exception:
+            # A malformed optional field must not discard the rest of a live
+            # heartbeat or crash the bot's event loop.
+            continue
 
 
 def _parse_log_message(alt_id: int, message: discord.Message):

@@ -1,8 +1,13 @@
 """control_bot.github_api — thin wrapper around GitHub REST API for workflow control."""
 from __future__ import annotations
 
+import json
 import os
+import re
+import shutil
+import subprocess
 import time
+import uuid
 from typing import Optional
 
 import requests  # uses requests; control bot doesn't need curl_cffi impersonation
@@ -16,6 +21,83 @@ _HTTP_TIMEOUT = config.CONTROL_HTTP_TIMEOUT
 
 
 GH = "https://api.github.com"
+
+
+def _gist_filename(alt_id: int) -> str:
+    return f"control_{int(alt_id)}.json"
+
+
+def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
+    """Queue one validated control command in the shared private Gist.
+
+    This is the transport used when the alt must not join the control server.
+    A separate file per alt prevents commands for different alts from
+    overwriting one another. The alt-side sender polls this file using its
+    existing GIST_TOKEN and applies the command exactly once per run.
+    """
+    if not config.CONTROL_GIST_ID:
+        return False, "CONTROL_GIST_ID is not configured."
+    raw = str(text or "").strip()
+    command, _, args = raw.lstrip("!/").partition(" ")
+    command = command.strip().lower()
+    if not command or len(command) > 40:
+        return False, "Command is empty or invalid."
+    url = f"{GH}/gists/{config.CONTROL_GIST_ID}"
+    # Preserve durable per-alt settings (especially deal keywords) when a new
+    # one-shot command replaces the target file.
+    payload = {}
+    try:
+        existing = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        if existing.status_code == 200:
+            files = existing.json().get("files") or {}
+            prior = files.get(_gist_filename(alt_id), {})
+            raw_prior = prior.get("content") or ""
+            parsed_prior = json.loads(raw_prior) if raw_prior else {}
+            if isinstance(parsed_prior, dict):
+                payload.update({k: v for k, v in parsed_prior.items() if k in {"deal_keywords", "deal_scan_enabled", "deal_alert_delta"}})
+    except Exception:
+        # The PATCH below remains authoritative; inability to read an old
+        # optional setting must not prevent a command from being queued.
+        pass
+    payload.update({
+        "alt_id": int(alt_id),
+        "command_id": uuid.uuid4().hex,
+        "command": command,
+        "args": args.strip()[:1900],
+        "issued_at": time.time(),
+        "transport": "control_gist",
+    })
+    if command == "setdealkeywords":
+        payload["deal_keywords"] = [item.strip()[:60] for item in args.split(",") if item.strip()][:20]
+    elif command == "setdealscan":
+        payload["deal_scan_enabled"] = args.casefold().strip() in {"on", "true", "1", "enable", "enabled"}
+    elif command == "setdealdelta":
+        try:
+            value = float(args.strip())
+            if 0 <= value <= 5:
+                payload["deal_alert_delta"] = value
+        except (TypeError, ValueError, OverflowError):
+            pass
+    try:
+        response = requests.patch(
+            url,
+            headers=_auth_headers(),
+            json={"files": {_gist_filename(alt_id): {"content": json.dumps(payload, ensure_ascii=False)}}},
+            timeout=_HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        return False, f"Control Gist network error: {type(exc).__name__}: {exc}"
+    if response.status_code == 200:
+        return True, payload["command_id"]
+    try:
+        message = response.json().get("message", response.text[:200])
+    except Exception:
+        message = response.text[:200]
+    if response.status_code in {401, 403}:
+        return False, f"Control Gist authorization failed (HTTP {response.status_code}): {message}"
+    if response.status_code == 404:
+        return False, "Control Gist was not found or GH_TOKEN cannot access it."
+    return False, f"Control Gist HTTP {response.status_code}: {message}"
 
 
 def _auth_headers() -> dict:
@@ -36,8 +118,97 @@ def _repo_slug(repo: str) -> str:
     return repo if "/" in repo else f"{config.GITHUB_OWNER}/{repo}"
 
 
+def repository_exists(repo: str) -> tuple[bool, str]:
+    """Check that a repository exists without exposing any secret value."""
+    if not repo:
+        return False, "Repository is empty."
+    try:
+        response = requests.get(
+            f"{GH}/repos/{_repo_slug(repo)}",
+            headers=_auth_headers(),
+            timeout=_HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        return False, f"Repository lookup failed: {type(exc).__name__}: {exc}"
+    if response.status_code == 200:
+        return True, "Repository exists."
+    if response.status_code == 404:
+        return False, "Repository was not found or is not accessible to GH_TOKEN."
+    return False, f"Repository lookup returned HTTP {response.status_code}."
+
+
+def _run_gh_secret(args: list[str], value: str | None = None) -> tuple[bool, str]:
+    """Run gh secret operations without putting secret values in argv/logs."""
+    if not config.GITHUB_TOKEN:
+        return False, "GH_TOKEN is missing."
+    if not shutil.which("gh"):
+        return False, "GitHub CLI (gh) is not installed on the control runner."
+    env = os.environ.copy()
+    env["GH_TOKEN"] = config.GITHUB_TOKEN
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            input=(value + "\n") if value is not None else None,
+            text=True,
+            capture_output=True,
+            timeout=_HTTP_TIMEOUT,
+            env=env,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"GitHub CLI failed: {type(exc).__name__}: {exc}"
+    if result.returncode == 0:
+        return True, "GitHub secret operation completed."
+    detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:300]
+    return False, detail or f"GitHub CLI exited with {result.returncode}."
+
+
+def set_repository_secret(repo: str, name: str, value: str) -> tuple[bool, str]:
+    """Set a repository secret via stdin so the value is never in argv."""
+    if not repo or not name or value is None:
+        return False, "Repository, secret name, and value are required."
+    return _run_gh_secret(["secret", "set", name, "--repo", _repo_slug(repo)], value)
+
+
+def delete_repository_secret(repo: str, name: str) -> tuple[bool, str]:
+    """Delete one repository secret; callers must already have owner auth."""
+    if not repo or not name:
+        return False, "Repository and secret name are required."
+    return _run_gh_secret(["secret", "delete", name, "--repo", _repo_slug(repo), "--yes"])
+
+
+def delete_repository(repo: str) -> tuple[bool, str]:
+    """Delete a repository only when an explicit owner command requested it."""
+    if not repo:
+        return False, "Repository is empty."
+    return _run_gh_secret(["repo", "delete", _repo_slug(repo), "--yes"])
+
+
+def dispatch_named_workflow(alt_id: int, workflow: str, inputs: dict | None = None) -> tuple[bool, str]:
+    """Trigger a named workflow without requiring an alt DM."""
+    repo = _repo_for(alt_id)
+    if not repo:
+        return False, f"Alt {alt_id} has no repository mapped in ALT_REPOS."
+    workflow = str(workflow or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", workflow):
+        return False, "Workflow filename is invalid."
+    url = f"{GH}/repos/{_repo_slug(repo)}/actions/workflows/{workflow}/dispatches"
+    payload = {"ref": "main", "inputs": inputs or {}}
+    try:
+        response = requests.post(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+    except Exception as exc:
+        return False, f"Network error: {type(exc).__name__}: {exc}"
+    if response.status_code == 204:
+        return True, f"Dispatched `{workflow}` in `{repo}`."
+    try:
+        message = response.json().get("message", response.text[:200])
+    except Exception:
+        message = response.text[:200]
+    return False, f"HTTP {response.status_code}: {message}"
+
+
 def dispatch_workflow(alt_id: int, inputs: dict) -> tuple[bool, str]:
-    """Trigger workflow_dispatch for an alt's repo. Returns (ok, message)."""
+    """Trigger the configured sender workflow. Returns (ok, message)."""
     repo = _repo_for(alt_id)
     if not repo:
         return False, f"Alt {alt_id} has no repository mapped in ALT_REPOS."

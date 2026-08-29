@@ -287,6 +287,22 @@ DEAL_MY_RATE         = _float("DEAL_MY_RATE", 0.0)   # 0 = auto-extract from MES
 DEAL_ALERT_DELTA     = _float("DEAL_ALERT_DELTA", 0.05)  # alert only if edge >= this
 # Deal alerts have their own destination; they never share the dashboard webhook.
 DEAL_WEBHOOK_URL     = _env("DEAL_WEBHOOK_URL") or _env("DEALS_WEBHOOK_URL")
+# Exact, case-insensitive item aliases required before a deal can alert. Keep
+# the default focused on the configured Blade Ball market; change it at runtime
+# with !setdealkeywords or /setdealkeywords (comma-separated).
+def _parse_deal_keywords(raw):
+    result, seen = [], set()
+    for part in str(raw or "").split(","):
+        value = re.sub(r"\\s+", " ", part.strip())[:60]
+        key = value.casefold()
+        if value and key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result[:20]
+
+DEAL_ITEM_KEYWORDS = _parse_deal_keywords(
+    _env("DEAL_ITEM_KEYWORDS", "Blade Ball,BladeBall,BB token,BB tokens,BB")
+)
 IP_HEALTH_CHECK_INTERVAL_MIN = _float("IP_HEALTH_CHECK_INTERVAL_MIN", 30)
 IP_HEALTH_PAUSE_MIN  = _float("IP_HEALTH_PAUSE_MIN", 10)
 CAUTION_WINDOW       = _int("CAUTION_WINDOW", 3)     # rolling window size
@@ -398,6 +414,7 @@ if TOTAL_RUN_MIN < 5:
 if TOTAL_RUN_MIN > 2880:  # 48h
     log(f"⚠️ CONFIG: TOTAL_RUN_MIN={TOTAL_RUN_MIN} exceeds the 48h safety cap. Clamping to 2880 min (48h).")
     TOTAL_RUN_MIN = 2880
+
 if AD_TYPE not in ("sell", "buy"):
     log(f"❌ CONFIG ERROR: AD_TYPE must be 'sell' or 'buy', got '{AD_TYPE}'. Check workflow inputs / AD_TYPE env var.")
     sys.exit(1)
@@ -458,8 +475,13 @@ _runtime_hours = 0               # current/next runtime choice for heartbeat sta
 _runtime_message = None          # overridden MESSAGE (set via !setmessage)
 _runtime_rate = None             # overridden rate (set via !setprice)
 _runtime_ad_type = None          # overridden ad_type (set via !setmode)
+_runtime_deal_keywords = None    # overridden item aliases (set via !setdealkeywords)
+_runtime_deal_scan_enabled = None  # overridden scanner toggle
+_runtime_deal_delta = None          # overridden alert edge
 _last_heartbeat_sent = 0.0
+_dashboard_message_id = ""
 _last_gist_sync = 0.0
+_last_control_command_id = ""
 _runtime_stats_start_sent = 0    # sent count at start of this run (for heartbeat delta)
 _runtime_stats_start_err = 0
 # Runtime counters (module-level so the gateway/controller thread can read them)
@@ -797,6 +819,7 @@ def api(method, url, retries=3, referer=None, files_mp=None, json_body=None,
                 pass
         return r
     return _fake_err_response(0, "max retries exceeded")
+
 def _fake_err_response(code, msg):
     r = creq.Response()
     r.status_code = code
@@ -1595,6 +1618,7 @@ def discover_channel_by_name(guild_id, channel_name):
 
 def _poll_reactions(cid, mid, emoji_url, trusted_only, timeout):
     """Poll for an approval/rejection from explicitly trusted users.
+
     Discovery is deliberately fail-closed: an empty trusted-user set never
     authorizes a channel replacement.
     """
@@ -2065,6 +2089,18 @@ _DEAL_SELL_KW = re.compile(r'\b(?:sell(?:ing)?|wts|stock|cheap)\b', re.I)
 _DEAL_BUY_KW  = re.compile(r'\b(?:buy(?:ing)?|wtb|lf\s*(?:tokens?|rap|bb)|need)\b', re.I)
 _DEAL_THROTTLE_SEC = 600  # don't re-alert same seller+price for 10min
 
+def _match_deal_item(text):
+    """Return the configured item alias found as a whole phrase, if any."""
+    source = str(text or "")
+    for keyword in _get_active_deal_keywords():
+        # Word boundaries prevent a short alias such as BB from matching a
+        # larger unrelated word. Spaces and punctuation inside an alias remain
+        # literal and case-insensitive.
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(keyword) + r"(?![A-Za-z0-9])"
+        if re.search(pattern, source, re.I):
+            return keyword
+    return None
+
 def _extract_my_rate():
     """Pull a baseline rate from the active message or DEAL_MY_RATE."""
     if DEAL_MY_RATE and DEAL_MY_RATE > 0:
@@ -2083,7 +2119,7 @@ def _extract_my_rate():
         except Exception: return None
     return None
 
-def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind):
+def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind, item):
     global _deal_alerts_sent, _last_deal_ts
     if not DEAL_WEBHOOK_URL:
         event_log("DEAL", "Deal matched but DEAL_WEBHOOK_URL is not configured.")
@@ -2111,6 +2147,7 @@ def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "url": jump_url,
         "fields": [
+            {"name": "Item",     "value": item, "inline": True},
             {"name": "User",     "value": f"@{seller.get('username') or seller.get('global_name') or '?'}", "inline": True},
             {"name": "Channel",  "value": f"<#{cid}>", "inline": True},
             {"name": "Price",    "value": f"**${price:.2f}/1k**", "inline": True},
@@ -2121,13 +2158,13 @@ def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind):
     }
     try:
         send_deal_webhook(embed)
-        event_log("DEAL", f"🔥 @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (yours ${my_rate:.2f})")
+        event_log("DEAL", f"🔥 {item} — @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (yours ${my_rate:.2f})")
     except Exception as e:
         dbg(f"[DEAL] alert error: {e}")
 
 def scan_deals(cid, msgs):
     """Passive scan of msgs (already fetched) — no extra API calls."""
-    if not DEAL_SCAN_ENABLED or not msgs:
+    if not _get_active_deal_scan_enabled() or not msgs:
         return
     my_rate = _extract_my_rate()
     if not my_rate or my_rate <= 0:
@@ -2143,6 +2180,8 @@ def scan_deals(cid, msgs):
             content = (m.get("content") or "").strip()
             if not content or len(content) < 6: continue
             if content[0] in "!/-.?": continue
+            item = _match_deal_item(content)
+            if not item: continue
             sell_m = _DEAL_SELL_KW.search(content)
             buy_m  = _DEAL_BUY_KW.search(content)
             if not sell_m and not buy_m: continue
@@ -2156,13 +2195,14 @@ def scan_deals(cid, msgs):
                     except Exception: continue
             if price is None or price <= 0 or price > 20: continue
             is_deal, kind = False, None
-            if active_ad_type == "buy"  and price <= my_rate - DEAL_ALERT_DELTA:
+            delta = _get_active_deal_delta()
+            if active_ad_type == "buy"  and price <= my_rate - delta:
                 is_deal, kind = True, "seller"
-            elif active_ad_type == "sell" and price >= my_rate + DEAL_ALERT_DELTA:
+            elif active_ad_type == "sell" and price >= my_rate + delta:
                 is_deal, kind = True, "buyer"
             if is_deal:
                 _send_deal_alert(cid, m.get("author", {}), price, my_rate,
-                                 content, jump_base + m.get("id", ""), kind)
+                                 content, jump_base + m.get("id", ""), kind, item)
         except Exception as e:
             dbg(f"[DEAL] msg error: {e}")
 
@@ -2406,10 +2446,16 @@ def _apply_rate_to_message(text, new_rate):
             return text[:m.start(1)] + repl(m, f"{new_rate:g}") + text[m.end(1):]
     return text
 
-def _handle_controller_dm(cid, author_id, content):
+def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, reply=True, reply_fn=None):
     """Parse and act on a DM command from a controller user. Returns True if handled."""
-    global _paused_by_controller, _runtime_message, _runtime_rate, _runtime_ad_type, _runtime_hours
-    if author_id not in CONTROLLER_USER_IDS:
+    global _paused_by_controller, _runtime_message, _runtime_rate, _runtime_ad_type, _runtime_hours, _runtime_deal_keywords
+    global _runtime_deal_scan_enabled, _runtime_deal_delta
+    def respond(text):
+        if reply_fn is not None:
+            reply_fn(text)
+        elif reply:
+            _controller_reply(cid, text)
+    if not trusted_source and author_id not in CONTROLLER_USER_IDS:
         return False
     txt = (content or "").strip()
     if not txt:
@@ -2418,14 +2464,14 @@ def _handle_controller_dm(cid, author_id, content):
     # Split command vs args
     if not txt.startswith(CONTROL_CMD_PREFIX) and not txt.startswith("/"):
         # Not a command — ignore (don't forward to webhook either)
-        _controller_reply(cid, "ℹ️ Expected a command prefixed with `!` or `/` (e.g. `!status`, `!pause`).")
+        respond("ℹ️ Expected a command prefixed with `!` or `/` (e.g. `!status`, `!pause`).")
         return True
     cmd, _, args = txt.lstrip("!/").partition(" ")
     cmd = cmd.lower()
     args = args.strip()
 
     if cmd in ("ping", "hello"):
-        _controller_reply(cid, f"✅ {ALT_NAME} ({VERSION}) is online — pong")
+        respond(f"✅ {ALT_NAME} ({VERSION}) is online — pong")
     elif cmd == "status":
         with _state_lock:
             paused = _public_pause_until > time.time()
@@ -2439,25 +2485,25 @@ def _handle_controller_dm(cid, author_id, content):
                  f"mode: `{at}`  rate: `{r}`  status: `{status_flag}`",
                  f"sent: {total_sent}  err: {total_err}  uptime: {(time.time()-_run_start_epoch)/60:.1f}m",
                  f"msg: ```{msg_preview}```"]
-        _controller_reply(cid, "\n".join(lines))
+        respond("\n".join(lines))
     elif cmd == "pause":
         _paused_by_controller = True
         log("⏸️ Paused by remote controller command.")
         send_log_webhook(f"⏸️ **PAUSED** by controller DM")
-        _controller_reply(cid, f"✅ {ALT_NAME} PAUSED (public posts stopped). Use !resume to continue.")
+        respond(f"✅ {ALT_NAME} PAUSED (public posts stopped). Use !resume to continue.")
     elif cmd == "resume":
         _paused_by_controller = False
         log("▶️ Resumed by remote controller command.")
         send_log_webhook(f"▶️ **RESUMED** by controller DM")
-        _controller_reply(cid, f"✅ {ALT_NAME} RESUMED — normal posting.")
+        respond(f"✅ {ALT_NAME} RESUMED — normal posting.")
     elif cmd in ("stop", "quit", "panic"):
-        _controller_reply(cid, f"🛑 {ALT_NAME} stopping now.")
+        respond(f"🛑 {ALT_NAME} stopping now.")
         log("🛑 Remote stop received via DM.")
         _panic_trigger(f"controller DM uid={author_id}")
     elif cmd == "setprice":
         new_rate = _extract_rate_value(args)
         if new_rate is None or new_rate <= 0 or new_rate > 20:
-            _controller_reply(cid, f"❌ Invalid price (got `{args}`). Use e.g. `!setprice 2.3`")
+            respond(f"❌ Invalid price (got `{args}`). Use e.g. `!setprice 2.3`")
             return True
         _runtime_rate = new_rate
         # Rebuild runtime message with new rate
@@ -2466,52 +2512,83 @@ def _handle_controller_dm(cid, author_id, content):
         _runtime_message = new_msg
         log(f"💰 Price updated by controller → {new_rate}$/1k")
         send_log_webhook(f"💰 **PRICE SET** → ${new_rate:.2f}/1k (controller)")
-        _controller_reply(cid, f"✅ Price updated to {new_rate}$/1k. Next post uses new rate.")
+        respond(f"✅ Price updated to {new_rate}$/1k. Next post uses new rate.")
     elif cmd == "setmode":
         mode = args.lower().strip()
         if mode not in ("sell", "buy"):
-            _controller_reply(cid, f"❌ Mode must be 'sell' or 'buy'.")
+            respond(f"❌ Mode must be 'sell' or 'buy'.")
             return True
         _runtime_ad_type = mode
         log(f"🔄 Ad type set by controller → {mode}")
         send_log_webhook(f"🔄 **MODE SET** → {mode} (controller). You should also send !setmessage with the new copy.")
-        _controller_reply(cid, f"✅ Ad type set to `{mode}`. Send `!setmessage <new copy>` to update the ad text.")
+        respond(f"✅ Ad type set to `{mode}`. Send `!setmessage <new copy>` to update the ad text.")
     elif cmd == "setmessage":
         if not args:
-            _controller_reply(cid, "❌ Provide the new message text.")
+            respond("❌ Provide the new message text.")
             return True
         if len(args) > 1900:
-            _controller_reply(cid, "❌ Message too long (max 1900).")
+            respond("❌ Message too long (max 1900).")
             return True
         _runtime_message = args
         log(f"📝 Message updated by controller ({len(args)} chars)")
         send_log_webhook(f"📝 **MESSAGE UPDATED** by controller ({len(args)} chars)")
-        _controller_reply(cid, f"✅ Message updated. {len(args)} chars — next post uses new copy.")
+        respond(f"✅ Message updated. {len(args)} chars — next post uses new copy.")
     elif cmd == "setinterval":
         try:
             new_interval = int(args.strip())
         except (TypeError, ValueError):
             new_interval = 0
         if new_interval not in (3, 5):
-            _controller_reply(cid, "❌ Interval must be 3 or 5 minutes.")
+            respond("❌ Interval must be 3 or 5 minutes.")
             return True
         global INTERVAL_MIN
         INTERVAL_MIN = new_interval
         event_log("CONTROL", f"interval updated by controller → {new_interval} minutes")
-        _controller_reply(cid, f"✅ Interval updated to {new_interval} minutes. Scheduler state changed live.")
+        respond(f"✅ Interval updated to {new_interval} minutes. Scheduler state changed live.")
     elif cmd == "setruntime":
         try:
             new_hours = int(args.strip())
         except (TypeError, ValueError):
             new_hours = 0
         if new_hours not in (6, 12, 18, 24, 48):
-            _controller_reply(cid, "❌ Runtime must be 6, 12, 18, 24, or 48 hours.")
+            respond("❌ Runtime must be 6, 12, 18, 24, or 48 hours.")
             return True
         global _runtime_run_end
         _runtime_run_end = time.time() + new_hours * 3600
         _runtime_hours = new_hours
         event_log("CONTROL", f"runtime updated by controller → {new_hours} hours")
-        _controller_reply(cid, f"✅ Runtime end moved to {new_hours} hours from now (48-hour cap).")
+        respond(f"✅ Runtime end moved to {new_hours} hours from now (48-hour cap).")
+    elif cmd == "setdealkeywords":
+        keywords = _parse_deal_keywords(args)
+        if not keywords:
+            respond("❌ Provide at least one comma-separated item keyword, e.g. `!setdealkeywords Blade Ball, BB token, BB`.")
+            return True
+        _runtime_deal_keywords = keywords
+        event_log("DEAL", f"deal item keywords updated by controller → {', '.join(keywords)}")
+        send_log_webhook(f"📈 **DEAL KEYWORDS UPDATED** → {', '.join(keywords)}", kind="DEAL")
+        respond(f"✅ Deal scanner now requires one of: `{', '.join(keywords)}`")
+    elif cmd == "setdealscan":
+        value = args.casefold().strip()
+        if value in {"on", "true", "1", "enable", "enabled"}:
+            _runtime_deal_scan_enabled = True
+        elif value in {"off", "false", "0", "disable", "disabled"}:
+            _runtime_deal_scan_enabled = False
+        else:
+            respond("❌ Scanner must be `on` or `off`.")
+            return True
+        event_log("DEAL", f"deal scanner {'enabled' if _runtime_deal_scan_enabled else 'disabled'} by controller")
+        respond(f"✅ Deal scanner is now `{ 'on' if _runtime_deal_scan_enabled else 'off' }`.")
+    elif cmd == "setdealdelta":
+        try:
+            delta = float(args.strip())
+        except (TypeError, ValueError):
+            delta = -1
+        if not math.isfinite(delta) or delta < 0 or delta > 5:
+            respond("❌ Deal delta must be between `0` and `5` dollars per 1k, e.g. `!setdealdelta 0.05`.")
+            return True
+        _runtime_deal_delta = delta
+        event_log("DEAL", f"deal alert delta updated by controller → ${delta:.2f}/1k")
+        respond(f"✅ Deal alerts now require an edge of `${delta:.2f}/1k`.")
     elif cmd in ("setchannel", "replacechannel"):
         # Safe live channel update. The target must be numeric and readable
         # before it enters the scheduler; this avoids phantom/typo channels.
@@ -2519,23 +2596,23 @@ def _handle_controller_dm(cid, author_id, content):
         if cmd == "replacechannel":
             parts = args.split(maxsplit=2)
             if len(parts) < 2:
-                _controller_reply(cid, "❌ Use `!replacechannel <old_id> <new_id> [name]`.")
+                respond("❌ Use `!replacechannel <old_id> <new_id> [name]`.")
                 return True
             old_cid, new_cid = parts[0], parts[1]
             label = parts[2] if len(parts) > 2 else ""
         else:
             parts = args.split(maxsplit=1)
             if not parts:
-                _controller_reply(cid, "❌ Use `!setchannel <channel_id> [name]`.")
+                respond("❌ Use `!setchannel <channel_id> [name]`.")
                 return True
             new_cid = parts[0]
             label = parts[1] if len(parts) > 1 else ""
         if not new_cid.isdigit():
-            _controller_reply(cid, "❌ Channel ID must contain digits only.")
+            respond("❌ Channel ID must contain digits only.")
             return True
         info = get_channel_info(new_cid)
         if not info:
-            _controller_reply(cid, f"❌ Discord did not verify channel `{new_cid}`. No runtime change made.")
+            respond(f"❌ Discord did not verify channel `{new_cid}`. No runtime change made.")
             return True
         new_name = str(info.get("name") or label or new_cid)[:80]
         if old_cid and old_cid in CHANNEL_IDS and old_cid != new_cid:
@@ -2552,7 +2629,7 @@ def _handle_controller_dm(cid, author_id, content):
                 _active_ch_ref[_active_ch_ref.index(old_cid)] = new_cid
             _dead_channels_ref.discard(old_cid)
             _next_post_ref[new_cid] = time.time() + random.uniform(20, 45)
-            _controller_reply(cid, f"✅ Channel updated: `{old_cid}` → `#{new_name}` (`{new_cid}`). Scheduler will resume safely.")
+            respond(f"✅ Channel updated: `{old_cid}` → `#{new_name}` (`{new_cid}`). Scheduler will resume safely.")
         else:
             if new_cid not in CHANNEL_IDS:
                 CHANNEL_IDS.append(new_cid)
@@ -2565,29 +2642,60 @@ def _handle_controller_dm(cid, author_id, content):
                 _active_ch_ref.append(new_cid)
             _dead_channels_ref.discard(new_cid)
             _next_post_ref[new_cid] = time.time() + random.uniform(20, 45)
-            _controller_reply(cid, f"✅ Channel added/updated: **#{new_name}** (`{new_cid}`). Scheduler state updated live.")
+            respond(f"✅ Channel added/updated: **#{new_name}** (`{new_cid}`). Scheduler state updated live.")
         event_log("CONTROL", f"channel runtime update by controller: {old_cid or 'new'} -> {new_cid}")
     elif cmd == "sync":
         # Re-read Gist config + blocklist
         load_blocked_from_gist()
-        _sync_control_gist(force=True)
+        if not trusted_source:
+            _sync_control_gist(force=True)
         save_blocked_to_gist(force=True)
-        _controller_reply(cid, f"✅ Sync complete. Blocklist + control gist reloaded.")
+        respond(f"✅ Sync complete. Blocklist + control gist reloaded.")
     elif cmd == "help":
-        _controller_reply(cid, "Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !setchannel <id> [name] !replacechannel <old> <new> !setinterval <3|5> !setruntime <6|12|18|24|48> !sync !ping")
+        respond("Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !setdealkeywords <a,b,c> !setdealscan <on|off> !setdealdelta <0..5> !setchannel <id> [name] !replacechannel <old> <new> !setinterval <3|5> !setruntime <6|12|18|24|48> !sync !ping")
     else:
-        _controller_reply(cid, f"❓ Unknown command `{cmd}`. Try !help")
+        respond(f"❓ Unknown command `{cmd}`. Try !help")
     return True
 
 
 # --------------------------------------------------------------------------- #
 # Gist-driven config sync (V6)                                              #
 # --------------------------------------------------------------------------- #
+def _ack_control_gist(filename, original, command_id, response_text):
+    """Write a bounded acknowledgement beside a queued Gist command."""
+    if not filename or not CONTROL_GIST_ID or not GIST_TOKEN:
+        return
+    payload = dict(original or {})
+    payload["ack_id"] = str(command_id)[:80]
+    payload["ack"] = str(response_text or "Command applied")[:500]
+    payload["ack_at"] = time.time()
+    try:
+        r = creq.patch(
+            f"https://api.github.com/gists/{CONTROL_GIST_ID}",
+            headers={"Authorization": f"token {GIST_TOKEN}",
+                     "Accept": "application/vnd.github+json",
+                     "User-Agent": "discord-ad-sender"},
+            json={"files": {filename: {"content": json.dumps(payload, ensure_ascii=False)}}},
+            impersonate=_BROWSER, timeout=8,
+        )
+        if r.status_code != 200:
+            dbg(f"[SYNC] control ack write failed (HTTP {r.status_code})")
+    except Exception as e:
+        dbg(f"[SYNC] control ack write error: {type(e).__name__}: {e}")
+
+
 def _sync_control_gist(force=False):
-    """Poll CONTROL_GIST_ID for a file `control.json` of shape:
-       {"alt_id":1,"paused":false,"rate":2.3,"ad_type":"sell","message":"..."}
-    Applies overrides to runtime state. Safe if no gist configured."""
-    global _paused_by_controller, _runtime_message, _runtime_rate, _runtime_ad_type
+    """Apply shared-Gist overrides and queued commands without a DM.
+
+    ``control.json`` remains the optional broadcast override file. The control
+    bot writes one command file per alt (``control_<ALT_ID>.json``), allowing
+    the alt to stay out of the control server entirely. Each command has a
+    unique id and is applied once per run; an acknowledgement is written back
+    to the same file for audit/debugging.
+    """
+    global _paused_by_controller, _runtime_message, _runtime_rate
+    global _runtime_ad_type, _runtime_deal_keywords, _runtime_deal_scan_enabled, _runtime_deal_delta, _last_gist_sync
+    global _last_control_command_id
     if not CONTROL_GIST_ID or not GIST_TOKEN:
         return
     if not force and (time.time() - _last_gist_sync) < SYNC_GIST_INTERVAL_SEC:
@@ -2599,22 +2707,47 @@ def _sync_control_gist(force=False):
                               "User-Agent": "discord-ad-sender"},
                      impersonate=_BROWSER, timeout=8)
         if r.status_code != 200:
+            dbg(f"[SYNC] control gist read failed (HTTP {r.status_code})")
             return
-        j = r.json()
-        data = None
-        for fname, finfo in (j.get("files") or {}).items():
-            if "control" in fname.lower() and fname.lower().endswith(".json"):
-                raw = (finfo.get("content") or "").strip()
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    pass
-                break
-        if not isinstance(data, dict):
+        files = r.json().get("files") or {}
+        broadcast = {}
+        targeted = {}
+        targeted_filename = ""
+        preferred = f"control_{ALT_ID}.json".lower()
+        for fname, finfo in files.items():
+            lower_name = str(fname).lower()
+            if lower_name not in {"control.json", preferred}:
+                continue
+            raw = (finfo.get("content") or "").strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except Exception:
+                dbg(f"[SYNC] ignored invalid JSON in {fname}")
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_alt = item.get("alt_id")
+            try:
+                if item_alt is not None and int(item_alt) != ALT_ID:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if lower_name == preferred:
+                targeted = item
+                targeted_filename = str(fname)
+            else:
+                broadcast = item
+        data = dict(broadcast)
+        data.update(targeted)
+        if not data:
+            _last_gist_sync = time.time()
             return
-        # Only apply if alt_id matches (or is absent → broadcast)
+        # Only apply if alt_id matches (or is absent → broadcast).
         target_alt = data.get("alt_id")
         if target_alt is not None and int(target_alt) != ALT_ID:
+            _last_gist_sync = time.time()
             return
         if "paused" in data:
             _paused_by_controller = bool(data["paused"])
@@ -2623,22 +2756,66 @@ def _sync_control_gist(force=False):
                 nr = float(data["rate"])
                 if 0 < nr <= 20:
                     _runtime_rate = nr
-                    if _runtime_message:
-                        _runtime_message = _apply_rate_to_message(_runtime_message, nr)
-                    else:
-                        _runtime_message = _apply_rate_to_message(MESSAGE, nr)
+                    _runtime_message = _apply_rate_to_message(
+                        _runtime_message or MESSAGE, nr
+                    )
             except Exception:
                 pass
         if data.get("ad_type") in ("sell", "buy"):
             _runtime_ad_type = data["ad_type"]
         if isinstance(data.get("message"), str) and data["message"]:
-            _runtime_message = data["message"]
-        if data.get("command") == "stop":
-            _panic_trigger("control gist: stop")
+            _runtime_message = data["message"][:1900]
+        if isinstance(data.get("deal_keywords"), list):
+            keywords = _parse_deal_keywords(",".join(str(x) for x in data["deal_keywords"]))
+            if keywords:
+                _runtime_deal_keywords = keywords
+        if isinstance(data.get("deal_scan_enabled"), bool):
+            _runtime_deal_scan_enabled = data["deal_scan_enabled"]
+        if data.get("deal_alert_delta") is not None:
+            try:
+                delta = float(data["deal_alert_delta"])
+                if math.isfinite(delta) and 0 <= delta <= 5:
+                    _runtime_deal_delta = delta
+            except (TypeError, ValueError, OverflowError):
+                pass
+        # Apply commands queued by the official control bot. A stop command
+        # from an older run must not kill a newly started workflow.
+        command_id = str(data.get("command_id") or "")
+        command = str(data.get("command") or "").strip().lower()
+        if command_id and command and command_id != _last_control_command_id:
+            try:
+                issued_at = float(data.get("issued_at") or 0)
+            except (TypeError, ValueError, OverflowError):
+                issued_at = 0
+            stale_stop = command == "stop" and _run_start_epoch and issued_at < _run_start_epoch
+            responses = []
+            if stale_stop:
+                handled = True
+                responses.append("ℹ️ Ignored stale stop command from an earlier run.")
+            else:
+                command_text = "!" + command
+                if data.get("args"):
+                    command_text += " " + str(data["args"])[:1900]
+                handled = _handle_controller_dm(
+                    f"gist:{command_id[:12]}", "control-gist", command_text,
+                    trusted_source=True, reply=False, reply_fn=responses.append,
+                )
+            if handled:
+                _last_control_command_id = command_id
+                _ack_control_gist(
+                    targeted_filename, data, command_id,
+                    responses[-1] if responses else "✅ Command applied.",
+                )
+                event_log("CONTROL", f"control Gist command applied: {command}")
         _last_gist_sync = time.time()
-        dbg(f"[SYNC] control gist applied: paused={_paused_by_controller} rate={_runtime_rate} type={_runtime_ad_type}")
+        dbg(
+            f"[SYNC] control gist applied: paused={_paused_by_controller} "
+            f"rate={_runtime_rate} type={_runtime_ad_type} "
+            f"deal_keywords={','.join(_get_active_deal_keywords())} "
+            f"deal_scan={_get_active_deal_scan_enabled()} delta={_get_active_deal_delta():.2f}"
+        )
     except Exception as e:
-        dbg(f"[SYNC] control gist error: {e}")
+        dbg(f"[SYNC] control gist error: {type(e).__name__}: {e}")
 
 
 def _get_run_end(default_end):
@@ -2651,6 +2828,15 @@ def _get_active_message():
 
 def _get_active_ad_type():
     return _runtime_ad_type if _runtime_ad_type else AD_TYPE
+
+def _get_active_deal_keywords():
+    return _runtime_deal_keywords if _runtime_deal_keywords is not None else DEAL_ITEM_KEYWORDS
+
+def _get_active_deal_scan_enabled():
+    return DEAL_SCAN_ENABLED if _runtime_deal_scan_enabled is None else bool(_runtime_deal_scan_enabled)
+
+def _get_active_deal_delta():
+    return DEAL_ALERT_DELTA if _runtime_deal_delta is None else float(_runtime_deal_delta)
 
 def _get_active_rate():
     if _runtime_rate is not None:
@@ -2729,6 +2915,9 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
         "total_edits": total_edits,
         "deal_alerts": _deal_alerts_sent,
         "last_deal_ts": _last_deal_ts,
+        "deal_keywords": _get_active_deal_keywords(),
+        "deal_scan_enabled": _get_active_deal_scan_enabled(),
+        "deal_alert_delta": _get_active_deal_delta(),
         "last_error": _last_error,
         "log_counts": dict(_log_counts),
         "uptime_sec": now - _run_start_epoch if _run_start_epoch else 0,
@@ -2743,65 +2932,87 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
         "ip_country": ip_country,
         "ts": now,
     }
-    # Build a pretty embed + attach JSON as content so the control bot can parse
+    # The dashboard webhook is intentionally human-readable. The control bot
+    # parses these structured fields, so there is no noisy raw JSON block in
+    # Discord. This also keeps the machine state and operator view separate.
     title_dot = {"active": "🟢", "paused": "🟡", "caution": "⚠️",
                  "ip_pause": "🚨", "afk": "☕", "stopped": "🔴",
                  "error": "🔴"}.get(status, "⚪")
+    active_count = len([c for c in active_channels_list
+                        if dead_channels is None or c not in dead_channels])
+    fields = [
+        {"name": "Status", "value": f"{title_dot} `{status}`", "inline": True},
+        {"name": "Mode", "value": f"`{_get_active_ad_type()}`", "inline": True},
+        {"name": "Rate", "value": f"${_get_active_rate()}/1k" if _get_active_rate() else "—", "inline": True},
+        {"name": "Activity", "value": f"Sent: `{total_sent}` · Errors: `{total_err}` · Skips: `{total_skip}`", "inline": False},
+        {"name": "Deals", "value": f"`{_deal_alerts_sent}` alert(s)", "inline": True},
+        {"name": "Scanner", "value": f"{'ON' if _get_active_deal_scan_enabled() else 'OFF'} · edge ${_get_active_deal_delta():.2f}/1k", "inline": True},
+        {"name": "Keywords", "value": ", ".join(_get_active_deal_keywords())[:1000] or "none configured", "inline": False},
+        {"name": "Uptime", "value": f"{(now-_run_start_epoch)/60:.1f} min" if _run_start_epoch else "—", "inline": True},
+        {"name": "Channels", "value": f"Active: `{active_count}/{len(CHANNEL_IDS)}`", "inline": True},
+        {"name": "Message", "value": _get_active_message().split("\n")[0][:1024] or "—", "inline": False},
+    ]
+    if _last_error:
+        fields.append({"name": "Latest issue", "value": _last_error[:1024], "inline": False})
+    if warnings:
+        fields.append({"name": "Warnings", "value": "\n".join(warnings)[:1024], "inline": False})
+    # Include a compact, readable per-channel breakdown. The parser uses the
+    # numeric ID in each field name to rebuild the live channel table.
+    for cid, details in list(ch_data.items())[:15]:
+        alive = "✅ alive" if details["alive"] else "❌ unavailable"
+        ch_name = str(details["name"] or cid)[:60]
+        last_post = int(details.get("last_post") or 0)
+        last_label = f"<t:{last_post}:R>" if last_post > 0 else "never"
+        fields.append({
+            "name": f"Channel: {cid} · #{ch_name}"[:256],
+            "value": (f"{alive} · sent `{details['sent']}` · errors `{details['errors']}` · "
+                      f"slowmode `{details['slowmode']}s` · last {last_label}"),
+            "inline": False,
+        })
     embed = {
-        "title": f"💓 HEARTBEAT — {ALT_NAME} ({_get_active_ad_type()})",
+        "title": f"💓 Heartbeat · {ALT_NAME}",
         "color": {"active":0x57F287,"paused":0xFEE75C,"caution":0xFEE75C,
                   "ip_pause":0xED4245,"afk":0x5865F2,"stopped":0xED4245,
                   "error":0xED4245}.get(status,0x2F3136),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer": {"text": f"alt_id={ALT_ID} · {VERSION}"},
-        "fields": [
-            {"name": "Status", "value": f"{title_dot} `{status}`", "inline": True},
-            {"name": "Rate", "value": f"${_get_active_rate()}/1k" if _get_active_rate() else "—", "inline": True},
-            {"name": "Sent / Err", "value": f"{total_sent} / {total_err}", "inline": True},
-            {"name": "Deals", "value": str(_deal_alerts_sent), "inline": True},
-            {"name": "Uptime", "value": f"{(now-_run_start_epoch)/60:.1f} min" if _run_start_epoch else "—", "inline": True},
-            {"name": "Channels", "value": f"{len(active_channels_list)}/{len(CHANNEL_IDS)}", "inline": True},
-        ],
+        "footer": {"text": f"alt_id={ALT_ID} · {VERSION} · updated {datetime.now().strftime('%H:%M:%S')}"},
+        "fields": fields,
     }
-    def _serialize_heartbeat(data):
-        # Return valid JSON within Discord's 2,000-character content limit.
-        candidate = dict(data)
-        # Preserve the complete payload whenever possible. If it grows beyond
-        # Discord's limit, remove optional details before serialization.
-        fence_len = len("```json\n\n```")
-        for field in ("channels", "message_preview", "warnings", "run_started_ts",
-                      "ip_org", "ip_country"):
-            raw = json.dumps(candidate, separators=(",", ":"), ensure_ascii=False)
-            if len(raw) + fence_len <= 2000:
-                return raw
-            candidate.pop(field, None)
-        raw = json.dumps(candidate, separators=(",", ":"), ensure_ascii=False)
-        if len(raw) + fence_len <= 2000:
-            return raw
-        minimal_keys = (
-            "heartbeat", "type", "version", "alt_id", "alt_name", "ad_type",
-            "rate", "rate_currency", "interval_min", "runtime_hours", "total_sent", "total_errors", "total_skips",
-            "total_edits", "deal_alerts", "last_deal_ts", "active_channels", "total_channels", "last_post_ts",
-            "status", "ts",
-        )
-        minimal = {k: candidate.get(k) for k in minimal_keys if k in candidate}
-        minimal["alt_name"] = str(minimal.get("alt_name", ""))[:80]
-        return json.dumps(minimal, separators=(",", ":"), ensure_ascii=False)
-
-    heartbeat_json = _serialize_heartbeat(payload_json)
-    heartbeat_content = f"```json\n{heartbeat_json}\n```"
-
+    heartbeat_content = (
+        f"💓 **Heartbeat** · `{status}` · mode `{_get_active_ad_type()}` · "
+        f"sent `{total_sent}` · errors `{total_err}` · channels `{active_count}/{len(CHANNEL_IDS)}`"
+    )
     def _send():
+        global _dashboard_message_id
+        payload = {"username": ALT_NAME[:80],
+                   "content": heartbeat_content,
+                   "allowed_mentions": {"parse": []},
+                   "embeds": [embed]}
         try:
             wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
-            creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
-                     json={"username": f"{ALT_NAME} heartbeat",
-                           "content": heartbeat_content,
-                           "allowed_mentions": {"parse": []},
-                           "embeds": [embed]},
-                     impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT, proxies=wh_proxies)
+            response = None
+            if _dashboard_message_id:
+                response = creq.patch(
+                    f"{DASHBOARD_WEBHOOK_URL}/messages/{_dashboard_message_id}",
+                    json=payload, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
+                    proxies=wh_proxies,
+                )
+                if response.status_code == 404:
+                    _dashboard_message_id = ""
+            if not _dashboard_message_id:
+                response = creq.post(
+                    DASHBOARD_WEBHOOK_URL + "?wait=true", json=payload,
+                    impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT, proxies=wh_proxies,
+                )
+                if response.status_code in (200, 204):
+                    try:
+                        _dashboard_message_id = str(response.json().get("id") or "")
+                    except Exception:
+                        _dashboard_message_id = ""
+            if response is not None and response.status_code not in (200, 204):
+                dbg(f"[HEARTBEAT] webhook failed (HTTP {response.status_code})")
         except Exception as e:
-            dbg(f"[HEARTBEAT] send failed: {e}")
+            dbg(f"[HEARTBEAT] send failed: {type(e).__name__}: {e}")
     threading.Thread(target=_send, daemon=True).start()
 
 def _controller_heartbeat_daemon():
@@ -3794,6 +4005,7 @@ def main():
     _runtime_message = None
     _runtime_rate = None
     _runtime_ad_type = None
+
     # Verify the route before any Discord warmup request can expose the runner
     # IP. The same configured SESSION is used for this check and all later REST
     # and webhook traffic.
@@ -3868,6 +4080,8 @@ def main():
     log(f"📋 LOG WEBHOOK   : {'ON' if LOG_WEBHOOK_URL else 'OFF (optional action-log channel)'}")
     log(f"📊 DASHBOARD    : {'ON (periodic summaries)' if DASHBOARD_WEBHOOK_URL else 'OFF (optional)'}")
     log(f"🔥 DEAL ALERTS    : {'ON → separate deals webhook' if DEAL_WEBHOOK_URL else 'OFF (no DEAL_WEBHOOK_URL)'}", kind="DEAL")
+    log(f"🎯 DEAL ITEMS     : {', '.join(_get_active_deal_keywords()) or 'NONE — no item can match'}", kind="DEAL")
+    log(f"🎚️  DEAL FILTER    : {'ON' if _get_active_deal_scan_enabled() else 'OFF'} · minimum edge ${_get_active_deal_delta():.2f}/1k", kind="DEAL")
     log(f"⏱️  WEBHOOK T/O   : {WEBHOOK_TIMEOUT}s (control); {DM_WEBHOOK_TIMEOUT}s (DM forward)")
     log(f"🧠 AUTO-LEARN    : strikes={BLOCKED_STRIKES}, safety_stop={BLOCKED_SAFETY_STOP}"
         + (f", gist={GIST_ID[:8]}... (persisted across runs)" if GIST_ID else " (no gist persistence — resets each run)"))
@@ -3939,7 +4153,7 @@ def main():
     # V6: start the control-gist sync daemon (polls for remote config changes)
     if CONTROL_GIST_ID and GIST_TOKEN:
         threading.Thread(target=_controller_heartbeat_daemon, daemon=True, name="ctrl-sync").start()
-        log(f"🎛️  Remote control: DM commands + gist sync every {SYNC_GIST_INTERVAL_SEC}s (control gist configured).")
+        log(f"🎛️  Remote control: control-Gist queue + DM fallback; polling every {SYNC_GIST_INTERVAL_SEC}s (no alt server membership required).")
     elif CONTROLLER_USER_IDS:
         threading.Thread(target=_controller_heartbeat_daemon, daemon=True, name="ctrl-sync").start()
         log(f"🎛️  Remote control: DM commands ENABLED ({len(CONTROLLER_USER_IDS)} controller id(s)); no control gist.")
@@ -4393,6 +4607,7 @@ def main():
                 send_log_webhook(
                     f"✅ **SEND** {ch_tag} | {'📷img' if attach_this_post else '💬txt'} | total=`{total_sent}` | id=`{new_msg_id}`"
                 )
+
                 if new_msg_id and not channel_in_caution(cid):
                     # maybe_typo_edit performs the single configured-probability
                     # roll. Keeping no outer roll makes 18% the effective rate.

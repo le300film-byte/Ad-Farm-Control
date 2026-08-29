@@ -75,12 +75,12 @@ on:
         default: ''
         type: string
       channel_1_name:
-        description: '[Optional v5.4] Channel NAME for channel_1 (e.g. "trading"). Lets the bot auto-discover the new ID if the channel gets deleted & recreated.'
+        description: '[Optional V6] Channel NAME for channel_1 (e.g. "trading"). Lets the bot auto-discover the new ID if the channel gets deleted & recreated.'
         required: false
         default: ''
         type: string
       channel_2_name:
-        description: '[Optional v5.4] Channel NAME for channel_2 (e.g. "market"). Same auto-discovery as channel_1_name.'
+        description: '[Optional V6] Channel NAME for channel_2 (e.g. "market"). Same auto-discovery as channel_1_name.'
         required: false
         default: ''
         type: string
@@ -226,6 +226,9 @@ jobs:
       # ---------------------------------------------------------------- #
       - name: Cloudflare WARP (free anti-datacenter IP layer)
         if: steps.check.outputs.skip == 'false' && steps.warp_check.outputs.should_warp == 'true'
+        # The action's built-in one-shot `warp=on` assertion is brittle on
+        # hosted runners. The independent egress check below is authoritative
+        # and still fails closed for an unverified/datacenter route.
         continue-on-error: true
         uses: sebst/actions-warp@v1
         with:
@@ -337,7 +340,7 @@ jobs:
 
       # Resolve which channels to post to. If channel_1/channel_2 are filled in
       # the Run Workflow form, they OVERRIDE the CHANNEL_IDS secret for this run.
-      # Also resolves CHANNEL_NAMES (v5.4) — positional match with CHANNEL_IDS
+      # Also resolves CHANNEL_NAMES (V6) — positional match with CHANNEL_IDS
       # enables auto-discovery when a channel returns 404 (deleted & recreated).
       - name: Resolve target channels
         if: steps.check.outputs.skip == 'false'
@@ -380,25 +383,29 @@ jobs:
               CNAMES="$N2"
             fi
             echo "🎯 Using per-run channels: $CIDS"
-            echo "   Channel names (v5.4 auto-discovery): ${CNAMES:-(none set — fill channel_1_name/channel_2_name to enable recovery on 404)}"
+            echo "   Channel names (V6 auto-discovery): ${CNAMES:-(none set — fill channel_1_name/channel_2_name to enable recovery on 404)}"
           else
             CIDS="$(clean "$SECRET_IDS")"
             CNAMES="$(cleantxt "$SECRET_NAMES")"
             echo "📡 Using full CHANNEL_IDS secret"
-            [ -n "$CNAMES" ] && echo "   Channel names (v5.4): $CNAMES" || echo "   (no CHANNEL_NAMES secret — v5.4 auto-discovery disabled)"
+            [ -n "$CNAMES" ] && echo "   Channel names (V6): $CNAMES" || echo "   (no CHANNEL_NAMES secret — V6 auto-discovery disabled)"
           fi
 
-          if [ -z "$CIDS" ]; then
-            echo "::error::No channels configured. Fill CHANNEL_IDS secret or channel_1/channel_2 inputs."
+          if [ -z "$CIDS" ] && [ -z "$CNAMES" ]; then
+            echo "::error::No channels configured. Fill CHANNEL_IDS, CHANNEL_NAMES, or channel_1/channel_2 inputs."
             exit 1
           fi
-          IFS=',' read -ra CID_LIST <<< "$CIDS"
-          for cid in "${CID_LIST[@]}"; do
-            if [[ ! "$cid" =~ ^[0-9]+$ ]]; then
-              echo "::error::Channel ID '$cid' is not numeric."
-              exit 1
-            fi
-          done
+          if [ -n "$CIDS" ]; then
+            IFS=',' read -ra CID_LIST <<< "$CIDS"
+            for cid in "${CID_LIST[@]}"; do
+              if [[ ! "$cid" =~ ^[0-9]+$ ]]; then
+                echo "::error::Channel ID '$cid' is not numeric."
+                exit 1
+              fi
+            done
+          else
+            echo "🧭 No numeric IDs supplied; sender will safely resolve the channel name after authentication."
+          fi
           echo "channels<<CH_EOF" >> "$GITHUB_OUTPUT"
           echo "$CIDS" >> "$GITHUB_OUTPUT"
           echo "CH_EOF" >> "$GITHUB_OUTPUT"
@@ -530,11 +537,12 @@ jobs:
           TYPO_EDIT_CHANCE: ${{ secrets.TYPO_EDIT_CHANCE }}
           IMAGE_JITTER: ${{ secrets.IMAGE_JITTER }}
           SUPPRESS_EMBEDS: ${{ secrets.SUPPRESS_EMBEDS }}
-          # v5.2: DM forwarding + auto-learn + geo-check (all optional)
+          # V6: DM forwarding + auto-learn + geo-check (all optional)
           DM_WEBHOOK_URL: ${{ secrets.DM_WEBHOOK_URL }}
           LOG_WEBHOOK_URL: ${{ secrets.LOG_WEBHOOK_URL }}
           DASHBOARD_WEBHOOK_URL: ${{ secrets.DASHBOARD_WEBHOOK_URL }}
-          # Deal alerts use DASHBOARD_WEBHOOK_URL; no fourth webhook is needed.
+          DEAL_WEBHOOK_URL: ${{ secrets.DEAL_WEBHOOK_URL }}
+          # Deal alerts use this separate webhook and never overwrite dashboard data.
           # Optional consolidated tuning object. Explicit workflow inputs above
           # still take precedence over values in this JSON object.
           TUNING_JSON: ${{ secrets.TUNING_JSON }}
@@ -548,11 +556,12 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           ALLOWED_COUNTRIES: ${{ secrets.ALLOWED_COUNTRIES }}
-          # v5.3 safety features (all optional — sane defaults if empty).
+          # V6 safety features (all optional — sane defaults if empty).
           # DEAL_MY_RATE is auto-extracted from the chosen sell/buy rate inputs.
           DEAL_SCAN_ENABLED: ${{ secrets.DEAL_SCAN_ENABLED }}
           DEAL_MY_RATE: ${{ steps.build.outputs.deal_my_rate }}
           DEAL_ALERT_DELTA: ${{ secrets.DEAL_ALERT_DELTA }}
+          DEAL_ITEM_KEYWORDS: ${{ secrets.DEAL_ITEM_KEYWORDS }}
           IP_HEALTH_CHECK_INTERVAL_MIN: ${{ secrets.IP_HEALTH_CHECK_INTERVAL_MIN }}
           IP_HEALTH_PAUSE_MIN: ${{ secrets.IP_HEALTH_PAUSE_MIN }}
           CAUTION_WINDOW: ${{ secrets.CAUTION_WINDOW }}
@@ -564,11 +573,11 @@ jobs:
           NEW_LOCATION_TIMEOUT_SEC: ${{ secrets.NEW_LOCATION_TIMEOUT_SEC }}
           RATELIMIT_PREADJUST: ${{ secrets.RATELIMIT_PREADJUST }}
           RATELIMIT_JITTER: ${{ secrets.RATELIMIT_JITTER }}
-          # v5.4: auto channel discovery on 404 (all optional)
+          # V6: auto channel discovery on 404 (all optional)
           CHANNEL_NAMES: ${{ steps.channels.outputs.ch_names }}
           CONFIRM_USER_IDS: ${{ secrets.CONFIRM_USER_IDS }}
           CONFIRM_TIMEOUT: ${{ secrets.CONFIRM_TIMEOUT }}
-          # v5.5: centralized remote control (all optional; no config required if you don't use the control bot)
+          # V6: centralized remote control (all optional; no config required if you don't use the control bot)
           # CONTROLLER_USER_IDS: comma-separated Discord user IDs allowed to DM !commands to this alt.
           #   Should include the official control bot's application ID (or your own ID for manual testing).
           CONTROLLER_USER_IDS: ${{ secrets.CONTROLLER_USER_IDS }}
@@ -579,16 +588,15 @@ jobs:
           # HEARTBEAT_INTERVAL_SEC: how often the alt pushes a structured heartbeat to DASHBOARD_WEBHOOK_URL.
           #   Default 300 (5 min). Min 60.
           HEARTBEAT_INTERVAL_SEC: ${{ secrets.HEARTBEAT_INTERVAL_SEC }}
-          # CONTROL_GIST_ID: optional shared gist ID for broadcast overrides.
-          #   The sender reads it with GIST_TOKEN; edit it in GitHub (or via a
-          #   separately authorized integration). DM-only control still works
-          #   when it is unset, and the official control bot does not mutate it.
+          # CONTROL_GIST_ID: shared private queue/override Gist. The control bot
+          #   writes control_<ALT_ID>.json so the alt need not join its server;
+          #   the sender polls and acknowledges commands with GIST_TOKEN.
           CONTROL_GIST_ID: ${{ secrets.CONTROL_GIST_ID }}
           # SYNC_GIST_INTERVAL_SEC: how often the alt polls the control gist for config changes. Default 45.
           SYNC_GIST_INTERVAL_SEC: ${{ secrets.SYNC_GIST_INTERVAL_SEC }}
           # CONTROL_CMD_PREFIX: prefix character for DM commands (default "!").
           CONTROL_CMD_PREFIX: ${{ secrets.CONTROL_CMD_PREFIX }}
-          # v5.5.1: per-alt personality jitter. Deterministically nudges typo/react/AFK
+          # V6: per-alt personality jitter. Deterministically nudges typo/react/AFK
           # rates ±12% per ALT_ID so multiple alts don't have identical behavioral
           # fingerprints. Set PERSONALITY_JITTER=0 to disable (all alts use defaults).
           PERSONALITY_JITTER: ${{ secrets.PERSONALITY_JITTER }}

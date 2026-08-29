@@ -96,6 +96,11 @@ CMD_COOLDOWN_SEC = _int("CMD_COOLDOWN_SEC", 5)
 # One shared token from `gh auth token` is used for dispatch, sync, and Gists.
 GITHUB_TOKEN = _env("GH_TOKEN") or _env("GITHUB_PAT")
 GITHUB_OWNER = _env("GITHUB_OWNER")
+CORE_REPO = _env("CORE_REPO") or os.environ.get("GITHUB_REPOSITORY", "").strip()
+# Shared private Gist used as a control queue when an alt is not a mutual
+# member of the control-bot server. The bot writes one targeted file per alt;
+# the alt polls it with its already-configured GIST_TOKEN.
+CONTROL_GIST_ID = _env("CONTROL_GIST_ID")
 CONTROL_HTTP_TIMEOUT = _int("CONTROL_HTTP_TIMEOUT", 20)
 
 # Alt -> repo mapping. The bootstrap writes the unambiguous form:
@@ -131,6 +136,7 @@ for pair in _split("ALT_NAMES"):
             pass
 
 WORKFLOW_FILE = _env("WORKFLOW_FILE", "send_ads.yml")
+SELF_CHECK_WORKFLOW = _env("SELF_CHECK_WORKFLOW", "self_check.yml")
 
 # Only alts represented by configured repository or Discord-ID mappings are
 # real alts. This prevents an orphaned name or placeholder Alt 4 entry from
