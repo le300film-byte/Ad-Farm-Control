@@ -136,13 +136,31 @@ To run a streamlined setup that accepts smart defaults (auto-naming repos, deriv
 python3 setup.py --quick
 ```
 
-To convert existing text-based `#dm-inbox` and `#deals` channels into native **Discord Forum channels** (deleting only those two farm channels and replacing them with forum channels with tags):
+To choose between native **Discord Forum channels** (ticket style) or **Standard Text channels**:
 
 ```bash
-python3 setup.py --upgrade-forums
+# Forum Channels (with ticket tags)
+python3 setup.py --quick --forums
+
+# Standard Text Channels (with rich embed cards)
+python3 setup.py --quick --text-channels
 ```
 
-You can also combine flags: `python3 setup.py --quick --upgrade-forums`.
+To convert existing channels and replace secrets without confirmation prompts:
+
+```bash
+# Convert to Forum channels
+python3 setup.py --quick --forums --upgrade-forums --force
+
+# Convert back to Text channels
+python3 setup.py --quick --text-channels --upgrade-forums --force
+```
+
+In GitHub Codespaces, skip the scope refresh prompt with:
+```bash
+unset GITHUB_TOKEN && SETUP_SKIP_AUTH_REFRESH=1 python3 setup.py --quick --force
+```
+
 *Note:* The script will **never** touch or delete any other channels on your server (like `general`, `todo`, `temp`, etc.).
 
 In interactive mode, the script asks before replacing an existing secret or

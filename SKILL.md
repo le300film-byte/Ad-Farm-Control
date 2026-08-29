@@ -80,6 +80,7 @@ The deal scanner continuously monitors marketplace channels, parses other users'
 ### Deal Detection Mechanics
 - **Formula:** A deal alerts if `(MY_RATE - OFFER_RATE) >= DEAL_ALERT_DELTA` (when buying) or `(OFFER_RATE - MY_RATE) >= DEAL_ALERT_DELTA` (when selling).
 - **Hard Constraint:** A message **only** alerts if it matches at least one keyword in `DEAL_ITEM_KEYWORDS`. This eliminates false positives from other games.
+- **Price Format Support:** Automatically parses standard rates (`2.5$/1k`, `$2.50/1k`), ratios (`rate: 2.05`, `ratio 2.75`), and item-unit notations (`$1.99 ea`, `$2.50 each`).
 
 ### How the AI Should Recommend Keywords
 When the operator asks for keywords for a game or market, generate a comprehensive list covering:
@@ -93,7 +94,34 @@ When the operator asks for keywords for a game or market, generate a comprehensi
 
 ---
 
-## 4. Ad Copy Crafting & Anti-Spam Optimization
+## 4. Smart Buyer DM Classifier & Operator Relay
+
+When prospective buyers message any fleet alt, the engine aggregates rapid-fire bursts (3.5s debouncer) and executes a multi-factor regex taxonomy before dispatching to `#dm-inbox`:
+
+### Extracted Metadata
+- **Game / Asset:** `⚔️ Blade Ball`, `💎 Robux`, `🐾 Pet Sim 99`, `🔪 MM2`, `🍇 Blox Fruits`, `🐶 Adopt Me`, `🔫 Da Hood`
+- **Intent Type:** `🛒 Purchase Intent` (`wtb`, `cop`, `buy`), `📦 Stock Check` (`stock`, `avail`), `🔄 Price Check` (`rate`, `$/1k`), `🛡️ Vouch Request` (`proofs`, `mm`, `legit`), `🔁 Trade Offer` (`swap`, `wtt`), `💬 General Inquiry`
+- **Volume & Budget:** `500k`, `2.5m`, `10M`, `$50 budget`, `100 usd`
+- **Payment Channels:** `💳 PayPal`, `🪙 Crypto/USDT/LTC`, `💵 CashApp`, `🏦 Bank/Card`, `🎁 Trade/Robux`
+- **Operator Relay Command:** Reply directly to buyers via:
+  ```
+  /reply alt:1 user:1029384756 text:Hey! 100k in stock, $0.85/1k = $85 total. USDT accepted.
+  ```
+
+---
+
+## 5. Channel Architecture: Forum vs Text Mode
+
+Operators can choose between two UI presentations for `#dm-inbox` and `#deals` (switchable at any time via `setup.py`):
+
+| UI Mode | Presentation | Best Used For |
+|---|---|---|
+| **🏛️ Forum Mode (`--forums`)** | 1 dedicated ticket thread per buyer or deal with filterable tags (`🔥 High Intent`, `💳 Crypto`, `💎 High Margin`). | High-volume fleets with multiple operators managing separate deals simultaneously. |
+| **💬 Text Mode (`--text-channels`)** | Clean chronological rich embed cards in a single text stream. | Single-operator setups wanting all buyer DMs and deal alerts in a unified live scroll. |
+
+---
+
+## 6. Ad Copy Crafting & Anti-Spam Optimization
 
 The engine automatically generates 25–40 human-like variations from a single base message using:
 - Case variations (ALL CAPS, Title Case, Sentence case)

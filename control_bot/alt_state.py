@@ -219,7 +219,8 @@ class AltStateManager:
         with self._lock:
             now = time.time()
             for alt in self._alts.values():
-                if alt.last_heartbeat_ts and now - alt.last_heartbeat_ts > threshold:
+                effective_last_seen = max(alt.last_heartbeat_ts, alt.last_post_ts)
+                if effective_last_seen and now - effective_last_seen > threshold:
                     alt.online = False
                     if alt.status not in {"stopped", "offline"}:
                         alt.status = "offline"
@@ -239,7 +240,8 @@ class AltStateManager:
             elif status == "in_progress" and alt.status in {"offline", "stopped", "error", ""}:
                 alt.status = "starting"
             elif status == "queued":
-                alt.status = "queued"
+                if not alt.online and alt.status in {"offline", "stopped", "error", ""}:
+                    alt.status = "queued"
 
     def set_dm_ack(self, alt_id: int, text: str) -> None:
         with self._lock:

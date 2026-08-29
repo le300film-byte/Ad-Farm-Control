@@ -67,12 +67,13 @@ class SetupError(RuntimeError):
 class Bootstrap:
     def __init__(self, non_interactive: bool = False, *, force: bool = False,
                  abort_on_failure: bool = False, quick: bool = False,
-                 upgrade_forums: bool = False):
+                 upgrade_forums: bool = False, use_forums: bool | None = None):
         self.non_interactive = non_interactive
         self.force = force
         self.abort_on_failure = abort_on_failure
         self.quick = quick
         self.upgrade_forums = upgrade_forums
+        self.use_forums = use_forums
         self.self_check_failures: list[str] = []
         self._existing_cache: dict[tuple[str, str], set[str]] = {}
         self.gh_token = ""
@@ -316,6 +317,17 @@ class Bootstrap:
             raise SetupError("Provide CHANNEL_IDS or CHANNEL_NAMES so sender targets are not empty.")
         self.channel_names = ",".join(name_parts)
 
+        if self.use_forums is None:
+            if self.quick or self.non_interactive:
+                env_val = os.environ.get("USE_FORUMS", "").strip().lower()
+                self.use_forums = env_val not in ("0", "false", "no") if env_val else True
+            else:
+                self.use_forums = self.yes_no(
+                    "Use Discord Forum channels for #dm-inbox and #deals (ticket board style)?",
+                    default=True,
+                    env="USE_FORUMS",
+                )
+
     def ensure_channel(
         self,
         name: str,
@@ -334,20 +346,21 @@ class Bootstrap:
             ch_name = channel.get("name", "").lower()
             if ch_name == name.lower():
                 existing_type = channel.get("type", 0)
-                # If upgrade_forums is requested, convert ONLY target farm channels (dm-inbox, deals) from Text (0) to Forum (15)
+                # If upgrade_forums / force conversion is requested on target farm channels:
                 if (
                     self.upgrade_forums
-                    and channel_type == 15
-                    and existing_type == 0
                     and ch_name in ("dm-inbox", "deals", "farm-alerts")
+                    and existing_type != channel_type
                 ):
-                    print(f"  🔄 Upgrading #{name} from Text to native Forum channel (deleting old #{name} {channel.get('id')}...)")
+                    target_str = "Forum" if channel_type == 15 else "Text"
+                    orig_str = "Forum" if existing_type == 15 else "Text"
+                    print(f"  🔄 Converting #{name} from {orig_str} to {target_str} channel (deleting old #{name} {channel.get('id')}...)")
                     del_status, _ = self.discord(
                         "DELETE", f"/channels/{channel.get('id')}", self.bot_token, bot=True
                     )
                     if del_status in (200, 204):
-                        break  # Proceed to create the new Forum channel below
-                    print(f"  ⚠️ Could not delete old #{name} (HTTP {del_status}); reusing existing Text channel.")
+                        break  # Proceed to create the new channel with the chosen type below
+                    print(f"  ⚠️ Could not delete old #{name} (HTTP {del_status}); reusing existing channel.")
                     return str(channel["id"])
 
                 ctype_str = "Forum" if existing_type == 15 else "Text"
@@ -475,11 +488,14 @@ class Bootstrap:
             {"name": "💎 Blade Ball", "moderated": False},
             {"name": "💰 Arbitrage", "moderated": False},
         ]
+        dm_type = 15 if self.use_forums else 0
+        deals_type = 15 if self.use_forums else 0
+
         self.channels["control"] = self.ensure_channel("control", channel_type=0)
         self.channels["dashboard"] = self.ensure_channel("dashboard", channel_type=0)
-        self.channels["dm-inbox"] = self.ensure_channel("dm-inbox", channel_type=15, tags=dm_inbox_tags)
+        self.channels["dm-inbox"] = self.ensure_channel("dm-inbox", channel_type=dm_type, tags=dm_inbox_tags if dm_type == 15 else None)
         self.channels["farm-logs"] = self.ensure_channel("farm-logs", channel_type=0)
-        self.channels["deals"] = self.ensure_channel("deals", channel_type=15, tags=deals_tags)
+        self.channels["deals"] = self.ensure_channel("deals", channel_type=deals_type, tags=deals_tags if deals_type == 15 else None)
 
         self.webhooks = {
             "LOG_WEBHOOK_URL": self.ensure_webhook(self.channels["farm-logs"], "Farm Logs"),
@@ -1030,7 +1046,20 @@ def main() -> int:
     parser.add_argument(
         "--upgrade-forums",
         action="store_true",
-        help="upgrade existing text #dm-inbox and #deals channels to native Discord Forum channels",
+        help="convert existing #dm-inbox and #deals channels to the selected type (forum or text)",
+    )
+    parser.add_argument(
+        "--forums",
+        dest="use_forums",
+        action="store_true",
+        default=None,
+        help="use native Discord Forum channels for #dm-inbox and #deals",
+    )
+    parser.add_argument(
+        "--no-forums", "--text-channels",
+        dest="use_forums",
+        action="store_false",
+        help="use standard Discord Text channels for #dm-inbox and #deals instead of forums",
     )
     args = parser.parse_args()
     force = args.force or os.environ.get("SETUP_FORCE", "").lower() in {"1", "true", "yes"}
@@ -1049,6 +1078,7 @@ def main() -> int:
         abort_on_failure=abort_on_failure,
         quick=quick,
         upgrade_forums=upgrade_forums,
+        use_forums=args.use_forums,
     )
     try:
         setup.run()

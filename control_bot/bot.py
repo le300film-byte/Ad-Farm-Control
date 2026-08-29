@@ -203,8 +203,18 @@ async def _hydrate_discord_state() -> None:
             except Exception as exc:
                 print(f"[STATE] Could not fetch channel {channel_id}: {type(exc).__name__}: {exc}")
                 continue
+        messages = []
         try:
-            messages = [message async for message in channel.history(limit=100)]
+            if hasattr(channel, "history"):
+                messages = [message async for message in channel.history(limit=100)]
+            elif isinstance(channel, discord.ForumChannel) or hasattr(channel, "threads"):
+                for thread in (getattr(channel, "threads", []) or []):
+                    if hasattr(thread, "history"):
+                        try:
+                            async for m in thread.history(limit=10):
+                                messages.append(m)
+                        except Exception:
+                            pass
         except Exception as exc:
             print(f"[STATE] Could not read channel {channel_id}: {type(exc).__name__}: {exc}")
             continue
@@ -1677,47 +1687,47 @@ async def cmd_canary(inter: discord.Interaction, alt: Optional[int] = 0):
 
 
 _COMMAND_GUIDE = {
-    "altadd": ("`/altadd` then complete the private modal", "Adds an existing prepared alt repository, stores its USER_TOKEN without echoing it, and persists its repository/Discord ID/name mapping. It does not expose or print secrets."),
-    "altupdate": ("`/altupdate alt:<alt>` then complete the private modal", "Updates an alt's token, repository, Discord ID, and/or display name. Empty fields are left unchanged; a repository move requires a new token."),
-    "altlist": ("`/altlist`", "Lists configured alts and live heartbeat age without displaying any token or secret."),
-    "altremove": ("`/altremove alt:<alt> confirmation:DELETE delete_repository:<true|false>`", "Stops the workflow, removes the alt from the core registry, deletes USER_TOKEN, and keeps the repository unless permanent deletion is explicitly selected."),
-    "run": ("No slash arguments; private form.", "Choose one configured alt, sell/buy, price/style, image yes/no, interval 3/5, and runtime 6/12/18/24/48h. Dispatches its GitHub workflow."),
-    "stop": ("`/stop alt:<alt>`", "Privately sends !stop and cancels the matching GitHub run."),
-    "pause": ("`/pause alt:<alt>`", "Privately sends !pause; public posting should stop after the remote ack."),
-    "resume": ("`/resume alt:<alt>`", "Privately sends !resume and reports the remote ack."),
-    "setprice": ("`/setprice alt:<alt> new_price:<0..20>`", "Validates the value, sends !setprice, and updates live dashboard state only after an ack."),
-    "setmode": ("`/setmode alt:<alt> mode:<sell|buy>`", "Sends !setmode and updates live mode after an ack."),
-    "setmessage": ("`/setmessage alt:<alt> new_message:<text>`", "Rejects empty/text over 1900 chars, sends !setmessage, and updates the preview after an ack."),
-    "setdealkeywords": ("`/setdealkeywords alt:<alt> keywords:<a, b, c>`", "Sets exact case-insensitive item keywords for the separate deal scanner. The sender persists the setting through the shared control Gist."),
-    "setdealscan": ("`/setdealscan alt:<alt> enabled:<on|off>`", "Turns the separate item-aware deal scanner on or off without changing public ad posting."),
-    "setdealdelta": ("`/setdealdelta alt:<alt> delta:<0..5>`", "Sets the minimum price edge per 1k before a matching item offer alerts; the default is $0.05."),
-    "setchannel": ("`/setchannel alt:<alt> channel_id:<digits> [name]`", "Sends !setchannel; the sender verifies the channel before adding it to its runtime scheduler and persists it to repo secrets."),
-    "replacechannel": ("`/replacechannel alt:<alt> old_id:<digits> new_id:<digits> [name]`", "Sends !replacechannel; the sender verifies the replacement, rewrites scheduler state, and persists it to repo secrets."),
-    "rescan_channels": ("`/rescan_channels alt:<alt>`", "Sends !rescan; forces the alt to immediately re-verify channel permissions and access."),
-    "resetcaution": ("`/resetcaution alt:<alt> [channel_id:<digits>]`", "Sends !resetcaution; clears slowmode and caution backoff flags on a specific channel or all channels."),
-    "settings": ("`/settings [alt:<alt>|All alts]`", "Displays current runtime parameters, workflow status, channels, and safety configurations."),
-    "channels": ("`/channels [alt:<alt>]`", "Opens the interactive visual channel manager to view, add, remove, and rescan channels."),
-    "uploadimage": ("`/uploadimage alt:<alt|0> image:<file>`", "Uploads or replaces an ad image directly into an alt GitHub repository."),
-    "setinterval": ("`/setinterval alt:<alt> interval:<3|5>`", "Sends !setinterval. The sender keeps the permitted 3/5-minute constraint."),
-    "setruntime": ("`/setruntime alt:<alt> hours:<6|12|18|24|48>`", "Sends !setruntime. The sender caps all runtime to 48 hours."),
-    "sync": ("`/sync`", "Sends !sync to every configured alt to reload shared control/Gist state."),
-    "pingalt": ("`/pingalt alt:<alt>`", "Sends !ping through the same control transport used by runtime commands; use it to verify the Gist queue without changing ad settings."),
-    "selfcheck": ("`/selfcheck alt:<alt>`", "Dispatches that alt's self-check workflow to validate token, channels, webhooks, Gists, and routing."),
-    "status": ("`/status [alt:<alt>|All alts]`", "Refreshes GitHub state and shows current heartbeat, workflow, counters, channels, errors, and alerts."),
-    "runs": ("`/runs alt:<alt>`", "Shows the latest GitHub Actions runs and links without exposing workflow secrets."),
-    "logs": ("`/logs alt:<alt> [limit] [kind] [search]`", "Shows typed buffered logs with optional keyword and category filtering."),
-    "clearlogs": ("`/clearlogs alt:<alt>`", "Clears only the control bot's local in-memory log buffer; it does not delete Discord history or sender logs."),
-    "deals": ("`/deals [alt:<alt>|All alts]`", "Shows deal-alert counters, latest alert time, scanner state, threshold, and active item keywords from the separate deal path."),
-    "diagnose": ("`/diagnose alt:<alt>`", "Causal Event Explorer: deep root-cause diagnostic timeline, transition triggers, and recommendations."),
-    "topology": ("`/topology`", "Displays the live fleet topology and routing relationship graph."),
-    "simulate": ("`/simulate alt:<alt> [test_rate]`", "Runs a sandboxed dry-run simulation of ad copy, variation generators, and cadence."),
-    "squad": ("`/squad action:<list|assign|view> [alt] [squad_name]`", "Manages fleet squad pools, squad-based grouping, and assignments."),
-    "policy": ("`/policy alt:<alt> template:<stealth|aggressive|peak_hour|balanced>`", "Applies preset operational channel policy templates to an alt."),
-    "canary": ("`/canary [alt]`", "Performs synthetic in-band health probes testing GitHub, Gist, and webhook infrastructure."),
-    "reply": ("`/reply alt:<alt> user:<buyer_id> text:<message>`", "Relays an operator reply through the selected alt directly to a buyer's DM."),
-    "refresh": ("`/refresh`", "Fetches current GitHub run state and updates the persistent dashboard message."),
-    "dashboard": ("`/dashboard`", "Posts a fresh dashboard snapshot; it does not run the sender or scan deals."),
-    "help": ("`/help`", "Shows this private complete command reference."),
+    "altadd": ("`/altadd` (opens private modal)", "Adds an existing alt repository to the control bot fleet. Prompts privately for Alt ID, Repository slug (`owner/repo`), Display Name, and USER_TOKEN. Secrets are masked and never logged."),
+    "altupdate": ("`/altupdate alt:<alt>` (opens private modal)", "Updates an alt's configuration (Token, Repository, Discord ID, or Display Name). Blank fields are left unchanged."),
+    "altlist": ("`/altlist`", "Displays all registered fleet alts, repository links, configured mode, and live heartbeat age without exposing sensitive tokens."),
+    "altremove": ("`/altremove alt:<alt> confirmation:DELETE [delete_repository:<true|false>]`", "Removes an alt from the control bot registry. Keeps the GitHub repository by default unless `delete_repository:true` is explicitly chosen."),
+    "run": ("`/run` (opens interactive UI)", "Interactive 3-step form to launch an alt: Choose Alt & Mode (`Sell` / `Buy`) ➔ Enter Rate, Message & Image settings ➔ Select Cadence (`3m`/`5m`) & Duration (`6h`, `12h`, `18h`, `24h`, `48h`). Automatically cancels old runs and dispatches workflow."),
+    "stop": ("`/stop alt:<alt>`", "Gracefully stops the alt: sends `!stop` through Gist/DM, syncs variation blocklist, and cancels the active GitHub Actions workflow run."),
+    "pause": ("`/pause alt:<alt>`", "Temporarily pauses public ad delivery on all target channels without terminating the GitHub Actions runner."),
+    "resume": ("`/resume alt:<alt>`", "Resumes public ad delivery from pause state."),
+    "setprice": ("`/setprice alt:<alt> new_price:<0.00..20.00>`", "Updates the active pricing rate (e.g. `2.50`) in the live ad copy and adjusts deal scanner profit calculations in real time."),
+    "setmode": ("`/setmode alt:<alt> mode:<sell|buy>`", "Swaps trade mode between Seller (`💰`) and Buyer (`🛒`). Prompts to update message copy if necessary."),
+    "setmessage": ("`/setmessage alt:<alt> new_message:<text>`", "Pushes new base ad copy (up to 1900 chars) to the alt. Automatically regenerates 25–40 anti-detection variations."),
+    "setdealkeywords": ("`/setdealkeywords alt:<alt> keywords:<comma-separated list>`", "Configures target item/game aliases for the deal scanner (e.g. `Blade Ball, BB token, BB, Robux, MM2`). Matches with whole-word boundaries to avoid false positives."),
+    "setdealscan": ("`/setdealscan alt:<alt> enabled:<on|off>`", "Toggles passive marketplace deal scanning on or off without affecting ad posting cadence."),
+    "setdealdelta": ("`/setdealdelta alt:<alt> delta:<0.00..5.00>`", "Sets the minimum profit margin required per 1k units before triggering a deal alert into `#deals` (default `$0.05`)."),
+    "setchannel": ("`/setchannel alt:<alt> channel_id:<numeric_id> [name]`", "Adds a new trading channel to the alt's rotation. Verifies channel accessibility before adding and persists it to GitHub secrets."),
+    "replacechannel": ("`/replacechannel alt:<alt> old_id:<numeric_id> new_id:<numeric_id> [name]`", "Safely swaps an old/dead trading channel with a new one in the alt's rotation and updates repository secrets."),
+    "rescan_channels": ("`/rescan_channels alt:<alt>`", "Forces the alt to immediately re-verify permissions, slowmode limits, and connectivity on all configured channels."),
+    "resetcaution": ("`/resetcaution alt:<alt> [channel_id:<numeric_id>|all]`", "Clears strike counters, slowmode flags, and Caution Mode backoffs on a specific channel or fleet-wide."),
+    "settings": ("`/settings [alt:<alt>|All alts]`", "Opens the interactive Fleet Tuning UI with native Select dropdowns for Alts, Policy templates, channel overview, and action buttons."),
+    "channels": ("`/channels [alt:<alt>]`", "Opens the interactive visual Channel Manager with 1-click buttons to View, Add Channel, Remove Channel, or Rescan."),
+    "uploadimage": ("`/uploadimage alt:<alt|0> image:<file>`", "Uploads or replaces an ad image (.png, .jpg, .webp < 8MB) directly into the selected alt's GitHub repository."),
+    "setinterval": ("`/setinterval alt:<alt> interval:<3|5>`", "Sets channel post interval to 3 or 5 minutes (enforces safety jitter and slowmode hard floor)."),
+    "setruntime": ("`/setruntime alt:<alt> hours:<6|12|18|24|48>`", "Sets execution runtime duration for the alt runner job."),
+    "sync": ("`/sync`", "Sends a fleet-wide broadcast telling all alts to immediately reload shared control Gists and variation blocklists."),
+    "pingalt": ("`/pingalt alt:<alt>`", "Tests round-trip latency of the Gist command queue without altering any ad settings."),
+    "selfcheck": ("`/selfcheck alt:<alt>`", "Dispatches `self_check.yml` in GitHub Actions to validate tokens, webhooks, channel permissions, and egress proxy routing."),
+    "status": ("`/status [alt:<alt>|All alts]`", "Refreshes live state and displays unified dashboard overview or detailed single-alt diagnostic card."),
+    "runs": ("`/runs alt:<alt> [limit:1..10]`", "Lists recent GitHub Actions workflow runs, duration, execution status, and run links without leaking tokens."),
+    "logs": ("`/logs alt:<alt> [limit:5..50] [kind:ALL|ERROR|DEAL|CONTROL|CHANNEL|CAUTION|DEBUG] [search:text]`", "Streams typed buffered log events with category and keyword filtering."),
+    "clearlogs": ("`/clearlogs alt:<alt>`", "Clears the control bot's local in-memory log buffer without affecting Discord channel history or GitHub runner logs."),
+    "deals": ("`/deals [alt:<alt>|All alts]`", "Displays deal-alert metrics, profit edges, scanner status, threshold, and active item keywords."),
+    "diagnose": ("`/diagnose alt:<alt>`", "Causal Event Explorer: deep root-cause diagnostic timeline, transition triggers, health index, and actionable operator recommendations."),
+    "topology": ("`/topology`", "Renders the live visual fleet topology graph: alts, squad pools, target Discord channels, yield grades, and egress routing."),
+    "simulate": ("`/simulate alt:<alt> [test_rate:float]`", "Sandboxed dry-run simulation: previews variation generation, typist permutations, and estimated survival score without sending live messages."),
+    "squad": ("`/squad action:<list|assign|view> [alt] [squad_name]`", "Fleet Squad Manager: `list` (view all squad pools), `assign` (assign alt to a named squad like 'Alpha Sellers'), `view` (view squad members)."),
+    "policy": ("`/policy alt:<alt> template:<stealth|aggressive|peak_hour|balanced>`", "Applies pre-packaged operational profiles:\n• `🛡️ stealth`: 5m interval, max typing jitter, soft copy, strict caution.\n• `⚡ aggressive`: 3m interval, high throughput, fast inter-channel rotation.\n• `🔥 peak_hour`: 3m interval, dynamic chat velocity cadence, active deal scanning.\n• `⚖️ balanced`: 5m interval, standard human jitter, balanced deal thresholds."),
+    "canary": ("`/canary [alt]`", "Synthetic In-Band Probe: tests GitHub API, Gist bridge sync, and token latency in milliseconds."),
+    "reply": ("`/reply alt:<alt> user:<buyer_id> text:<message>`", "Operator DM Relay: transmits your message through the selected alt account directly into the buyer's private DM."),
+    "refresh": ("`/refresh`", "Forces an immediate live poll of GitHub Actions workflow states and updates the persistent dashboard embed."),
+    "dashboard": ("`/dashboard`", "Posts a fresh 3-card dashboard snapshot in `#ad-dashboard` without running or scanning ads."),
+    "help": ("`/help`", "Displays this complete interactive reference manual with arguments, options, examples, and permissions."),
 }
 
 
@@ -1869,6 +1879,30 @@ async def on_message(message: discord.Message):
         await _handle_guild_webhook_message(message)
 
 
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if bot.user and after.author.id == bot.user.id:
+        return
+    if after.guild and after.guild.id == (config.GUILD_ID or after.guild.id):
+        await _handle_guild_webhook_message(after, is_edit=True)
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    if not payload.guild_id or (config.GUILD_ID and payload.guild_id != config.GUILD_ID):
+        return
+    ch_id = payload.channel_id
+    if ch_id == config.DASHBOARD_CH_ID or (config.LOG_CH_ID and ch_id == config.LOG_CH_ID) or (config.DEALS_CH_ID and ch_id == config.DEALS_CH_ID):
+        try:
+            channel = bot.get_channel(ch_id)
+            if channel and hasattr(channel, "fetch_message"):
+                msg = await channel.fetch_message(payload.message_id)
+                if msg:
+                    await _handle_guild_webhook_message(msg, is_edit=True)
+        except Exception:
+            pass
+
+
 async def _handle_incoming_dm(message: discord.Message):
     author_id = message.author.id
     # Is this from a known alt?
@@ -1906,7 +1940,7 @@ def _alt_id_for_discord_id(did: int) -> int | None:
     return None
 
 
-async def _handle_guild_webhook_message(message: discord.Message):
+async def _handle_guild_webhook_message(message: discord.Message, is_edit: bool = False):
     """Parse consolidated dashboard and farm-log webhook messages.
 
     All alts share one #farm-logs webhook. ``send_log_webhook`` sets the
@@ -1918,8 +1952,9 @@ async def _handle_guild_webhook_message(message: discord.Message):
     # heartbeat just because its display name resembles an alt.
     if not getattr(message, "webhook_id", None) and not getattr(message.author, "bot", False):
         return
+    ch_id = message.channel.id
     message_id = getattr(message, "id", None)
-    if message_id is not None:
+    if message_id is not None and ch_id != config.DASHBOARD_CH_ID and not is_edit:
         try:
             message_id = int(message_id)
         except (TypeError, ValueError):
@@ -1931,7 +1966,6 @@ async def _handle_guild_webhook_message(message: discord.Message):
             if len(_processed_webhook_ids) > 5000:
                 _processed_webhook_ids.clear()
                 _processed_webhook_ids.add(message_id)
-    ch_id = message.channel.id
     if ch_id == config.DASHBOARD_CH_ID:
         _parse_dashboard_message(message)
 
@@ -1960,9 +1994,11 @@ async def _handle_guild_webhook_message(message: discord.Message):
                 alt_id = _match_alt_name(footer)
                 if alt_id is not None:
                     break
+        if alt_id is None and len(state.alt_ids) == 1:
+            alt_id = state.alt_ids[0]
         if alt_id is not None:
             _parse_log_message(alt_id, message)
-        else:
+        elif not any(n.lower() in ("farm logs", "adfarm control") for n in names if n):
             print(f"⚠️ Could not map farm-log webhook username to an alt: {names!r}")
 
 
@@ -2085,6 +2121,9 @@ def _parse_dashboard_message(message: discord.Message):
                         }
             if channels:
                 payload["channels"] = channels
+                max_ch_post = max((int(ch.get("last_post") or 0) for ch in channels.values()), default=0)
+                if max_ch_post > 0:
+                    payload["last_post_ts"] = max_ch_post
             state.update_from_heartbeat(alt_id, payload)
         except Exception:
             # A malformed optional field must not discard the rest of a live
@@ -2123,11 +2162,40 @@ def _parse_log_message(alt_id: int, message: discord.Message):
     elif "ERROR" in body.upper() or "FAIL" in body.upper():
         kind = "ERROR"
     state.append_log(alt_id, body[:300], emoji=emoji, color=color, kind=kind)
-    # Try to detect success counts from "total=`N`"
-    m = re.search(r"total[`=]\s*(\d+)", body)
-    if m:
-        a = state.get(alt_id)
-        if a:
+
+    # Any live log message from an alt confirms the alt runner is running and active
+    a = state.get(alt_id)
+    now_ts = time.time()
+    if a:
+        a.online = True
+        a.last_heartbeat_ts = now_ts
+        if a.status in {"offline", "stopped", "queued", "starting", ""}:
+            a.status = "active"
+
+        # Detect ad post event
+        if "SEND" in body.upper():
+            a.last_post_ts = now_ts
+            m_cid = re.search(r"\((\d{17,20})\)", body)
+            if m_cid:
+                cid = m_cid.group(1)
+                m_chname = re.search(r"#([^\s(]+)", body)
+                ch_name = m_chname.group(1) if m_chname else cid
+                if cid not in a.channels or not isinstance(a.channels[cid], dict):
+                    a.channels[cid] = {
+                        "name": ch_name[:80],
+                        "sent": 0,
+                        "errors": 0,
+                        "slowmode": 0,
+                        "alive": True,
+                        "last_post": 0,
+                    }
+                a.channels[cid]["sent"] = int(a.channels[cid].get("sent") or 0) + 1
+                a.channels[cid]["last_post"] = int(now_ts)
+                a.channels[cid]["alive"] = True
+
+        # Try to detect success counts from "total=`N`"
+        m = re.search(r"total[`=]\s*(\d+)", body)
+        if m:
             try:
                 a.total_sent = max(a.total_sent, int(m.group(1)))
             except Exception:

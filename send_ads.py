@@ -845,6 +845,9 @@ def _fake_err_response(code, msg):
 # --------------------------------------------------------------------------- #
 # Webhook (DM forwarding)                                                     #
 # --------------------------------------------------------------------------- #
+_buyer_forum_threads = {}   # user_id / channel_id -> forum thread_id for ticket continuation
+_buyer_context_history = {} # user_id -> list of recent message dicts for spaced-out DM context
+
 def _avatar_url(user):
     """Build Discord CDN avatar URL for a user."""
     uid = user.get("id")
@@ -859,8 +862,8 @@ def _avatar_url(user):
         idx = 0
     return f"{_avatar_base}/embed/avatars/{idx}.png"
 
-def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=None, thread_name=None):
-    """Send a single message to the configured DM webhook (supports text & forum channels)."""
+def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=None, thread_name=None, thread_id=None, buyer_key=None):
+    """Send a single message to the configured DM webhook (supports text & forum channels and thread continuation)."""
     global _dm_forward_failures
     if not DM_WEBHOOK_URL:
         return True
@@ -878,7 +881,7 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
         payload["embeds"] = [embed]
     elif embeds is not None:
         payload["embeds"] = embeds
-    if thread_name:
+    if thread_name and not thread_id:
         payload["thread_name"] = thread_name[:100]
     if not payload.get("content") and not payload.get("embeds"):
         return True
@@ -889,14 +892,55 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
         # their own URL token.
         wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
         r = None
+        target_url = DM_WEBHOOK_URL + "?wait=true"
+        if thread_id:
+            target_url += f"&thread_id={thread_id}"
         for attempt in range(3):
             try:
-                r = creq.post(DM_WEBHOOK_URL + "?wait=true",
+                r = creq.post(target_url,
                               json=payload, impersonate=_BROWSER, timeout=DM_WEBHOOK_TIMEOUT,
                               proxies=wh_proxies)
                 if r.status_code in (200, 204):
                     _dm_forward_failures = 0
+                    if buyer_key:
+                        try:
+                            resp_data = r.json()
+                            if isinstance(resp_data, dict):
+                                tid = str(resp_data.get("channel_id") or resp_data.get("thread_id") or "")
+                                if tid:
+                                    _buyer_forum_threads[str(buyer_key)] = tid
+                        except Exception:
+                            pass
                     return True
+                # If thread_id failed with 400 or 404 (thread deleted or archived, or text channel mode), fall back to standard POST
+                if thread_id and r.status_code in (400, 404):
+                    fallback_url = DM_WEBHOOK_URL + "?wait=true"
+                    if thread_name:
+                        payload["thread_name"] = thread_name[:100]
+                    r2 = creq.post(fallback_url,
+                                   json=payload, impersonate=_BROWSER, timeout=DM_WEBHOOK_TIMEOUT,
+                                   proxies=wh_proxies)
+                    if r2.status_code in (200, 204):
+                        _dm_forward_failures = 0
+                        if buyer_key:
+                            try:
+                                resp_data = r2.json()
+                                if isinstance(resp_data, dict):
+                                    tid = str(resp_data.get("channel_id") or "")
+                                    if tid:
+                                        _buyer_forum_threads[str(buyer_key)] = tid
+                            except Exception:
+                                pass
+                        return True
+                    # If forum thread_name failed on a plain text channel
+                    if r2.status_code == 400 and "thread_name" in payload:
+                        plain_payload = {k: v for k, v in payload.items() if k != "thread_name"}
+                        r3 = creq.post(fallback_url,
+                                       json=plain_payload, impersonate=_BROWSER, timeout=DM_WEBHOOK_TIMEOUT,
+                                       proxies=wh_proxies)
+                        if r3.status_code in (200, 204):
+                            _dm_forward_failures = 0
+                            return True
                 # If Discord returns 400 because thread_name was supplied on a standard text channel
                 if r.status_code == 400 and "thread_name" in payload:
                     fallback_payload = {k: v for k, v in payload.items() if k != "thread_name"}
@@ -913,6 +957,13 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
             except Exception as inner:
                 dbg(f"webhook attempt {attempt+1} err: {type(inner).__name__}")
                 time.sleep(2 * (attempt + 1))
+        dbg(f"webhook failed ({getattr(r, 'status_code', '?')}): {getattr(r,'text','')[:200]}")
+        _dm_forward_failures += 1
+        return False
+    except Exception as e:
+        dbg(f"webhook exception: {type(e).__name__}: {e}")
+        _dm_forward_failures += 1
+        return False
         dbg(f"webhook failed ({getattr(r, 'status_code', '?')}): {getattr(r,'text','')[:200]}")
         _dm_forward_failures += 1
         return False
@@ -1147,10 +1198,20 @@ def _format_attachments(attachments):
             lines.append(f"📎 [{fn}]({url}){size_str}")
     return "\n".join(lines)
 
+def _format_dm_ago(sec):
+    if sec < 60:
+        return "just now"
+    if sec < 3600:
+        return f"-{int(sec // 60)}m"
+    if sec < 86400:
+        return f"-{int(sec // 3600)}h"
+    return f"-{int(sec // 86400)}d"
+
 def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
-    """Forward a DM (one side of the conversation) to the webhook."""
+    """Forward a DM (one side of the conversation) to the webhook with thread and context memory."""
     if not DM_WEBHOOK_URL:
         return
+    uid = str(user_obj.get("id") or channel_id or "0")
     uname = (user_obj.get("username") or user_obj.get("global_name")
              or _me_cache.get("global_name") or "unknown")
     if is_me:
@@ -1160,6 +1221,21 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
     body = content or ""
     if att_text:
         body = (body + "\n" + att_text).strip()
+
+    # Track conversation context history per buyer across spaced-out DMs
+    now_ts = time.time()
+    if uid not in _buyer_context_history:
+        _buyer_context_history[uid] = []
+    if body and body != "*(empty — embed/attachment only)*":
+        _buyer_context_history[uid].append({
+            "ts": now_ts,
+            "text": body[:200],
+            "is_me": is_me,
+            "uname": uname,
+        })
+        if len(_buyer_context_history[uid]) > 10:
+            _buyer_context_history[uid] = _buyer_context_history[uid][-10:]
+
     # Discord deep link — opens the DM channel directly
     deep_link = f"https://discord.com/channels/@me/{channel_id}"
     embed = {
@@ -1169,9 +1245,17 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
         "url": deep_link,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    thread_title = f"💬 {uname[:24]} ({str(user_obj.get('id', ''))[-4:]})"
+    thread_title = f"💬 {uname[:24]} ({uid[-4:] if len(uid)>=4 else uid})"
+
     if not is_me and body and body != "*(empty — embed/attachment only)*":
-        intent = _classify_dm_intent(body)
+        # Aggregate recent buyer text (last 2 hours) to build cumulative intent across spaced-out DMs
+        recent_texts = [
+            item["text"] for item in _buyer_context_history[uid]
+            if not item.get("is_me") and (now_ts - item.get("ts", 0)) < 7200
+        ]
+        cumulative_text = "\n".join(recent_texts) if recent_texts else body
+        intent = _classify_dm_intent(cumulative_text)
+
         badges = [f"**Intent:** `{intent['category']}`", f"**Priority:** `{intent['priority']}`"]
         if intent.get("game"):
             badges.append(f"**Game:** `{intent['game']}`")
@@ -1179,15 +1263,42 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
             badges.append(f"**Vol:** `{intent['volume']}`")
         if intent["payments"]:
             badges.append(f"**Pay:** {', '.join(intent['payments'])}")
-        embed["fields"] = [
+
+        fields = [
             {"name": "🏷️ Smart Intent Classification", "value": " · ".join(badges), "inline": False},
-            {"name": "⚡ Quick Reply Command", "value": f"`/reply alt:{ALT_ID} user:{user_obj.get('id', '')} text:...`", "inline": False},
         ]
+
+        # If there are spaced-out past messages from this buyer, show recent history for instant context
+        history = _buyer_context_history[uid]
+        if len(history) > 1:
+            hist_lines = []
+            for h in history[-5:]:
+                role_label = "Alt" if h.get("is_me") else "Buyer"
+                ago_str = _format_dm_ago(now_ts - h.get("ts", now_ts))
+                clean_h_text = h.get("text", "").replace("\n", " ")[:70]
+                hist_lines.append(f"• `[{ago_str}]` **{role_label}:** \"{clean_h_text}\"")
+            if hist_lines:
+                fields.append({"name": "📜 Conversation Context (spaced DMs)", "value": "\n".join(hist_lines)[:1024], "inline": False})
+
+        fields.append({"name": "⚡ Quick Reply Command", "value": f"`/reply alt:{ALT_ID} user:{uid} text:...`", "inline": False})
+        embed["fields"] = fields
+
         tag_badge = intent.get('game') or intent['category']
         thread_title = f"🏷️ [{tag_badge}] {uname[:20]}"
+
     if not body:
         body = "*(empty — embed/attachment only)*"
-    send_webhook(body[:2000], username=uname[:80], avatar_url=av, embed=embed, thread_name=thread_title)
+
+    existing_thread_id = _buyer_forum_threads.get(uid) or _buyer_forum_threads.get(str(channel_id))
+    send_webhook(
+        body[:2000],
+        username=uname[:80],
+        avatar_url=av,
+        embed=embed,
+        thread_name=thread_title,
+        thread_id=existing_thread_id,
+        buyer_key=uid,
+    )
 
 # --------------------------------------------------------------------------- #
 # Blocklist Gist persistence                                                  #
