@@ -266,11 +266,16 @@ jobs:
                   fail(f"{label} URL doesn't look like a Discord webhook")
                   return
               try:
-                  # Send a test message
+                  # Send a test message with thread_name for forum channels, with auto-fallback for text channels
                   payload = {"content": f"🔍 Self-check from **{alt_name}** (test ping; will be deleted).",
-                             "allowed_mentions": {"parse": []}}
+                             "allowed_mentions": {"parse": []},
+                             "thread_name": f"🔍 Self-check ({alt_name})"}
                   r = creq.post(url + "?wait=true", json=payload, impersonate=BROWSER,
                                 timeout=20, proxies=PROXIES)
+                  if r.status_code == 400:
+                      payload_no_thread = {k: v for k, v in payload.items() if k != "thread_name"}
+                      r = creq.post(url + "?wait=true", json=payload_no_thread, impersonate=BROWSER,
+                                    timeout=20, proxies=PROXIES)
                   if r.status_code in (200, 204):
                       # Discord normally returns 200 for ?wait=true, but 204 is
                       # also a successful webhook response. Never parse JSON from
@@ -281,8 +286,14 @@ jobs:
                       # Try to clean up when the response supplied a message ID.
                       if mid:
                           try:
-                              creq.delete(f"{url}/messages/{mid}", impersonate=BROWSER,
-                                          timeout=10, proxies=PROXIES)
+                              del_url = f"{url}/messages/{mid}"
+                              if msg.get("channel_id"):
+                                  del_url += f"?thread_id={msg['channel_id']}"
+                              r_del = creq.delete(del_url, impersonate=BROWSER,
+                                                  timeout=10, proxies=PROXIES)
+                              if r_del.status_code not in (200, 204):
+                                  creq.delete(f"{url}/messages/{mid}", impersonate=BROWSER,
+                                              timeout=10, proxies=PROXIES)
                               info("   cleaned up test message")
                           except Exception:
                               info("   (could not delete — ignore the ping)")

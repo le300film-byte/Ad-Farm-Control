@@ -951,12 +951,19 @@ def send_log_webhook(msg, username=None, kind=None):
         global _log_webhook_failures
         try:
             wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
+            payload = {"content": line[:2000],
+                       "username": (username or ALT_NAME)[:80],
+                       "allowed_mentions": {"parse": []}}
             r = creq.post(LOG_WEBHOOK_URL + "?wait=true",
-                          json={"content": line[:2000],
-                                "username": (username or ALT_NAME)[:80],
-                                "allowed_mentions": {"parse": []}},
+                          json=payload,
                           impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                           proxies=wh_proxies)
+            if r.status_code == 400:
+                payload["thread_name"] = f"📜 Logs ({ALT_NAME})"
+                r = creq.post(LOG_WEBHOOK_URL + "?wait=true",
+                              json=payload,
+                              impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
+                              proxies=wh_proxies)
             if r.status_code in (200, 204):
                 _log_webhook_failures = 0
             elif not (500 <= r.status_code < 600):
@@ -999,6 +1006,12 @@ def send_dashboard(embed_dict):
                 r = creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
                               json=payload, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                               proxies=wh_proxies)
+                if r.status_code == 400:
+                    payload_forum = dict(payload)
+                    payload_forum["thread_name"] = "📊 Live Dashboard"
+                    r = creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
+                                  json=payload_forum, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
+                                  proxies=wh_proxies)
                 if r.status_code in (200, 204):
                     _dash_webhook_failures = 0
                 elif r.status_code not in (429,) and not (500 <= r.status_code < 600):
