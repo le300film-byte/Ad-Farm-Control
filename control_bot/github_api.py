@@ -1,6 +1,7 @@
 """control_bot.github_api — thin wrapper around GitHub REST API for workflow control."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -21,10 +22,25 @@ _HTTP_TIMEOUT = config.CONTROL_HTTP_TIMEOUT
 
 
 GH = "https://api.github.com"
+GITHUB_API = GH
 
 
 def _gist_filename(alt_id: int) -> str:
     return f"control_{int(alt_id)}.json"
+
+
+def fetch_gist(gist_id: str) -> dict:
+    """Fetch Gist contents and metadata by gist ID."""
+    if not gist_id:
+        return {}
+    url = f"{GH}/gists/{gist_id}"
+    try:
+        r = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+        return {}
+    except Exception:
+        return {}
 
 
 def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
@@ -245,8 +261,8 @@ def _fetch_latest_run_id(repo: str) -> Optional[int]:
             runs = r.json().get("workflow_runs") or []
             if runs:
                 return runs[0].get("id")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[GH_API] fetch latest run error for {repo}: {e}")
     return None
 
 
@@ -277,9 +293,66 @@ def list_runs(alt_id: int, limit: int = 5) -> list[dict]:
         r = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
         if r.status_code == 200:
             return r.json().get("workflow_runs") or []
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[GH_API] list runs error for {repo}: {e}")
     return []
+
+
+def upload_repository_file(repo: str, file_path: str, content_bytes: bytes, message: str = "Update file from control bot") -> tuple[bool, str]:
+    """Upload or overwrite a file in a GitHub repository."""
+    if not repo or not file_path:
+        return False, "Repository and file path are required."
+    slug = _repo_slug(repo)
+    clean_path = file_path.lstrip("/")
+    url = f"{GH}/repos/{slug}/contents/{clean_path}"
+
+    sha = None
+    try:
+        r_get = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        if r_get.status_code == 200:
+            sha = r_get.json().get("sha")
+    except Exception as e:
+        print(f"[GH_API] get file info error for {repo}/{clean_path}: {e}")
+
+    payload = {
+        "message": message[:200],
+        "content": base64.b64encode(content_bytes).decode("ascii"),
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        r_put = requests.put(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+        if r_put.status_code in (200, 201):
+            return True, f"File `{clean_path}` committed to `{slug}`."
+        return False, f"HTTP {r_put.status_code}: {r_put.text[:200]}"
+    except Exception as e:
+        return False, f"Network error: {e}"
+
+
+def get_authenticated_user() -> dict:
+    """Fetch the authenticated GitHub user profile."""
+    url = f"{GITHUB_API}/user"
+    try:
+        r = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        if r.status_code == 200:
+            return r.json()
+        return {}
+    except Exception:
+        return {}
+
+
+def check_github_api_health() -> tuple[bool, float]:
+    """Check GitHub REST API status and latency in milliseconds."""
+    t0 = time.perf_counter()
+    headers = _auth_headers()
+    try:
+        r = requests.get(f"{GITHUB_API}/user", headers=headers, timeout=_HTTP_TIMEOUT)
+        latency = (time.perf_counter() - t0) * 1000
+        return (r.status_code == 200, latency)
+    except Exception:
+        latency = (time.perf_counter() - t0) * 1000
+        return (False, latency)
 
 
 def refresh_all_run_statuses(state_manager) -> None:

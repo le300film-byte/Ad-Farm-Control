@@ -66,10 +66,13 @@ class SetupError(RuntimeError):
 
 class Bootstrap:
     def __init__(self, non_interactive: bool = False, *, force: bool = False,
-                 abort_on_failure: bool = False):
+                 abort_on_failure: bool = False, quick: bool = False,
+                 upgrade_forums: bool = False):
         self.non_interactive = non_interactive
         self.force = force
         self.abort_on_failure = abort_on_failure
+        self.quick = quick
+        self.upgrade_forums = upgrade_forums
         self.self_check_failures: list[str] = []
         self._existing_cache: dict[tuple[str, str], set[str]] = {}
         self.gh_token = ""
@@ -137,6 +140,10 @@ class Bootstrap:
 
     # ---------- preflight ----------
     def preflight(self) -> None:
+        if sys.version_info < (3, 10):
+            raise SetupError(f"Python 3.10+ required. Current version: {sys.version.split()[0]}")
+        if not shutil.which("git"):
+            raise SetupError("Git CLI 'git' is not installed or is not on PATH.")
         if not shutil.which("gh"):
             raise SetupError("GitHub CLI 'gh' is not installed or is not on PATH.")
         status = self.run_command(["gh", "auth", "status"], check=False)
@@ -158,6 +165,7 @@ class Bootstrap:
         ).stdout.strip()
         if "/" not in self.core_repo:
             raise SetupError("Could not determine the current core repository.")
+        print(f"✓ Python runtime ({sys.version.split()[0]}) & git environment verified.")
         print(f"✓ GitHub CLI authenticated; core repository: {self.core_repo}")
 
     # ---------- HTTP helpers ----------
@@ -293,11 +301,14 @@ class Bootstrap:
         if channel_parts and not all(part.isdigit() for part in channel_parts):
             raise SetupError("CHANNEL_IDS must contain only comma-separated numeric IDs.")
         self.channel_ids = ",".join(channel_parts)
-        self.channel_names = self.ask(
-            "Trading channel names (same order, optional; e.g. trading,market)",
-            required=False,
-            env="CHANNEL_NAMES",
-        )
+        if not self.quick and not self.non_interactive:
+            self.channel_names = self.ask(
+                "Trading channel names (same order, optional; e.g. trading,market)",
+                required=False,
+                env="CHANNEL_NAMES",
+            )
+        else:
+            self.channel_names = os.environ.get("CHANNEL_NAMES", "").strip()
         name_parts = [part.strip() for part in self.channel_names.split(",") if part.strip()]
         if name_parts and channel_parts and len(name_parts) != len(channel_parts):
             raise SetupError("CHANNEL_NAMES must be empty or have one name for each CHANNEL_IDS entry, in the same order.")
@@ -305,7 +316,12 @@ class Bootstrap:
             raise SetupError("Provide CHANNEL_IDS or CHANNEL_NAMES so sender targets are not empty.")
         self.channel_names = ",".join(name_parts)
 
-    def ensure_channel(self, name: str) -> str:
+    def ensure_channel(
+        self,
+        name: str,
+        channel_type: int = 0,
+        tags: list[dict[str, Any]] | None = None,
+    ) -> str:
         status, existing = self.discord(
             "GET", f"/guilds/{self.guild_id}/channels", self.bot_token, bot=True
         )
@@ -315,8 +331,27 @@ class Bootstrap:
                 "Give the bot Manage Channels and retry."
             )
         for channel in existing:
-            if channel.get("type") == 0 and channel.get("name", "").lower() == name:
-                print(f"  ✓ #{name} already exists ({channel.get('id')})")
+            ch_name = channel.get("name", "").lower()
+            if ch_name == name.lower():
+                existing_type = channel.get("type", 0)
+                # If upgrade_forums is requested, convert ONLY target farm channels (dm-inbox, deals) from Text (0) to Forum (15)
+                if (
+                    self.upgrade_forums
+                    and channel_type == 15
+                    and existing_type == 0
+                    and ch_name in ("dm-inbox", "deals", "farm-alerts")
+                ):
+                    print(f"  🔄 Upgrading #{name} from Text to native Forum channel (deleting old #{name} {channel.get('id')}...)")
+                    del_status, _ = self.discord(
+                        "DELETE", f"/channels/{channel.get('id')}", self.bot_token, bot=True
+                    )
+                    if del_status in (200, 204):
+                        break  # Proceed to create the new Forum channel below
+                    print(f"  ⚠️ Could not delete old #{name} (HTTP {del_status}); reusing existing Text channel.")
+                    return str(channel["id"])
+
+                ctype_str = "Forum" if existing_type == 15 else "Text"
+                print(f"  ✓ #{name} already exists ({ctype_str}, {channel.get('id')})")
                 return str(channel["id"])
 
         # Hide the channel from @everyone and explicitly grant the bot enough
@@ -324,28 +359,45 @@ class Bootstrap:
         overwrites = [
             {"id": self.guild_id, "type": 0, "allow": "0", "deny": str(VIEW_CHANNEL)},
             {
-                "id": str(self.bot_user["id"]),
+                "id": str(self.bot_user.get("id", "0")),
                 "type": 1,
                 "allow": str(BOT_CHANNEL_PERMS),
                 "deny": "0",
             },
         ]
+        body: dict[str, Any] = {
+            "name": name,
+            "type": channel_type,
+            "permission_overwrites": overwrites,
+        }
+        if channel_type == 15 and tags:
+            body["available_tags"] = tags
+
         status, channel = self.discord(
             "POST",
             f"/guilds/{self.guild_id}/channels",
             self.bot_token,
             bot=True,
-            body={
-                "name": name,
-                "type": 0,
-                "permission_overwrites": overwrites,
-            },
+            body=body,
         )
+        # Fallback: if creating Forum channel (type 15) fails, fallback to Text channel (type 0)
+        if (status not in (200, 201) or not isinstance(channel, dict) or not channel.get("id")) and channel_type == 15:
+            body["type"] = 0
+            body.pop("available_tags", None)
+            status, channel = self.discord(
+                "POST",
+                f"/guilds/{self.guild_id}/channels",
+                self.bot_token,
+                bot=True,
+                body=body,
+            )
+
         if status not in (200, 201) or not isinstance(channel, dict) or not channel.get("id"):
             raise SetupError(
                 f"Could not create #{name} (HTTP {status}). The bot needs Manage Channels."
             )
-        print(f"  ✓ created #{name} ({channel['id']})")
+        ctype_str = "Forum" if channel.get("type") == 15 else "Text"
+        print(f"  ✓ created #{name} ({ctype_str}, {channel['id']})")
         return str(channel["id"])
 
     @staticmethod
@@ -406,8 +458,29 @@ class Bootstrap:
 
     def provision_discord(self) -> None:
         print("\nCreating/reusing private control channels and four shared webhooks…")
-        for channel_name in ("control", "dashboard", "dm-inbox", "farm-logs", "deals"):
-            self.channels[channel_name] = self.ensure_channel(channel_name)
+        dm_inbox_tags = [
+            {"name": "🔥 High Intent", "moderated": False},
+            {"name": "🛒 Purchase", "moderated": False},
+            {"name": "🔄 Price Check", "moderated": False},
+            {"name": "🛡️ Vouches", "moderated": False},
+            {"name": "💳 Crypto", "moderated": False},
+            {"name": "💵 PayPal", "moderated": False},
+            {"name": "✅ Closed", "moderated": False},
+        ]
+        deals_tags = [
+            {"name": "🔥 High Margin", "moderated": False},
+            {"name": "⚡ Instant Flip", "moderated": False},
+            {"name": "⏳ Active", "moderated": False},
+            {"name": "✅ Claimed", "moderated": False},
+            {"name": "💎 Blade Ball", "moderated": False},
+            {"name": "💰 Arbitrage", "moderated": False},
+        ]
+        self.channels["control"] = self.ensure_channel("control", channel_type=0)
+        self.channels["dashboard"] = self.ensure_channel("dashboard", channel_type=0)
+        self.channels["dm-inbox"] = self.ensure_channel("dm-inbox", channel_type=15, tags=dm_inbox_tags)
+        self.channels["farm-logs"] = self.ensure_channel("farm-logs", channel_type=0)
+        self.channels["deals"] = self.ensure_channel("deals", channel_type=15, tags=deals_tags)
+
         self.webhooks = {
             "LOG_WEBHOOK_URL": self.ensure_webhook(self.channels["farm-logs"], "Farm Logs"),
             "DASHBOARD_WEBHOOK_URL": self.ensure_webhook(self.channels["dashboard"], "Farm Dashboard"),
@@ -453,17 +526,17 @@ class Bootstrap:
         if len(candidates) == 1:
             print(f"  ✓ reusing detected repository for alt {index}: {candidates[0]}")
             return candidates[0]
-        if not self.non_interactive:
+        if not self.non_interactive and not self.quick:
             return self.ask(
                 f"Alt {index} repository name",
                 default=candidates[0] if candidates else default,
                 env=f"ALT_REPO_{index}",
             )
-        return default
+        return candidates[0] if candidates else default
 
     def collect_alt_inputs(self) -> None:
         inferred_count = self.existing_alt_count()
-        if self.non_interactive:
+        if self.non_interactive or self.quick:
             raw_count = os.environ.get("ALT_COUNT", "").strip() or str(inferred_count or 4)
         else:
             raw_count = self.ask(
@@ -493,16 +566,21 @@ class Bootstrap:
             suggested_name = str(
                 body.get("username") or body.get("global_name") or suggested_name
             )
-            ad_type = self.ask(
-                f"Alt {index} initial ad type (live heartbeats can change it)",
-                default=suggested_type, env=f"ALT_TYPE_{index}",
-            ).lower()
+            if self.quick or self.non_interactive:
+                ad_type = (os.environ.get(f"ALT_TYPE_{index}", "").strip().lower()
+                           or suggested_type)
+                name = os.environ.get(f"ALT_NAME_{index}", "").strip() or suggested_name
+            else:
+                ad_type = self.ask(
+                    f"Alt {index} initial ad type (live heartbeats can change it)",
+                    default=suggested_type, env=f"ALT_TYPE_{index}",
+                ).lower()
+                name = self.ask(
+                    f"Alt {index} display name", default=suggested_name,
+                    env=f"ALT_NAME_{index}",
+                )
             if ad_type not in ("sell", "buy"):
                 raise SetupError(f"ALT_TYPE_{index} must be sell or buy.")
-            name = self.ask(
-                f"Alt {index} display name", default=suggested_name,
-                env=f"ALT_NAME_{index}",
-            )
             self.alts.append({
                 "id": str(index),
                 "token": token,
@@ -514,10 +592,12 @@ class Bootstrap:
             alt_username = body.get("username") or body.get("global_name") or "?"
             print(f"✓ Alt {index} validated as @{alt_username} (ID captured)")
 
-        tuning = self.ask(
-            "Optional TUNING_JSON object (leave blank for code defaults)",
-            required=False, env="TUNING_JSON",
-        )
+        tuning = os.environ.get("TUNING_JSON", "").strip()
+        if not tuning and not self.quick and not self.non_interactive:
+            tuning = self.ask(
+                "Optional TUNING_JSON object (leave blank for code defaults)",
+                required=False, env="TUNING_JSON",
+            )
         if tuning:
             try:
                 if not isinstance(json.loads(tuning), dict):
@@ -528,10 +608,13 @@ class Bootstrap:
 
     def determine_github_owner(self) -> None:
         login = self.run_command(["gh", "api", "user", "--jq", ".login"]).stdout.strip()
-        self.github_owner = self.ask(
-            "GitHub owner or organization for the alt repositories",
-            default=login, env="GITHUB_OWNER",
-        )
+        if self.quick or self.non_interactive:
+            self.github_owner = os.environ.get("GITHUB_OWNER", "").strip() or login
+        else:
+            self.github_owner = self.ask(
+                "GitHub owner or organization for the alt repositories",
+                default=login, env="GITHUB_OWNER",
+            )
         if "/" in self.github_owner or not self.github_owner:
             raise SetupError("GITHUB_OWNER must be a username or organization name, not owner/repo.")
         self.existing_repo_names = self.discover_existing_repositories()
@@ -930,6 +1013,11 @@ def main() -> int:
         help="read sensitive inputs from environment variables for CI",
     )
     parser.add_argument(
+        "--quick", "-q",
+        action="store_true",
+        help="quick setup mode: accept smart defaults and prompt only for required tokens and IDs",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="replace existing GitHub secrets and variables without prompting",
@@ -939,16 +1027,28 @@ def main() -> int:
         action="store_true",
         help="stop with an error if any alt self-check fails",
     )
+    parser.add_argument(
+        "--upgrade-forums",
+        action="store_true",
+        help="upgrade existing text #dm-inbox and #deals channels to native Discord Forum channels",
+    )
     args = parser.parse_args()
     force = args.force or os.environ.get("SETUP_FORCE", "").lower() in {"1", "true", "yes"}
     abort_on_failure = (
         args.abort_on_failure
         or os.environ.get("SETUP_ABORT_ON_FAILURE", "").lower() in {"1", "true", "yes"}
     )
+    quick = args.quick or os.environ.get("SETUP_QUICK", "").lower() in {"1", "true", "yes"}
+    upgrade_forums = (
+        args.upgrade_forums
+        or os.environ.get("SETUP_UPGRADE_FORUMS", "").lower() in {"1", "true", "yes"}
+    )
     setup = Bootstrap(
         non_interactive=args.non_interactive,
         force=force,
         abort_on_failure=abort_on_failure,
+        quick=quick,
+        upgrade_forums=upgrade_forums,
     )
     try:
         setup.run()

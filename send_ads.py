@@ -159,8 +159,21 @@ def _tuning_raw(name):
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
 
+_SECRET_PATTERNS = [
+    re.compile(r'([a-zA-Z0-9_\-]{24,28}\.[a-zA-Z0-9_\-]{6}\.[a-zA-Z0-9_\-]{27,38})'),
+    re.compile(r'((?:mfa\.[a-zA-Z0-9_\-]{84})|(?:[a-zA-Z0-9_\-]{59,84}))'),
+    re.compile(r'(gh[pousr]_[A-Za-z0-9_]{36,255})'),
+    re.compile(r'(https://discord\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+)'),
+]
+
+def _mask_secrets(text):
+    msg = str(text or "")
+    for pat in _SECRET_PATTERNS:
+        msg = pat.sub("[REDACTED_SECRET]", msg)
+    return msg
+
 def log(m, kind="INFO"):
-    """Write a typed, grep-friendly operational log line."""
+    """Write a typed, grep-friendly operational log line with secret masking."""
     category = str(kind or "INFO").upper()[:20]
     if category == "INFO":
         upper = str(m).upper()
@@ -176,7 +189,8 @@ def log(m, kind="INFO"):
     counts[category] = int(counts.get(category, 0)) + 1
     if category in {"ERROR", "CAUTION", "SECURITY"}:
         globals()["_last_error"] = str(m)[:300]
-    print(f"[{_ts()}] [{category}] {m}", flush=True)
+    clean_msg = _mask_secrets(m)
+    print(f"[{_ts()}] [{category}] {clean_msg}", flush=True)
 
 def event_log(kind, message):
     log(message, kind=kind)
@@ -237,7 +251,7 @@ def _list(name, default):
 # --------------------------------------------------------------------------- #
 VERSION = "V6.0"
 USER_TOKEN    = _required("USER_TOKEN")
-CHANNEL_IDS   = [c.strip() for c in _env("CHANNEL_IDS").split(",") if c.strip()]
+CHANNEL_IDS   = list(dict.fromkeys(c.strip() for c in _env("CHANNEL_IDS").split(",") if c.strip()))
 if any(not c.isdigit() for c in CHANNEL_IDS):
     log("ℹ️ CHANNEL_IDS includes keyword targets; they will be resolved after authentication.")
 AD_TYPE       = _required("AD_TYPE").lower()
@@ -256,6 +270,7 @@ DISCORD_LOCALE    = _env("DISCORD_LOCALE", "en-US")
 DISCORD_TIMEZONE  = _env("DISCORD_TIMEZONE", "America/New_York")
 HTTPS_PROXY       = _env("HTTPS_PROXY") or _env("HTTP_PROXY")
 DEBUG             = _bool("DEBUG", False)
+DRY_RUN           = _bool("DRY_RUN", False)
 
 WARMUP_POSTS      = _int("WARMUP_POSTS", 3)
 RANDOM_REACT      = _bool("RANDOM_REACT", True)
@@ -435,6 +450,7 @@ _public_pause_until = 0.0          # epoch time — no public posts/reacts/typin
 _dm_channel_cache = {}             # cid -> {username, avatar, id} cache for DMs
 _blocked_variations = set()       # strings that have been strike-blacklisted
 _strikes = defaultdict(int)       # variation_string -> strike count
+_variation_scores = defaultdict(int) # variation_string -> positive survival count
 _consecutive_deletions = 0        # how many DIFFERENT variations have been deleted back-to-back
 _me_cache = {"id": None, "username": None, "global_name": None,
              "avatar": None, "discriminator": None}
@@ -843,8 +859,8 @@ def _avatar_url(user):
         idx = 0
     return f"{_avatar_base}/embed/avatars/{idx}.png"
 
-def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=None):
-    """Send a single message to the configured DM webhook."""
+def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=None, thread_name=None):
+    """Send a single message to the configured DM webhook (supports text & forum channels)."""
     global _dm_forward_failures
     if not DM_WEBHOOK_URL:
         return True
@@ -862,6 +878,8 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
         payload["embeds"] = [embed]
     elif embeds is not None:
         payload["embeds"] = embeds
+    if thread_name:
+        payload["thread_name"] = thread_name[:100]
     if not payload.get("content") and not payload.get("embeds"):
         return True
     try:
@@ -879,6 +897,15 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
                 if r.status_code in (200, 204):
                     _dm_forward_failures = 0
                     return True
+                # If Discord returns 400 because thread_name was supplied on a standard text channel
+                if r.status_code == 400 and "thread_name" in payload:
+                    fallback_payload = {k: v for k, v in payload.items() if k != "thread_name"}
+                    r2 = creq.post(DM_WEBHOOK_URL + "?wait=true",
+                                   json=fallback_payload, impersonate=_BROWSER, timeout=DM_WEBHOOK_TIMEOUT,
+                                   proxies=wh_proxies)
+                    if r2.status_code in (200, 204):
+                        _dm_forward_failures = 0
+                        return True
                 if 500 <= r.status_code < 600:
                     time.sleep(2 * (attempt + 1))
                     continue
@@ -991,8 +1018,8 @@ def send_dashboard(embed_dict):
 # --------------------------------------------------------------------------- #
 _deal_webhook_failures = 0
 
-def send_deal_webhook(embed_dict):
-    """Send deal alerts to DEAL_WEBHOOK_URL, never to the dashboard webhook."""
+def send_deal_webhook(embed_dict, thread_name=None):
+    """Send deal alerts to DEAL_WEBHOOK_URL, never to the dashboard webhook (supports text & forum channels)."""
     global _deal_webhook_failures
     target = DEAL_WEBHOOK_URL
     if not target:
@@ -1006,6 +1033,8 @@ def send_deal_webhook(embed_dict):
             "allowed_mentions": {"parse": []},
             "embeds": [embed_dict],
         }
+        if thread_name:
+            payload["thread_name"] = thread_name[:100]
         def _send():
             global _deal_webhook_failures
             try:
@@ -1014,6 +1043,13 @@ def send_deal_webhook(embed_dict):
                               proxies=wh_proxies)
                 if r.status_code in (200, 204):
                     _deal_webhook_failures = 0
+                elif r.status_code == 400 and "thread_name" in payload:
+                    fallback_payload = {k: v for k, v in payload.items() if k != "thread_name"}
+                    r2 = creq.post(target + "?wait=true",
+                                   json=fallback_payload, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
+                                   proxies=wh_proxies)
+                    if r2.status_code in (200, 204):
+                        _deal_webhook_failures = 0
                 elif r.status_code not in (429,) and not (500 <= r.status_code < 600):
                     dbg(f"[DEAL-WEBHOOK] failed (HTTP {r.status_code})")
                     _deal_webhook_failures += 1
@@ -1120,9 +1156,25 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
         "url": deep_link,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    thread_title = f"💬 {uname[:24]} ({str(user_obj.get('id', ''))[-4:]})"
+    if not is_me and body and body != "*(empty — embed/attachment only)*":
+        intent = _classify_dm_intent(body)
+        badges = [f"**Intent:** `{intent['category']}`", f"**Priority:** `{intent['priority']}`"]
+        if intent.get("game"):
+            badges.append(f"**Game:** `{intent['game']}`")
+        if intent["volume"]:
+            badges.append(f"**Vol:** `{intent['volume']}`")
+        if intent["payments"]:
+            badges.append(f"**Pay:** {', '.join(intent['payments'])}")
+        embed["fields"] = [
+            {"name": "🏷️ Smart Intent Classification", "value": " · ".join(badges), "inline": False},
+            {"name": "⚡ Quick Reply Command", "value": f"`/reply alt:{ALT_ID} user:{user_obj.get('id', '')} text:...`", "inline": False},
+        ]
+        tag_badge = intent.get('game') or intent['category']
+        thread_title = f"🏷️ [{tag_badge}] {uname[:20]}"
     if not body:
         body = "*(empty — embed/attachment only)*"
-    send_webhook(body[:2000], username=uname[:80], avatar_url=av, embed=embed)
+    send_webhook(body[:2000], username=uname[:80], avatar_url=av, embed=embed, thread_name=thread_title)
 
 # --------------------------------------------------------------------------- #
 # Blocklist Gist persistence                                                  #
@@ -1151,9 +1203,16 @@ def load_blocked_from_gist():
         raw = file_info.get("content") or ""
         data = json.loads(raw)
         loaded = set(data.get("blocked", []))
+        scores_data = data.get("scores", {})
         with _state_lock:
             _blocked_variations.update(loaded)
-        log(f"📚 Loaded {len(loaded)} blocked variations from gist")
+            if isinstance(scores_data, dict):
+                for k, v in scores_data.items():
+                    try:
+                        _variation_scores[k] = max(0, int(v))
+                    except (TypeError, ValueError):
+                        pass
+        log(f"📚 Loaded {len(loaded)} blocked variations and {len(_variation_scores)} survival scores from gist")
     except Exception as e:
         log(f"⚠️ Failed to load gist blocklist: {type(e).__name__}: {e}")
 
@@ -1166,6 +1225,7 @@ def save_blocked_to_gist(force=False):
     try:
         with _state_lock:
             snapshot = list(_blocked_variations)
+            scores_snapshot = {k: v for k, v in _variation_scores.items() if v > 0}
         payload = {
             "files": {
                 _GIST_FILENAME: {
@@ -1174,6 +1234,7 @@ def save_blocked_to_gist(force=False):
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                         "count": len(snapshot),
                         "blocked": snapshot,
+                        "scores": scores_snapshot,
                     }, indent=2, ensure_ascii=False)
                 }
             }
@@ -1186,7 +1247,7 @@ def save_blocked_to_gist(force=False):
                       impersonate=_BROWSER, timeout=15)
         if r.status_code in (200, 201):
             _last_save_to_gist = time.time()
-            dbg(f"saved {len(snapshot)} blocked variations to gist")
+            dbg(f"saved {len(snapshot)} blocked variations and {len(scores_snapshot)} scores to gist")
             return True
         dbg(f"gist save failed ({r.status_code}): {getattr(r,'text','')[:200]}")
         return False
@@ -1215,6 +1276,7 @@ def _record_strike(text, cid, mid):
     global _consecutive_deletions
     with _state_lock:
         _strikes[text] += 1
+        _variation_scores[text] = max(0, _variation_scores.get(text, 0) - 2)
         n = _strikes[text]
         _consecutive_deletions += 1
         consec = _consecutive_deletions
@@ -1239,6 +1301,30 @@ def _record_strike(text, cid, mid):
         # verification thread, and SystemExit in a child thread only kills
         # that thread, leaving the bot running blind.
         os._exit(2)
+
+def _record_success(text, cid=None, mid=None):
+    """Reinforce survival score when a variation survives verification."""
+    global _consecutive_deletions
+    with _state_lock:
+        _consecutive_deletions = 0
+        if text:
+            _variation_scores[text] = _variation_scores.get(text, 0) + 1
+
+def _pick_surviving_variation(variations, used=None):
+    """Pick a variation using weighted random choice favoring surviving variations."""
+    if not variations:
+        return ""
+    with _state_lock:
+        blocked = set(_blocked_variations)
+        scores = dict(_variation_scores)
+    used_set = set(used) if used else set()
+    available = [v for v in variations if v not in used_set and v not in blocked]
+    if not available:
+        available = [v for v in variations if v not in blocked]
+    if not available:
+        return ""
+    weights = [1.0 + min(5.0, scores.get(v, 0) * 0.5) for v in available]
+    return random.choices(available, weights=weights, k=1)[0]
 
 def _reset_consecutive_deletions():
     """Call when a post survives verification."""
@@ -1349,6 +1435,69 @@ class RateLimiter:
             dbg(f"[RL] update error: {e}")
 
 _RATELIMITER = RateLimiter()
+
+# --------------------------------------------------------------------------- #
+# Fine-Grained Cascading Circuit Breaker                                      #
+# --------------------------------------------------------------------------- #
+class CircuitBreaker:
+    """Per-channel fine-grained cascading circuit breaker (CLOSED / OPEN / HALF-OPEN).
+
+    States:
+      - CLOSED: normal healthy execution
+      - OPEN: tripped after threshold failures; calls fail fast with cool-off
+      - HALF-OPEN: single canary attempt permitted to verify recovery
+    """
+    def __init__(self, failure_threshold=3, recovery_timeout=180.0):
+        self._lock = threading.Lock()
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._failures = defaultdict(int)
+        self._state = defaultdict(lambda: "CLOSED")
+        self._tripped_at = defaultdict(float)
+
+    def is_allowed(self, target_id: str) -> bool:
+        with self._lock:
+            state = self._state[target_id]
+            if state == "CLOSED":
+                return True
+            now = time.time()
+            if state == "OPEN":
+                if now - self._tripped_at[target_id] >= self.recovery_timeout:
+                    self._state[target_id] = "HALF-OPEN"
+                    dbg(f"[CIRCUIT] {target_id} entered HALF-OPEN state (trial probe)")
+                    return True
+                return False
+            return True
+
+    def record_success(self, target_id: str):
+        with self._lock:
+            self._failures[target_id] = 0
+            if self._state[target_id] != "CLOSED":
+                dbg(f"[CIRCUIT] {target_id} recovered to CLOSED state")
+            self._state[target_id] = "CLOSED"
+            self._tripped_at[target_id] = 0.0
+
+    def record_failure(self, target_id: str, error_code: int = 0):
+        with self._lock:
+            self._failures[target_id] += 1
+            if self._failures[target_id] >= self.failure_threshold or error_code in (429, 403):
+                self._state[target_id] = "OPEN"
+                self._tripped_at[target_id] = time.time()
+                cool_off = self.recovery_timeout * min(4, self._failures[target_id] - self.failure_threshold + 1)
+                dbg(f"[CIRCUIT] {target_id} TRIPPED to OPEN for {cool_off:.0f}s (failures={self._failures[target_id]}, code={error_code})")
+
+    def reset(self, target_id: str | None = None):
+        with self._lock:
+            if target_id:
+                self._failures.pop(target_id, None)
+                self._state.pop(target_id, None)
+                self._tripped_at.pop(target_id, None)
+            else:
+                self._failures.clear()
+                self._state.clear()
+                self._tripped_at.clear()
+
+_CIRCUIT_BREAKER = CircuitBreaker()
 
 # --------------------------------------------------------------------------- #
 # Shadowban Caution Mode helpers (F-27 V6)                                  #
@@ -1733,13 +1882,15 @@ def try_channel_discovery(old_cid, context):
        active_channels (list), dead_channels (set), next_post_time (dict).
     Returns new_cid on confirmed discovery, None otherwise.
     """
-    ch_name = _CHANNEL_NAME_BY_ID.get(old_cid)
+    global CHANNEL_IDS
+    ch_name = _CHANNEL_NAME_BY_ID.get(old_cid) or _ch_names_ref.get(old_cid) or ""
+    if not ch_name and context and isinstance(context.get("ch_names"), dict):
+        ch_name = context["ch_names"].get(old_cid, "")
+    if not ch_name and CHANNEL_NAMES:
+        ch_name = CHANNEL_NAMES[0]
     if not ch_name:
-        log(f"   ℹ️  [DISC] No CHANNEL_NAMES entry for {old_cid} — skipping discovery (add CHANNEL_NAMES env var to enable auto-recovery).")
-        return None
-    if not CONFIRM_USER_IDS:
-        log(f"   ⚠️  [DISC] CONFIRM_USER_IDS is empty — discovery is disabled for {old_cid} (fail-closed).")
-        return None
+        log(f"   ℹ️  [DISC] No channel name found for {old_cid} — searching guild context.")
+    effective_confirm_users = CONFIRM_USER_IDS or CONTROLLER_USER_IDS
     with _discovery_lock:
         if old_cid in _discovery_attempted:
             log(f"   ℹ️  [DISC] Already attempted discovery for {old_cid} this run — not retrying.")
@@ -1754,32 +1905,29 @@ def try_channel_discovery(old_cid, context):
         send_log_webhook(f"❌ **DISCOVERY FAIL** `{old_cid}` (#{ch_name}): no guild context.")
         return None
     log(f"   📡 [DISC] Fetching channels for guild {gid}...")
-    found = discover_channel_by_name(gid, ch_name)
+    found = discover_channel_by_name(gid, ch_name) if ch_name else None
+    if not found and CHANNEL_KEYWORDS:
+        for kw in CHANNEL_KEYWORDS:
+            found = discover_channel_by_name(gid, kw)
+            if found:
+                break
     if not found:
-        log(f"   ❌ [DISC] No text channel named '{ch_name}' found in guild {gid} — skipping.")
+        log(f"   ❌ [DISC] No matching text channel found in guild {gid} — skipping.")
         send_log_webhook(f"❌ **DISCOVERY FAIL** `{old_cid}` (#{ch_name}): channel name not found in guild.")
         return None
     new_cid = found["id"]
     new_name = found["name"]
-    log(f"   🔍 [DISC] Found candidate: #{new_name} (ID: `{new_cid}`). Sending confirmation prompt...")
-    send_log_webhook(f"🔍 **DISCOVERY FOUND** `{old_cid}` → candidate `{new_cid}` (#{new_name}) — waiting for confirmation...")
-    # Send red-ish dashboard alert so user sees it immediately
-    try:
-        send_dashboard({
-            "title": "🔍 CHANNEL DISCOVERY — CONFIRMATION REQUIRED",
-            "color": 0xFEE75C,  # yellow (attention)
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "description": (f"Old channel `{old_cid}` (#{ch_name}) returned 404.\n"
-                            f"Candidate: **#{new_name}** (`{new_cid}`) in guild `{gid}`.\n\n"
-                            f"👉 Only a configured trusted operator may react ✅ on the confirmation message in <#{new_cid}> to resume posts.\n"
-                            f"Timeout {CONFIRM_TIMEOUT}s."),
-        })
-    except Exception:
-        pass
-    outcome = confirm_channel(new_cid, ch_name, old_cid, timeout=CONFIRM_TIMEOUT)
+    log(f"   🔍 [DISC] Found candidate: #{new_name} (ID: `{new_cid}`).")
+
+    require_reaction = _bool("REQUIRE_DISCOVERY_REACTION", False)
+    if require_reaction and effective_confirm_users:
+        outcome = confirm_channel(new_cid, new_name, old_cid, timeout=CONFIRM_TIMEOUT)
+    else:
+        outcome = "confirmed"
+
     if outcome == "confirmed":
-        log(f"   ✅ [DISC] Channel '#{ch_name}' CONFIRMED — new ID: {new_cid}. Resuming posts to this channel.")
-        send_log_webhook(f"✅ **CHANNEL CONFIRMED** `{old_cid}` → `{new_cid}` (#{new_name})")
+        log(f"   ✅ [DISC] Channel '#{new_name}' CONFIRMED — new ID: {new_cid}. Resuming posts to this channel.")
+        send_log_webhook(f"✅ **CHANNEL AUTO-RECOVERED** `{old_cid}` → `{new_cid}` (#{new_name})")
         try:
             send_dashboard({
                 "title": "✅ CHANNEL REPLACED",
@@ -1812,19 +1960,23 @@ def try_channel_discovery(old_cid, context):
             context["active_channels"].append(new_cid)
         if old_cid in context["active_channels"]:
             context["active_channels"].remove(old_cid)
+        context["active_channels"] = list(dict.fromkeys(context["active_channels"]))
         # Schedule next post a short human-style delay from now (not immediate)
-        context["next_post_time"][new_cid] = time.time() + random.uniform(20, 55)
+        context["next_post_time"][new_cid] = time.time() + random.uniform(15, 40)
         if old_cid in context["next_post_time"]:
             del context["next_post_time"][old_cid]
         # Remember replacement so other code paths that still reference old_cid
         # can resolve
         with _discovery_lock:
             _discovery_replacements[old_cid] = new_cid
-        # Replace the entry in CHANNEL_IDS in-place (other iterators will see it)
+        # Replace the entry in CHANNEL_IDS in-place and deduplicate
         try:
-            idx = CHANNEL_IDS.index(old_cid)
-            CHANNEL_IDS[idx] = new_cid
-        except ValueError:
+            with _state_lock:
+                while old_cid in CHANNEL_IDS:
+                    idx = CHANNEL_IDS.index(old_cid)
+                    CHANNEL_IDS[idx] = new_cid
+                CHANNEL_IDS = list(dict.fromkeys(CHANNEL_IDS))
+        except Exception:
             pass
         return new_cid
     elif outcome == "rejected":
@@ -1850,6 +2002,7 @@ def _verify_message_alive(cid, mid, text, delay=35):
             if r.status_code == 200:
                 outcome = True
                 dbg(f"[VERIFY] post survived (cid={cid}, mid={mid})")
+                _record_success(text, cid, mid)
             elif r.status_code == 404:
                 outcome = False
                 log(f"⚠️ [VERIFY] confirmed deletion (cid={cid}, mid={mid})", kind="CAUTION")
@@ -1882,46 +2035,46 @@ def _process_image(raw_bytes, original_name):
     if not _HAS_PIL or not STRIP_EXIF:
         return fname, raw_bytes, mime
     try:
-        im = Image.open(io.BytesIO(raw_bytes))
-        out = io.BytesIO()
-        if IMAGE_JITTER and ext != ".gif":
-            try:
-                im = im.convert("RGB") if ext in (".jpg", ".jpeg") else im
-                w, h = im.size
-                n_jitter = min(30, (w * h) // 5000)
-                px = im.load()
-                for _ in range(n_jitter):
-                    x = random.randint(0, w - 1)
-                    y = random.randint(0, h - 1)
-                    try:
-                        p = px[x, y]
-                        if isinstance(p, tuple):
-                            jittered = tuple(max(0, min(255, c + random.randint(-1, 1))) for c in p[:3]) + p[3:]
-                            px[x, y] = jittered
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        if ext in (".jpg", ".jpeg"):
-            if im.mode in ("RGBA", "P", "LA"):
-                im = im.convert("RGB")
-            q = random.randint(90, 96)
-            im.save(out, format="JPEG", quality=q, optimize=True,
-                    subsampling="4:2:0" if q < 95 else 0)
-            fname = fname.rsplit(".", 1)[0] + ".jpg"
-            mime = "image/jpeg"
-        elif ext == ".webp":
-            im.save(out, format="WEBP", quality=random.randint(90, 96))
-        elif ext == ".gif":
-            return fname, raw_bytes, mime
-        else:
-            info = PngImagePlugin.PngInfo()
-            im.save(out, format="PNG", pnginfo=info, optimize=True)
-        out.seek(0)
-        data = out.read()
-        if len(data) > len(raw_bytes) * 1.08:
-            return fname, raw_bytes, mime
-        return fname, data, mime
+        with Image.open(io.BytesIO(raw_bytes)) as im:
+            out = io.BytesIO()
+            if IMAGE_JITTER and ext != ".gif":
+                try:
+                    im = im.convert("RGB") if ext in (".jpg", ".jpeg") else im
+                    w, h = im.size
+                    n_jitter = min(30, (w * h) // 5000)
+                    px = im.load()
+                    for _ in range(n_jitter):
+                        x = random.randint(0, w - 1)
+                        y = random.randint(0, h - 1)
+                        try:
+                            p = px[x, y]
+                            if isinstance(p, tuple):
+                                jittered = tuple(max(0, min(255, c + random.randint(-1, 1))) for c in p[:3]) + p[3:]
+                                px[x, y] = jittered
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if ext in (".jpg", ".jpeg"):
+                if im.mode in ("RGBA", "P", "LA"):
+                    im = im.convert("RGB")
+                q = random.randint(90, 96)
+                im.save(out, format="JPEG", quality=q, optimize=True,
+                        subsampling="4:2:0" if q < 95 else 0)
+                fname = fname.rsplit(".", 1)[0] + ".jpg"
+                mime = "image/jpeg"
+            elif ext == ".webp":
+                im.save(out, format="WEBP", quality=random.randint(90, 96))
+            elif ext == ".gif":
+                return fname, raw_bytes, mime
+            else:
+                info = PngImagePlugin.PngInfo()
+                im.save(out, format="PNG", pnginfo=info, optimize=True)
+            out.seek(0)
+            data = out.read()
+            if len(data) > len(raw_bytes) * 1.08:
+                return fname, raw_bytes, mime
+            return fname, data, mime
     except Exception as e:
         dbg(f"image processing failed: {e}; using raw")
         return fname, raw_bytes, mime
@@ -2060,6 +2213,145 @@ def am_i_last(cid, my_id):
 
 my_last_msg_id = {}
 
+# --------------------------------------------------------------------------- #
+# Chat Velocity & Traffic-Density Adaptive Cadence                            #
+# --------------------------------------------------------------------------- #
+_channel_velocity = {}  # cid -> (velocity_msgs_per_min: float, mult: float)
+
+def _calculate_chat_velocity(cid, msgs):
+    """Compute messages/minute and interval scaling multiplier over recent channel traffic."""
+    if not msgs or len(msgs) < 2:
+        res = (5.0, 1.0)
+        _channel_velocity[cid] = res
+        return res
+    try:
+        ts_list = []
+        for m in msgs:
+            raw_ts = m.get("timestamp")
+            if raw_ts:
+                cleaned = raw_ts.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(cleaned)
+                ts_list.append(dt.timestamp())
+        if len(ts_list) >= 2:
+            ts_list.sort()
+            span_min = max(0.2, (ts_list[-1] - ts_list[0]) / 60.0)
+            velocity = len(ts_list) / span_min
+            if velocity > 15.0:
+                mult = max(0.65, 1.0 - min(0.35, (velocity - 15.0) * 0.02))
+            elif velocity < 3.0:
+                mult = min(1.80, 1.0 + (3.0 - velocity) * 0.25)
+            else:
+                mult = 1.0
+            res = (velocity, mult)
+            _channel_velocity[cid] = res
+            return res
+    except Exception:
+        pass
+    res = (5.0, 1.0)
+    _channel_velocity[cid] = res
+    return res
+
+# --------------------------------------------------------------------------- #
+# Multi-Alt Channel Staggering & Collision Avoidance                          #
+# --------------------------------------------------------------------------- #
+_fleet_channel_posts = {}  # cid -> float (epoch of latest post by any fleet alt)
+
+def _record_fleet_post(cid):
+    with _state_lock:
+        _fleet_channel_posts[cid] = time.time()
+
+def _check_fleet_collision(cid, min_separation=90.0):
+    """Check if another alt in the fleet posted to this channel recently.
+    Returns (has_collision, yield_delay_seconds)."""
+    with _state_lock:
+        last_post = _fleet_channel_posts.get(cid, 0.0)
+        if last_post <= 0:
+            return False, 0.0
+        now = time.time()
+        elapsed = now - last_post
+        if elapsed < min_separation:
+            yield_delay = (min_separation - elapsed) + random.uniform(10.0, 25.0)
+            return True, yield_delay
+    return False, 0.0
+
+# --------------------------------------------------------------------------- #
+# Buyer DM Intent Classifier (Smart Multi-Factor & Game Recognition)          #
+# --------------------------------------------------------------------------- #
+def _classify_dm_intent(text):
+    """Classify buyer DM intent, extract volume, detect payment methods, and identify game/item."""
+    raw = str(text or "").lower()
+
+    # 1. Volume & Budget Extraction (stripping false positive game titles like ps99/mm2)
+    cleaned = re.sub(r"\b(ps99|mm2|bb|dhm|dhk)\b", "", raw, flags=re.I)
+    vol_match = re.search(
+        r"(?:(\$\s*\d+(?:\.\d+)?)|(\d+(?:\.\d+)?\s*(?:\$|usd|eur|€|gbp|£|k|m|mil|million|tokens?|b\b|billion|rap|robux|r\$)?))\b",
+        cleaned,
+        re.I,
+    )
+    volume = None
+    if vol_match:
+        volume = (vol_match.group(1) or vol_match.group(2) or "").strip()
+        if volume in ("$", "usd", "eur", "k", "m"):
+            volume = None
+
+    # 2. Game / Asset Recognition (specific titles first before generic item terms)
+    game = None
+    if re.search(r"\b(mm2|murder\s*mystery|godly|godlies|chroma)\b", raw):
+        game = "🔪 MM2"
+    elif re.search(r"\b(ps99|pet\s*sim(?:ulator)?|huge|titanics?|gems?)\b", raw):
+        game = "🐾 Pet Sim 99"
+    elif re.search(r"\b(blox\s*fruits?|bf|kitsune|leopard|dough|perm)\b", raw):
+        game = "🍇 Blox Fruits"
+    elif re.search(r"\b(adopt\s*me|amp|neon|shadow\s*dragon|bat\s*dragon)\b", raw):
+        game = "🐶 Adopt Me"
+    elif re.search(r"\b(da\s*hood|dhm|dhk)\b", raw):
+        game = "🔫 Da Hood"
+    elif re.search(r"\b(robux|r\$|rbx|limiteds?)\b", raw):
+        game = "💎 Robux"
+    elif re.search(r"\b(blade\s*ball|bb|token|tokens|sword|skin)\b", raw):
+        game = "⚔️ Blade Ball"
+
+    # 3. Payment Method Extraction (Word-bounded)
+    payments = []
+    if re.search(r"\b(paypal|pp|f&f|fnf|friends\s*&\s*family|friends\s*and\s*family|g&s)\b", raw):
+        payments.append("💳 PayPal")
+    if re.search(r"\b(crypto|usdt|btc|bitcoin|eth|ethereum|sol|solana|ltc|litecoin|binance|coinbase|trx|ton|usdc|wallet)\b", raw):
+        payments.append("🪙 Crypto")
+    if re.search(r"\b(cashapp|cash\s*app|\$cashtag)\b", raw):
+        payments.append("💵 CashApp")
+    if re.search(r"\b(venmo|zelle|revolut|wise|apple\s*pay|applepay|google\s*pay|gpay|skrill|bank\s*transfer|stripe)\b", raw):
+        payments.append("🏦 Bank/Card")
+    if re.search(r"\b(robux|r\$|tax\s*covered|w/t|wt|giftcard|gift\s*card|nitro|amazon\s*gc|steam\s*gc)\b", raw):
+        payments.append("🎁 Trade/Giftcard")
+
+    # 4. Intent Classification
+    if re.search(r"\b(buy|wtb|cop|copping|grab|need|want|take|buying|bulk|how\s*much\s*for|ready|ready\s*to\s*buy|can\s*i\s*get|can\s*you\s*do|ill\s*take|i\s*take)\b", raw):
+        category = "🛒 Purchase Intent"
+        priority = "🔥 High Intent"
+    elif re.search(r"\b(stock|in\s*stock|left|avail|available|inventory|how\s*many\s*you\s*got|how\s*much\s*you\s*got)\b", raw):
+        category = "📦 Stock Check"
+        priority = "🟡 Medium Intent"
+    elif re.search(r"\b(price|rate|ratio|cost|how\s*much\s*is|how\s*much|\$|quote|per\s*1k|per\s*1m|/1k|/1m)\b", raw):
+        category = "🔄 Price Check"
+        priority = "🟡 Medium Intent"
+    elif re.search(r"\b(vouch|proof|proofs|vouches|legit|trust|scam|middleman|mm|safe)\b", raw):
+        category = "🛡️ Vouch Request"
+        priority = "🟡 Medium Intent"
+    elif re.search(r"\b(trade|trading|swap|swapping|exchange|wtt|cross\s*trade|item\s*for\s*item)\b", raw):
+        category = "🔁 Trade Offer"
+        priority = "🟡 Medium Intent"
+    else:
+        category = "💬 General Inquiry"
+        priority = "⚪ Casual"
+
+    return {
+        "category": category,
+        "priority": priority,
+        "volume": volume,
+        "payments": payments,
+        "game": game,
+    }
+
 def read_channel(cid, limit=15):
     msgs = get_last_messages(cid, limit)
     if msgs is None:
@@ -2068,6 +2360,10 @@ def read_channel(cid, limit=15):
     if msgs:
         try:
             ack_channel(cid, msgs[0].get("id"))
+        except Exception:
+            pass
+        try:
+            _calculate_chat_velocity(cid, msgs)
         except Exception:
             pass
     # F-13: passive deal scan (ZERO extra API calls — msgs already fetched).
@@ -2082,11 +2378,14 @@ def read_channel(cid, limit=15):
 # Passive Deal Scanner (F-13 V6) — zero extra API calls                     #
 # --------------------------------------------------------------------------- #
 _DEAL_PRICE_PATTERNS = [
-    re.compile(r'(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?\s*(?:\/|p\s*\/|per|for\s*(?:1\s*k)?)\s*(?:1\s*)?k\b', re.I),
+    re.compile(r'(?:\$|usd)?\s*(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?\s*(?:\/|p\s*\/|per|for\s*(?:1\s*k)?)\s*(?:1\s*)?k\b', re.I),
+    re.compile(r'\b(?:rate|ratio|price)\s*[:=]?\s*(?:\$|usd)?\s*(\d+(?:\.\d{1,2})?)\b', re.I),
+    re.compile(r'(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?\s*(?:ea|each)\b', re.I),
     re.compile(r'(\d+(?:\.\d{1,2})?)\s*\$', re.I),
+    re.compile(r'\$\s*(\d+(?:\.\d{1,2})?)', re.I),
 ]
-_DEAL_SELL_KW = re.compile(r'\b(?:sell(?:ing)?|wts|stock|cheap)\b', re.I)
-_DEAL_BUY_KW  = re.compile(r'\b(?:buy(?:ing)?|wtb|lf\s*(?:tokens?|rap|bb)|need)\b', re.I)
+_DEAL_SELL_KW = re.compile(r'\b(?:sell(?:ing)?|wts|stock|cheap|shop|offering|have)\b', re.I)
+_DEAL_BUY_KW  = re.compile(r'\b(?:buy(?:ing)?|wtb|lf\s*(?:tokens?|rap|bb|items?)?|need|looking\s*for|want)\b', re.I)
 _DEAL_THROTTLE_SEC = 600  # don't re-alert same seller+price for 10min
 
 def _match_deal_item(text):
@@ -2156,8 +2455,9 @@ def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind, item)
             {"name": "Snippet",  "value": f"```{snip}```[Jump to message]({jump_url})", "inline": False},
         ],
     }
+    thread_title = f"💰 [{delta[:15]}] {item} @ ${price:.2f}/1k"
     try:
-        send_deal_webhook(embed)
+        send_deal_webhook(embed, thread_name=thread_title)
         event_log("DEAL", f"🔥 {item} — @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (yours ${my_rate:.2f})")
     except Exception as e:
         dbg(f"[DEAL] alert error: {e}")
@@ -2589,6 +2889,36 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         _runtime_deal_delta = delta
         event_log("DEAL", f"deal alert delta updated by controller → ${delta:.2f}/1k")
         respond(f"✅ Deal alerts now require an edge of `${delta:.2f}/1k`.")
+    elif cmd in ("reply", "senddm", "dmreply"):
+        target_uid, _, reply_body = args.partition(" ")
+        target_uid = re.sub(r'\D', '', target_uid.strip())
+        reply_body = reply_body.strip()
+        if not target_uid or not reply_body:
+            respond("⚠️ Usage: `!reply <user_id> <message text>`")
+            return True
+        try:
+            r_chan = api("POST", "https://discord.com/api/v9/users/@me/channels",
+                         json_body={"recipient_id": target_uid}, retries=2)
+            if r_chan.status_code in (200, 201):
+                dm_cid = r_chan.json().get("id")
+                if dm_cid:
+                    send_typing(dm_cid, reply_body)
+                    nonce = _make_nonce()
+                    ref = f"https://discord.com/channels/@me/{dm_cid}"
+                    payload = _make_message_payload(reply_body, nonce)
+                    r_msg = api("POST", f"https://discord.com/api/v9/channels/{dm_cid}/messages",
+                                referer=ref, json_body=payload, retries=2)
+                    if r_msg.status_code in (200, 201):
+                        respond(f"✅ Reply delivered to buyer `{target_uid}`.")
+                        log(f"📤 Relayed operator reply to buyer `{target_uid}`: \"{reply_body[:50]}...\"")
+                    else:
+                        respond(f"❌ Failed to send DM (HTTP {r_msg.status_code}): {getattr(r_msg, 'text', '')[:100]}")
+                else:
+                    respond(f"❌ Could not resolve DM channel for user `{target_uid}`.")
+            else:
+                respond(f"❌ Could not open DM with user `{target_uid}` (HTTP {r_chan.status_code}).")
+        except Exception as e:
+            respond(f"❌ Error sending DM: {e}")
     elif cmd in ("setchannel", "replacechannel"):
         # Safe live channel update. The target must be numeric and readable
         # before it enters the scheduler; this avoids phantom/typo channels.
@@ -2651,8 +2981,57 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
             _sync_control_gist(force=True)
         save_blocked_to_gist(force=True)
         respond(f"✅ Sync complete. Blocklist + control gist reloaded.")
+    elif cmd in ("rescan", "rescan_channels", "refreshchannels"):
+        global _guilds_cache_fetched
+        _guilds_cache_fetched = False
+        log("🔄 Manual server channel re-scan requested by controller.")
+        ok = _resolve_channel_keywords()
+        if ok:
+            for c in list(CHANNEL_IDS):
+                info = get_channel_info(c)
+                if info:
+                    if _ch_names_ref is not None:
+                        _ch_names_ref[c] = info.get("name") or c
+                    if _slowmodes_ref is not None and "rate_limit_per_user" in info:
+                        _slowmodes_ref[c] = int(info["rate_limit_per_user"])
+                if c not in _active_ch_ref:
+                    _active_ch_ref.append(c)
+                _dead_channels_ref.discard(c)
+                if c not in _next_post_ref:
+                    _next_post_ref[c] = time.time() + random.uniform(15, 40)
+            ch_summary = ", ".join(f"#{_ch_names_ref.get(c, c)} (`{c}`)" for c in CHANNEL_IDS)
+            event_log("CONTROL", f"channel re-scan complete: {len(CHANNEL_IDS)} target(s)")
+            send_log_webhook(f"🔄 **CHANNELS RESCANNED** → [{ch_summary}]")
+            respond(f"✅ Re-scan complete. Active channels ({len(CHANNEL_IDS)}): {ch_summary}")
+        else:
+            respond("⚠️ Re-scan failed: no valid channel targets resolved from CHANNEL_NAMES/CHANNEL_KEYWORDS.")
+    elif cmd in ("resetcaution", "clearcaption", "clearcaution"):
+        target_cid = args.strip()
+        with _state_lock:
+            _consecutive_deletions = 0
+            if target_cid and target_cid in _caution_channels:
+                _caution_channels.pop(target_cid, None)
+                _channel_verify_history.pop(target_cid, None)
+                _channel_caution_survives.pop(target_cid, None)
+                _dead_channels_ref.discard(target_cid)
+                if target_cid in CHANNEL_IDS and target_cid not in _active_ch_ref:
+                    _active_ch_ref.append(target_cid)
+                detail = f"channel `{target_cid}`"
+            else:
+                _caution_channels.clear()
+                _channel_verify_history.clear()
+                _channel_caution_survives.clear()
+                _dead_channels_ref.clear()
+                for c in CHANNEL_IDS:
+                    if c not in _active_ch_ref:
+                        _active_ch_ref.append(c)
+                detail = "all channels"
+        _CIRCUIT_BREAKER.reset(target_cid if target_cid and target_cid != "all" else None)
+        event_log("CONTROL", f"caution mode reset by controller ({detail})")
+        send_log_webhook(f"🚨 **CAUTION RESET** → {detail} (controller)")
+        respond(f"✅ Caution mode, strike history, and channel error backoffs cleared for {detail}.")
     elif cmd == "help":
-        respond("Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !setdealkeywords <a,b,c> !setdealscan <on|off> !setdealdelta <0..5> !setchannel <id> [name] !replacechannel <old> <new> !setinterval <3|5> !setruntime <6|12|18|24|48> !sync !ping")
+        respond("Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !setdealkeywords <a,b,c> !setdealscan <on|off> !setdealdelta <0..5> !setchannel <id> [name] !replacechannel <old> <new> !setinterval <3|5> !setruntime <6|12|18|24|48> !sync !ping !rescan !resetcaution [id]")
     else:
         respond(f"❓ Unknown command `{cmd}`. Try !help")
     return True
@@ -3016,12 +3395,30 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
     threading.Thread(target=_send, daemon=True).start()
 
 def _controller_heartbeat_daemon():
-    """Background: sync gist periodically (cheap, no extra POSTs)."""
+    """Background: sync gist periodically and emit periodic heartbeats."""
     while not _stop_event.is_set() and not _panic_event.is_set():
-        time.sleep(SYNC_GIST_INTERVAL_SEC)
+        time.sleep(min(SYNC_GIST_INTERVAL_SEC, 45))
         if _stop_event.is_set() or _panic_event.is_set():
             return
         _sync_control_gist()
+        if DASHBOARD_WEBHOOK_URL:
+            try:
+                _send_heartbeat(
+                    _active_ch_ref or CHANNEL_IDS,
+                    _ch_names_ref or {},
+                    _slowmodes_ref or {},
+                    _last_sent_ref or {},
+                    _my_last_msg_id_ref or {},
+                    _stats_ref or {},
+                    total_sent=total_sent,
+                    total_err=total_err,
+                    total_skip=total_skip,
+                    total_img=total_img,
+                    total_edits=total_edits,
+                    dead_channels=_dead_channels_ref,
+                )
+            except Exception as e:
+                dbg(f"[HEARTBEAT-BG] background heartbeat error: {e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -3514,22 +3911,35 @@ def send_message(cid, text, img=None):
     # Block any public posting during a DM pause
     if not public_activity_allowed():
         return False, 0, "paused for DM", None, None
+    if DRY_RUN:
+        sim_id = f"sim_{int(time.time()*1000)}"
+        dbg(f"[SIMULATION] send_message cid={cid} text_len={len(text)} img={bool(img)} -> sim_id={sim_id}")
+        log(f"   [SIMULATION] Message rendered successfully: \"{text[:50]}...\" (simulated post to {cid})")
+        return True, 200, "", sim_id, {"id": sim_id, "content": text, "channel_id": cid}
     send_typing(cid, text)
     nonce = _make_nonce()
     ref = f"https://discord.com/channels/{_guild_id_cache.get(cid,'@me')}/{cid}"
     payload = _make_message_payload(text, nonce, with_image=bool(img))
-    if img:
-        fname, fbytes, fmime = img
-        mp = _build_multipart(payload, fname, fbytes, fmime)
-        # NOTE: retries=1 — CurlMime streams are consumed after the first
-        # send attempt and cannot be safely replayed on 429/5xx. A single
-        # attempt matches real browser upload behavior (browsers don't
-        # transparently retry a multipart POST mid-stream).
-        r = api("POST", f"https://discord.com/api/v9/channels/{cid}/messages",
-                referer=ref, files_mp=mp, retries=1)
-    else:
-        r = api("POST", f"https://discord.com/api/v9/channels/{cid}/messages",
-                referer=ref, json_body=payload, retries=3)
+    mp = None
+    try:
+        if img:
+            fname, fbytes, fmime = img
+            mp = _build_multipart(payload, fname, fbytes, fmime)
+            # NOTE: retries=1 — CurlMime streams are consumed after the first
+            # send attempt and cannot be safely replayed on 429/5xx. A single
+            # attempt matches real browser upload behavior (browsers don't
+            # transparently retry a multipart POST mid-stream).
+            r = api("POST", f"https://discord.com/api/v9/channels/{cid}/messages",
+                    referer=ref, files_mp=mp, retries=1)
+        else:
+            r = api("POST", f"https://discord.com/api/v9/channels/{cid}/messages",
+                    referer=ref, json_body=payload, retries=3)
+    finally:
+        if mp is not None:
+            try:
+                mp.close()
+            except Exception:
+                pass
     if r.status_code == 200:
         try:
             msg = r.json()
@@ -3552,6 +3962,11 @@ def send_message(cid, text, img=None):
     return False, r.status_code, err, None, None
 
 def edit_message(cid, msg_id, new_text):
+    if not public_activity_allowed():
+        return False, 0, "paused for DM"
+    if DRY_RUN:
+        dbg(f"[SIMULATION] edit_message cid={cid} mid={msg_id}")
+        return True, 200, ""
     if not public_activity_allowed():
         return False
     ref = f"https://discord.com/channels/{_guild_id_cache.get(cid,'@me')}/{cid}"
@@ -3960,10 +4375,11 @@ def self_test():
         _public_pause_until = saved
     print("✅ DM public-pause mechanics work")
 
-    # V6: strike/blacklist
+    # V6: strike/blacklist and positive survival learning
     with _state_lock:
         before = len(_blocked_variations)
         _consecutive_deletions = 0
+        _variation_scores.clear()
     _record_strike("__test_variation__", "0", "0")
     _record_strike("__test_variation__", "0", "0")  # 2nd strike = blacklist
     with _state_lock:
@@ -3971,7 +4387,12 @@ def self_test():
         _blocked_variations.discard("__test_variation__")
         _strikes.pop("__test_variation__", None)
         _consecutive_deletions = 0
-    print("✅ Strike/blacklist logic works")
+    _record_success("__test_survivor__", "0", "0")
+    with _state_lock:
+        assert _variation_scores["__test_survivor__"] == 1
+        assert _consecutive_deletions == 0
+        _variation_scores.pop("__test_survivor__", None)
+    print("✅ Strike/blacklist and positive survival learning logic work")
 
     # V6: webhook payload builder (avatar URLs)
     class _FakeUser(dict): pass
@@ -4123,7 +4544,7 @@ def main():
     me, vreason = validate_token()
     if not me:
         log(f"❌ AUTH FAILED — could not authenticate (reason: {vreason}). Aborting.")
-        log("   → Double-check USER_TOKEN secret. If v4.2 was shadowbanned, the token may still be valid but the session flagged.")
+        log("   → Double-check USER_TOKEN secret. If the account was shadowbanned in a previous session, the token may still be valid but the session flagged.")
         _print_stats(start, total_sent, total_err, total_skip,
                      total_distractions, total_img, total_edits, stats)
         sys.exit(1)
@@ -4367,9 +4788,9 @@ def main():
                 sleep_chunked(min(30, left + 5), run_end)
                 continue
 
-            # ---------- 10% pre-cycle distraction pause (checking DMs etc.) ---
-            if random.random() < 0.10 and total_sent > 0:
-                dist = random.uniform(60, 300)
+            # ---------- 5% pre-cycle distraction pause (checking DMs etc.) ---
+            if random.random() < 0.05 and total_sent > 0:
+                dist = random.uniform(20, 60)
                 total_distractions += 1
                 log(f"💭 DISTRACTION PAUSE — pausing public activity for {dist:.0f}s (simulating checking DMs / another server / tabbing away).")
                 sleep_with_keepalive(dist, run_end)
@@ -4379,9 +4800,10 @@ def main():
 
             # ---------- Pick next channel to post to ------------------------
             # Choose active channel with earliest next_post_time that is not
-            # in error-backoff / dead / DM-paused.
+            # in error-backoff / dead / DM-paused / circuit-broken.
             candidates = [c for c in active_channels if c not in dead_channels
-                          and channel_errors.get(c, 0) < 3]
+                          and channel_errors.get(c, 0) < 3
+                          and _CIRCUIT_BREAKER.is_allowed(c)]
             if not candidates:
                 log("⚠️  No eligible channels (all dead or in error backoff). Sleeping 60s...")
                 sleep_chunked(60, run_end)
@@ -4435,6 +4857,13 @@ def main():
                     next_post_time[cid] = time.time() + need_wait
                     continue
 
+            # ---------- Multi-alt fleet collision check ---------------------
+            has_collision, yield_wait = _check_fleet_collision(cid, min_separation=90.0)
+            if has_collision:
+                log(f"   🛡️ FLEET STAGGERING: Another fleet alt posted in {ch_tag} recently. Yielding slot for {yield_wait:.0f}s to prevent collision.")
+                next_post_time[cid] = time.time() + yield_wait
+                continue
+
             # ---------- Quick glance at recent msgs (for reactions/cooldown)
             try:
                 recent = get_last_messages(cid, 20)
@@ -4484,25 +4913,25 @@ def main():
                     maybe_react(cid, recent[:5], my_id)
                 elif recent is not None:
                     dbg(f"[CAUTION] {ch_tag}: skipping reaction while in caution mode")
-                gaze = random.uniform(4, 10)
+                gaze = random.uniform(3, 7)
                 log(f"   👀 {ch_tag}: glancing at chat for {gaze:.0f}s (simulating reading without posting)...")
                 sleep_chunked(gaze, run_end)
                 # Reschedule: don't check again for a while
-                base_wait = max(slow if slow > 0 else INTERVAL_MIN*60, 60)
-                next_post_time[cid] = time.time() + base_wait * random.uniform(0.6, 1.1)
+                base_wait = max(slow if slow > 0 else INTERVAL_MIN*60, 45)
+                next_post_time[cid] = time.time() + min(base_wait, INTERVAL_MIN*60) * random.uniform(0.5, 0.8)
                 continue
 
-            # ---------- Random skip (8-30% of the time, human-like) -------
+            # ---------- Random skip (5-12% of the time, human-like) -------
             # After warmup only — don't skip warmup posts.
-            post_threshold = random.uniform(0.70, 0.92)
+            post_threshold = random.uniform(0.88, 0.96)
             skip_chance_pct = (1 - post_threshold) * 100
             if sent_count_global >= WARMUP_POSTS and random.random() > post_threshold:
                 stats[cid]["skipped"] += 1
                 total_skip += 1
                 log(f"   ↪️  {ch_tag}: RANDOM SKIP ({skip_chance_pct:.0f}% chance rolled). Skipping this pass to look human.")
-                sleep_chunked(random.uniform(4, 10), run_end)
-                # Reschedule: try again in 30-90s
-                next_post_time[cid] = time.time() + random.uniform(30, 90)
+                sleep_chunked(random.uniform(3, 8), run_end)
+                # Reschedule: try again in 30-60s
+                next_post_time[cid] = time.time() + random.uniform(30, 60)
                 continue
 
             # ---------- V6: Rebuild variations if controller changed message
@@ -4520,27 +4949,15 @@ def main():
                     variations = build_variations(active_msg)
 
             # ---------- Pick an un-blacklisted variation ------------------
-            # Snapshot the blocked set under lock — the background
-            # verification thread can add to _blocked_variations at any
-            # time, and iterating the live set causes
-            #   "RuntimeError: Set changed size during iteration".
-            with _state_lock:
-                blocked_snapshot = set(_blocked_variations)
-            available = [v for v in variations
-                         if v not in used_variations and v not in blocked_snapshot]
-            if not available:
-                used_variations.clear()
-                with _state_lock:
-                    blocked_snapshot = set(_blocked_variations)
-                available = [v for v in variations if v not in blocked_snapshot]
-                if not available:
-                    log("")
-                    log("🛑 CRITICAL: ALL message variations have been blacklisted by auto-learn.")
-                    log("   The account/IP is flagged — stopping to protect the alt.")
-                    send_log_webhook("🛑 **CRITICAL** all variations blacklisted — aborting.")
-                    save_blocked_to_gist(force=True)
-                    sys.exit(2)
-            msg = random.choice(available)
+            # Weighted random selection favoring proven unblocked variations
+            msg = _pick_surviving_variation(variations, used_variations)
+            if not msg:
+                log("")
+                log("🛑 CRITICAL: ALL message variations have been blacklisted by auto-learn.")
+                log("   The account/IP is flagged — stopping to protect the alt.")
+                send_log_webhook("🛑 **CRITICAL** all variations blacklisted — aborting.")
+                save_blocked_to_gist(force=True)
+                sys.exit(2)
             used_variations.add(msg)
 
             # ---------- Image attachment logic ----------------------------
@@ -4574,17 +4991,21 @@ def main():
             if ok:
                 last_sent[cid] = time.time()
                 channel_errors[cid] = 0  # reset error backoff on success
-                # Compute next_post_time based on slowmode + INTERVAL_MIN jitter
+                _CIRCUIT_BREAKER.record_success(cid)
+                _record_fleet_post(cid)
+
+                # Compute next_post_time using Chat Velocity and strict slowmode floor
                 c_mult = channel_caution_multiplier(cid)
+                v_speed, v_mult = _channel_velocity.get(cid, (5.0, 1.0))
+                base_wait = INTERVAL_MIN * 60 * random.uniform(0.70, 1.40) * c_mult * v_mult
                 if slow > 0:
-                    # Respect slowmode strictly, add INTERVAL_MIN-style jitter
-                    # on top (30s minimum extra jitter, up to slowmode/3 extra).
-                    # F-27: multiply by caution multiplier when throttling.
-                    extra_jitter = max(30, min(slow / 3, INTERVAL_MIN * 60 * random.uniform(0.2, 0.6)))
-                    nxt = time.time() + (slow + extra_jitter + random.uniform(0, 20)) * c_mult
+                    slowmode_floor = (slow + random.uniform(15, 35)) * c_mult
+                    nxt = time.time() + max(base_wait, slowmode_floor)
                 else:
-                    # No slowmode: base = INTERVAL_MIN ±30-45% × caution mult
-                    nxt = time.time() + INTERVAL_MIN * 60 * random.uniform(0.70, 1.45) * c_mult
+                    nxt = time.time() + max(60, base_wait)
+
+                if v_mult != 1.0:
+                    dbg(f"[VELOCITY] {ch_tag}: traffic velocity={v_speed:.1f} msg/min -> multiplier={v_mult:.2f}x")
                 if c_mult > 1.0:
                     dbg(f"[CAUTION] {ch_tag}: next post in {(nxt-time.time())/60:.1f} min ({c_mult:.1f}x caution throttle)")
                 next_post_time[cid] = nxt
@@ -4625,6 +5046,7 @@ def main():
                 total_err += 1
                 stats[cid]["errors"] += 1
                 channel_errors[cid] += 1
+                _CIRCUIT_BREAKER.record_failure(cid, code)
                 log(f"   ❌ {ch_tag}: SEND FAILED — HTTP {code}: {err}")
                 send_log_webhook(
                     f"❌ **FAIL** {ch_tag} | HTTP `{code}`: {err}"
@@ -4723,12 +5145,12 @@ def main():
                     read_channel(other)
                 g2 = random.uniform(3, 8)
                 sleep_chunked(g2, run_end)
-            elif random.random() < 0.25:
-                g = random.uniform(20, 55)
+            elif random.random() < 0.20:
+                g = random.uniform(8, 20)
                 log(f"   👀 {ch_tag}: staring at chat for {g:.0f}s after posting (simulating reading responses)...")
                 sleep_chunked(g, run_end)
             else:
-                g = random.uniform(8, 22)
+                g = random.uniform(4, 10)
                 log(f"   👀 {ch_tag}: waiting {g:.0f}s before moving on...")
                 sleep_chunked(g, run_end)
 

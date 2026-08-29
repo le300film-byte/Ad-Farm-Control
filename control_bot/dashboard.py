@@ -120,9 +120,11 @@ def build_summary_embed(mgr: AltStateManager) -> discord.Embed:
         workflow = alt.workflow_status or "no workflow data"
         if alt.workflow_conclusion:
             workflow += f"/{alt.workflow_conclusion}"
+        health = mgr.get_health_index(alt.alt_id)
+        spark = mgr.get_activity_sparkline(alt.alt_id)
         lines.append(
             f"{dot} **{alt.name}** {_mode_icon(alt.ad_type)} `{alt.ad_type or 'unknown'}` "
-            f"@ **{_rate_str(alt)}** · `{alt.status}` · "
+            f"@ **{_rate_str(alt)}** · Health **{health}%** `[{spark}]` · `{alt.status}` · "
             f"sent **{alt.total_sent}** · err **{alt.total_errors}** · "
             f"ch **{alt.active_channels}/{alt.total_channels}** · "
             f"cadence **{alt.interval_min}m/{alt.runtime_hours}h** · "
@@ -168,8 +170,9 @@ def build_channels_embed(mgr: AltStateManager) -> discord.Embed:
             last_post = _safe_float(raw.get("last_post"))
             alive = bool(raw.get("alive"))
             dot = "🟢" if alive else "⚫"
+            yield_rating = mgr.get_channel_yield(alt.alt_id, cid)
             rows.append(
-                f"{dot} **{alt.name} · #{name}** `{cid}` · sent **{sent}** · "
+                f"{dot} **{alt.name} · #{name}** `{cid}` · Yield **{yield_rating}** · sent **{sent}** · "
                 f"err **{errors}** · last {_fmt_ago(last_post)}"
             )
     if not rows:
@@ -233,6 +236,7 @@ def build_single_alt_embed(mgr: AltStateManager, alt_id: int) -> discord.Embed:
     embed.add_field(name="Mode", value=f"`{alt.ad_type or '—'}`", inline=True)
     embed.add_field(name="Rate", value=_rate_str(alt), inline=True)
     embed.add_field(name="Status", value=f"`{alt.status}`", inline=True)
+    embed.add_field(name="Health Score", value=f"**{mgr.get_health_index(alt.alt_id)}%** `[{mgr.get_activity_sparkline(alt.alt_id)}]`", inline=True)
     embed.add_field(name="Cadence / runtime", value=f"{alt.interval_min}m / {alt.runtime_hours}h", inline=True)
     embed.add_field(name="Online", value="yes" if alt.online else "no", inline=True)
     embed.add_field(name="Sent / errors / skips", value=f"{alt.total_sent} / {alt.total_errors} / {alt.total_skips}", inline=True)
@@ -266,4 +270,102 @@ def build_single_alt_embed(mgr: AltStateManager, alt_id: int) -> discord.Embed:
             )
     if channel_lines:
         embed.add_field(name="Channel detail", value="\n".join(channel_lines)[:1024], inline=False)
+    return embed
+
+
+def build_topology_embed(mgr: AltStateManager) -> discord.Embed:
+    """Render the live topological relationship graph of the fleet."""
+    mgr.mark_offline_stale(config.OFFLINE_AFTER_SEC)
+    alts = mgr.all()
+    embed = discord.Embed(
+        title="🌐 FLEET TOPOLOGY & ROUTING GRAPH",
+        color=_BLUE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if not alts:
+        embed.description = "No configured alts in topology."
+        return embed
+
+    nodes = []
+    for a in alts:
+        dot, _ = _status_dot(a)
+        squad_tag = f"[{a.squad}]" if a.squad else "[Unassigned]"
+        health = mgr.get_health_index(a.alt_id)
+        node = [
+            f"**{dot} Alt {a.alt_id}: {a.name}** {squad_tag} · Health `{health}%`",
+            f"   ├─ 📍 **Target Channels ({len(a.channels)})**:",
+        ]
+        if a.channels:
+            for cid, ch in list(a.channels.items())[:6]:
+                yield_grade = mgr.get_channel_yield(a.alt_id, cid)
+                ch_name = ch.get("name") or cid
+                node.append(f"   │  └─ `#{ch_name}` (`{cid}`) [{yield_grade}]")
+            if len(a.channels) > 6:
+                node.append(f"   │  └─ *+ {len(a.channels)-6} more channels*")
+        else:
+            node.append("   │  └─ *No channels active*")
+
+        egress_info = f"{a.ip_org or 'Direct'} ({a.ip_country or 'Unknown'})"
+        node.append(f"   ├─ 🛡️ **Egress Routing**: `{egress_info}`")
+        node.append(f"   └─ 🔄 **Sync Bridge**: Gist `{_fmt_ago(a.last_heartbeat_ts)}`")
+        nodes.append("\n".join(node))
+
+    embed.description = "\n\n".join(nodes)[:4000]
+    return embed
+
+
+def build_diagnose_embed(mgr: AltStateManager, alt_id: int) -> discord.Embed:
+    """Render the 'Why Did This Happen?' causal diagnostic explorer embed."""
+    mgr.mark_offline_stale(config.OFFLINE_AFTER_SEC)
+    alt = mgr.get(alt_id)
+    if not alt:
+        return discord.Embed(
+            title="❓ Unknown Alt",
+            description=f"Alt `{alt_id}` is not configured.",
+            color=_RED,
+        )
+    dot, color = _status_dot(alt)
+    health = mgr.get_health_index(alt_id)
+    timeline = mgr.get_causal_timeline(alt_id)
+
+    embed = discord.Embed(
+        title=f"🔍 Causal Event Explorer · {dot} {alt.name} (#{alt.alt_id})",
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Current Health Index", value=f"**{health}%** `[{mgr.get_activity_sparkline(alt_id)}]`", inline=True)
+    embed.add_field(name="Operational Status", value=f"`{alt.status}` (online: {alt.online})", inline=True)
+    embed.add_field(name="Active Policy", value=f"`{alt.policy_template}` ({alt.interval_min}m interval)", inline=True)
+
+    if alt.status == "caution":
+        assessment = "⚠️ **CAUTION MODE ACTIVE**: Message deletions or verification misses detected. The alt is throttling interval (2x) and sending text-only."
+        action = f"Run `/resetcaution alt:{alt_id}` after verifying channel anti-spam or waiting for the 3-post survival streak."
+    elif alt.status == "ip_pause":
+        assessment = "🚨 **EGRESS IP PAUSE**: Outbound IP failed datacenter/WARP check. Public posting paused."
+        action = f"Check Cloudflare WARP connection or restart workflow run with `/start alt:{alt_id}`."
+    elif alt.status == "error":
+        assessment = f"❌ **ERROR STATE**: Last recorded error: `{alt.last_error or 'Unknown exception'}`"
+        action = f"Inspect recent execution output with `/logs alt:{alt_id}`."
+    elif alt.status == "active":
+        assessment = "✅ **HEALTHY**: Transmission cadence is steady, circuit breakers are CLOSED, and verification survival rate is optimal."
+        action = "No operator intervention required."
+    else:
+        assessment = f"ℹ️ **STATUS: {alt.status.upper()}**: Alt is currently {alt.status}."
+        action = f"Use `/start alt:{alt_id}` to dispatch a new posting cycle if desired."
+
+    embed.add_field(name="Root-Cause Diagnostic Analysis", value=assessment, inline=False)
+    embed.add_field(name="Recommended Operator Action", value=action, inline=False)
+
+    if timeline:
+        history_lines = []
+        for ev in reversed(timeline[-8:]):
+            ts_str = _fmt_ago(ev["ts"])
+            ev_type = ev.get("type", "event").upper()
+            desc = ev.get("description", "")
+            detail = f" — `{ev['details']}`" if ev.get("details") else ""
+            history_lines.append(f"• **[{ts_str}]** `{ev_type}`: {desc}{detail}")
+        embed.add_field(name="Recent Causal Chain Timeline", value="\n".join(history_lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="Recent Causal Chain Timeline", value="*No causal state transitions recorded during current run.*", inline=False)
+
     return embed

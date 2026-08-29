@@ -51,6 +51,11 @@ class AltState:
     deal_alert_delta: float = 0.05
     last_error: str = ""
     log_counts: dict = field(default_factory=dict)
+    squad: str = ""
+    tags: list[str] = field(default_factory=list)
+    policy_template: str = "balanced"
+    causal_history: list = field(default_factory=list)
+    hourly_activity: list = field(default_factory=lambda: [0] * 24)
 
 
 class AltStateManager:
@@ -58,7 +63,7 @@ class AltStateManager:
 
     def __init__(self, alt_names: dict[int, str], alt_ids=None,
                  offline_after_sec: float = 300):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._offline_after_sec = offline_after_sec
         configured = set(alt_ids) if alt_ids is not None else set(alt_names)
         self._alts: dict[int, AltState] = {
@@ -104,6 +109,11 @@ class AltStateManager:
             self._alts.pop(alt_id, None)
             self._log_buffer.pop(alt_id, None)
             return True
+
+    def is_online(self, alt_id: int) -> bool:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            return bool(alt and alt.online)
 
     def all(self) -> list[AltState]:
         with self._lock:
@@ -167,8 +177,13 @@ class AltStateManager:
             for field_name in ("uptime_sec", "last_post_ts", "run_started_ts", "last_deal_ts"):
                 if field_name in payload:
                     setattr(alt, field_name, self._float_value(payload[field_name], getattr(alt, field_name)))
-            status = self._text_value(payload, "status", alt.status, 20)
+            old_status = alt.status
+            status = self._text_value(payload, "status", alt.status, 20).lower()
+            if status == "running":
+                status = "active"
             if status in {"active", "paused", "caution", "ip_pause", "afk", "stopped", "error", "offline", "starting", "queued"}:
+                if old_status != status:
+                    self.record_causal_event(alt_id, "status_transition", f"Status changed from {old_status} -> {status}", details=payload.get("last_error", ""))
                 alt.status = status
             if isinstance(payload.get("warnings"), list):
                 alt.warnings = [str(item)[:300] for item in payload["warnings"][:25]]
@@ -348,3 +363,174 @@ class AltStateManager:
         with self._lock:
             if alt_id in self._log_buffer:
                 self._log_buffer[alt_id].clear()
+
+    def reset_caution(self, alt_id: int, channel_id: str | None = None) -> bool:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return False
+            if alt.status in {"caution", "ip_pause"}:
+                alt.status = "active"
+            if channel_id:
+                cid_str = str(channel_id).strip()
+                ch = alt.channels.get(cid_str)
+                if ch:
+                    ch["errors"] = 0
+                    ch["slowmode"] = 0
+                    ch["alive"] = True
+            else:
+                for ch in alt.channels.values():
+                    ch["errors"] = 0
+                    ch["slowmode"] = 0
+                    ch["alive"] = True
+            alt.warnings = [w for w in alt.warnings if "caution" not in str(w).lower() and "strike" not in str(w).lower()]
+            alt.last_error = ""
+            return True
+
+    def get_health_index(self, alt_id: int) -> int:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return 0
+            if not alt.online or alt.status in {"offline", "stopped"}:
+                return 0
+            score = 100
+            if alt.status == "caution":
+                score -= 35
+            elif alt.status in {"ip_pause", "error"}:
+                score -= 60
+            elif alt.status in {"paused", "afk"}:
+                score -= 10
+            total_ops = alt.total_sent + alt.total_errors
+            if total_ops > 0:
+                err_ratio = alt.total_errors / total_ops
+                score -= int(err_ratio * 40)
+            if alt.last_heartbeat_ts > 0:
+                age = time.time() - alt.last_heartbeat_ts
+                if age > 180:
+                    score -= min(30, int((age - 180) / 10))
+            return max(0, min(100, score))
+
+    def get_activity_sparkline(self, alt_id: int) -> str:
+        with self._lock:
+            buf = self._log_buffer.get(alt_id, [])
+            if not buf:
+                return "      "
+            now = time.time()
+            buckets = [0] * 6
+            for ts, _emo, _col, _body in buf:
+                age = now - ts
+                idx = int(age // 600)
+                if 0 <= idx < 6:
+                    buckets[5 - idx] += 1
+            max_v = max(buckets) if max(buckets) > 0 else 1
+            chars = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+            return "".join(chars[min(len(chars) - 1, int((v / max_v) * (len(chars) - 1)))] for v in buckets)
+
+    def get_channel_yield(self, alt_id: int, channel_id: str) -> str:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt or channel_id not in alt.channels:
+                return "N/A"
+            ch = alt.channels[channel_id]
+            sent = ch.get("sent", 0)
+            err = ch.get("errors", 0)
+            alive = ch.get("alive", True)
+            if not alive or ch.get("slowmode", 0) >= 300:
+                return "⚠️ Caution"
+            if sent + err == 0:
+                return "✨ Fresh"
+            ratio = sent / max(1, sent + err * 2)
+            if ratio >= 0.95:
+                return "🟢 A+"
+            if ratio >= 0.80:
+                return "🟢 A"
+            if ratio >= 0.60:
+                return "🟡 B"
+            return "🔴 C"
+
+    def record_causal_event(self, alt_id: int, event_type: str, description: str, details: str = "") -> None:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return
+            event = {
+                "ts": time.time(),
+                "type": str(event_type)[:30],
+                "description": str(description)[:200],
+                "details": str(details)[:300],
+            }
+            alt.causal_history.append(event)
+            if len(alt.causal_history) > 25:
+                alt.causal_history = alt.causal_history[-25:]
+
+    def get_causal_timeline(self, alt_id: int) -> list[dict]:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return []
+            return list(alt.causal_history)
+
+    def set_squad(self, alt_id: int, squad: str) -> bool:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return False
+            alt.squad = str(squad or "").strip()[:50]
+            self.record_causal_event(alt_id, "squad_assigned", f"Assigned to squad '{alt.squad or 'None'}'")
+            return True
+
+    def set_tags(self, alt_id: int, tags: list[str]) -> bool:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return False
+            alt.tags = [str(t).strip()[:30] for t in tags if str(t).strip()][:10]
+            return True
+
+    def get_squad_members(self, squad: str) -> list[AltState]:
+        target = str(squad or "").strip().lower()
+        with self._lock:
+            return [alt for alt in self._alts.values() if alt.squad.lower() == target]
+
+    def get_all_squads(self) -> dict[str, list[int]]:
+        with self._lock:
+            squads: dict[str, list[int]] = {}
+            for alt in self._alts.values():
+                sq = alt.squad or "Unassigned"
+                squads.setdefault(sq, []).append(alt.alt_id)
+            return squads
+
+    def set_policy_template(self, alt_id: int, template: str) -> bool:
+        t_clean = str(template or "").strip().lower()
+        if t_clean not in {"stealth", "aggressive", "peak_hour", "balanced"}:
+            return False
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return False
+            alt.policy_template = t_clean
+            if t_clean == "stealth":
+                alt.interval_min = 5
+            elif t_clean in {"aggressive", "peak_hour"}:
+                alt.interval_min = 3
+            elif t_clean == "balanced":
+                alt.interval_min = 5
+            self.record_causal_event(alt_id, "policy_applied", f"Applied policy template '{t_clean}'")
+            return True
+
+    def get_hourly_heatmap(self, alt_id: int) -> str:
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return "░" * 24
+            buf = self._log_buffer.get(alt_id, [])
+            now = time.time()
+            hours = [0] * 24
+            for ts, _emo, _col, _body in buf:
+                age_hr = int((now - ts) // 3600)
+                if 0 <= age_hr < 24:
+                    hours[23 - age_hr] += 1
+            max_h = max(hours) if max(hours) > 0 else 1
+            shades = ["░", "▒", "▓", "█"]
+            return "".join(shades[min(len(shades) - 1, int((v / max_h) * (len(shades) - 1)))] for v in hours)

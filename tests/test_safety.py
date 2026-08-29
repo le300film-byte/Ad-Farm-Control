@@ -155,10 +155,71 @@ class SafetyRegressionTests(unittest.TestCase):
             names,
             {
                 "run", "stop", "pause", "resume", "altadd", "altupdate", "altlist", "altremove",
-                "setprice", "setmode", "setmessage", "setdealkeywords", "setdealscan", "setdealdelta", "setchannel", "replacechannel", "setinterval", "setruntime",
-                "sync", "status", "logs", "deals", "pingalt", "selfcheck", "clearlogs", "runs", "refresh", "dashboard", "help",
+                "setprice", "setmode", "setmessage", "setdealkeywords", "setdealscan", "setdealdelta", "setchannel", "replacechannel", "rescan_channels", "resetcaution", "channels", "uploadimage", "setinterval", "setruntime",
+                "settings", "sync", "status", "logs", "deals", "pingalt", "selfcheck", "clearlogs", "runs", "refresh", "dashboard", "help",
+                "diagnose", "topology", "simulate", "squad", "policy", "canary", "reply",
             },
         )
+
+    def test_rescan_and_reset_caution_controller_handlers(self):
+        replies = []
+        with mock.patch.object(send_ads, "CONTROLLER_USER_IDS", {"owner"}), \
+             mock.patch.object(send_ads, "CHANNEL_IDS", ["111", "222"]), \
+             mock.patch.object(send_ads, "_active_ch_ref", ["111", "222"]), \
+             mock.patch.object(send_ads, "_ch_names_ref", {"111": "room-1", "222": "room-2"}), \
+             mock.patch.object(send_ads, "_slowmodes_ref", {"111": 10, "222": 20}), \
+             mock.patch.object(send_ads, "_caution_channels", {"111": True, "222": True}), \
+             mock.patch.object(send_ads, "_controller_reply", side_effect=lambda _cid, text: replies.append(text)), \
+             mock.patch.object(send_ads, "event_log"), \
+             mock.patch.object(send_ads, "send_log_webhook"), \
+             mock.patch.object(send_ads, "get_channel_info", side_effect=lambda cid: {"type": 0, "name": f"verified-{cid}", "rate_limit_per_user": 0}):
+            self.assertTrue(send_ads._handle_controller_dm("dm", "owner", "!rescan"))
+            self.assertIn("111", send_ads.CHANNEL_IDS)
+            self.assertIn("222", send_ads.CHANNEL_IDS)
+            self.assertEqual(send_ads._ch_names_ref["111"], "verified-111")
+
+            self.assertTrue(send_ads._handle_controller_dm("dm", "owner", "!resetcaution 111"))
+            self.assertFalse(send_ads._caution_channels.get("111", False))
+            self.assertTrue(send_ads._caution_channels.get("222", False))
+
+            self.assertTrue(send_ads._handle_controller_dm("dm", "owner", "!resetcaution all"))
+            self.assertEqual(send_ads._caution_channels, {})
+
+    def test_variation_positive_reinforcement_survival_scoring(self):
+        with send_ads._state_lock:
+            send_ads._variation_scores.clear()
+            send_ads._blocked_variations.clear()
+
+        send_ads._record_success("var_a")
+        send_ads._record_success("var_a")
+        send_ads._record_success("var_b")
+
+        self.assertEqual(send_ads._variation_scores.get("var_a"), 2)
+        self.assertEqual(send_ads._variation_scores.get("var_b"), 1)
+
+        # var_a with score 2 has weight 1 + 2*2 = 5, var_b has weight 1 + 1*2 = 3
+        # picking among [var_a, var_b] should select non-empty and non-blocked
+        picked = send_ads._pick_surviving_variation(["var_a", "var_b"])
+        self.assertIn(picked, ["var_a", "var_b"])
+
+    def test_state_manager_reset_caution(self):
+        from control_bot.alt_state import AltStateManager
+
+        manager = AltStateManager({1: "Configured"}, alt_ids=[1])
+        manager.set_channel(1, "111", "room1")
+        manager.set_channel(1, "222", "room2")
+        alt = manager.get(1)
+        alt.channels["111"]["slowmode"] = 60
+        alt.channels["222"]["slowmode"] = 120
+        alt.status = "caution"
+
+        manager.reset_caution(1, "111")
+        self.assertEqual(alt.channels["111"]["slowmode"], 0)
+        self.assertEqual(alt.channels["222"]["slowmode"], 120)
+
+        manager.reset_caution(1, None)
+        self.assertEqual(alt.channels["222"]["slowmode"], 0)
+        self.assertEqual(alt.status, "active")
 
     def test_state_manager_add_update_remove_alt_lifecycle_is_live_and_bounded(self):
         from control_bot.alt_state import AltStateManager
@@ -308,6 +369,93 @@ class SafetyRegressionTests(unittest.TestCase):
         self.assertEqual(alt.uptime_sec, 0.0)
         self.assertEqual(alt.status, "offline")
         self.assertEqual(len(build_all(manager)), 3)
+
+    def test_circuit_breaker_trips_and_recovers(self):
+        import time
+        cb = send_ads.CircuitBreaker(failure_threshold=2, recovery_timeout=0.1)
+        target = "123456789012345678"
+        self.assertTrue(cb.is_allowed(target))
+        
+        # 1st failure - still allowed
+        cb.record_failure(target, error_code=500)
+        self.assertTrue(cb.is_allowed(target))
+        
+        # 2nd failure - trips OPEN
+        cb.record_failure(target, error_code=500)
+        self.assertFalse(cb.is_allowed(target))
+        
+        # Sleep for recovery timeout to transition to HALF-OPEN
+        time.sleep(0.15)
+        self.assertTrue(cb.is_allowed(target))
+        
+        # Record success - transitions to CLOSED
+        cb.record_success(target)
+        self.assertTrue(cb.is_allowed(target))
+
+    def test_secret_masking_scrubs_tokens_and_webhooks(self):
+        raw_msg = (
+            "Auth failed with token mfa.AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdEfGhIjKl "
+            "and webhook https://discord.com/api/webhooks/123456789012345678/abc-XYZ_123456 "
+            "and gh token ghp_1234567890abcdefghijklmnopqrstuvwxyz"
+        )
+        masked = send_ads._mask_secrets(raw_msg)
+        self.assertNotIn("mfa.", masked)
+        self.assertNotIn("https://discord.com/api/webhooks/", masked)
+        self.assertNotIn("ghp_", masked)
+        self.assertIn("[REDACTED_SECRET]", masked)
+
+    def test_composite_alt_health_and_yield_grades(self):
+        from control_bot.alt_state import AltStateManager
+        manager = AltStateManager({1: "Alt 1"}, alt_ids=[1])
+        manager.update_from_heartbeat(1, {
+            "type": "heartbeat",
+            "status": "active",
+            "total_sent": 50,
+            "total_errors": 0,
+            "channels": {
+                "111": {"id": "111", "name": "trade-ads", "sent": 25, "errors": 0, "slowmode": 0, "status": "active"},
+                "222": {"id": "222", "name": "market", "sent": 25, "errors": 1, "slowmode": 120, "status": "caution"},
+            }
+        })
+        self.assertGreaterEqual(manager.get_health_index(1), 70)
+        sparkline = manager.get_activity_sparkline(1)
+        self.assertIsInstance(sparkline, str)
+        self.assertEqual(len(sparkline), 6)
+        
+        grade_111 = manager.get_channel_yield(1, "111")
+        grade_222 = manager.get_channel_yield(1, "222")
+        self.assertIn(grade_111, ["🟢 A+", "🟢 A", "🟡 B", "🔴 C", "✨ Fresh", "⚠️ Caution"])
+        self.assertIn(grade_222, ["🟢 A+", "🟢 A", "🟡 B", "🔴 C", "✨ Fresh", "⚠️ Caution"])
+
+    def test_chat_velocity_and_intent_classifier(self):
+        import time
+        from datetime import datetime, timezone
+        # 1. Intent classifier test
+        buyer_msg = "yo bro I want to buy 100k tokens via paypal or crypto, you got stock?"
+        intent = send_ads._classify_dm_intent(buyer_msg)
+        self.assertEqual(intent["category"], "🛒 Purchase Intent")
+        self.assertEqual(intent["priority"], "🔥 High Intent")
+        self.assertEqual(intent["volume"], "100k")
+        self.assertTrue(any("PayPal" in p for p in intent["payments"]))
+        self.assertTrue(any("Crypto" in p for p in intent["payments"]))
+
+        # 2. Chat velocity calculation test
+        now = time.time()
+        fake_msgs = [
+            {"timestamp": datetime.fromtimestamp(now - 10, timezone.utc).isoformat()},
+            {"timestamp": datetime.fromtimestamp(now - 30, timezone.utc).isoformat()},
+            {"timestamp": datetime.fromtimestamp(now - 50, timezone.utc).isoformat()},
+        ]
+        vel, mult = send_ads._calculate_chat_velocity("test_cid", fake_msgs)
+        self.assertGreater(vel, 0.0)
+        self.assertGreater(mult, 0.0)
+
+    def test_multi_alt_fleet_collision_staggering(self):
+        cid = "999888777666555444"
+        send_ads._record_fleet_post(cid)
+        has_collision, wait_needed = send_ads._check_fleet_collision(cid, min_separation=90.0)
+        self.assertTrue(has_collision)
+        self.assertGreaterEqual(wait_needed, 80.0)
 
 
 if __name__ == "__main__":

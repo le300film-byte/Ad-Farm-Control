@@ -12,7 +12,8 @@ By the end you will have:
 - one private repository per configured alt, with its own Actions job and
   Cloudflare WARP step;
 - two private Gists for the blocklist and live control overrides; and
-- four webhooks total: DM inbox, dashboard, consolidated farm logs, and separate deals.
+- four webhooks total: DM inbox, dashboard, consolidated farm logs, and separate deals; and
+- an actionable architectural roadmap in [`ROADMAP.md`](./ROADMAP.md).
 
 > **Important:** Discord user-account automation is not an official Discord
 > bot feature and can violate Discord's Terms of Service. Use only accounts
@@ -128,6 +129,21 @@ them, add `--force`; to make any self-check failure fatal, add
 ```bash
 python3 setup.py --force --abort-on-failure
 ```
+
+To run a streamlined setup that accepts smart defaults (auto-naming repos, deriving display names from Discord profiles, skipping optional JSON tuning, and prompting only for essential tokens and IDs):
+
+```bash
+python3 setup.py --quick
+```
+
+To convert existing text-based `#dm-inbox` and `#deals` channels into native **Discord Forum channels** (deleting only those two farm channels and replacing them with forum channels with tags):
+
+```bash
+python3 setup.py --upgrade-forums
+```
+
+You can also combine flags: `python3 setup.py --quick --upgrade-forums`.
+*Note:* The script will **never** touch or delete any other channels on your server (like `general`, `todo`, `temp`, etc.).
 
 In interactive mode, the script asks before replacing an existing secret or
 variable. In non-interactive mode, existing values are preserved unless
@@ -268,10 +284,22 @@ Other commands are still available:
 | `/setdealscan` | Enable or disable deal scanning independently of ad posting |
 | `/setdealdelta` | Set the minimum price edge required for a deal alert |
 | `/sync` | Reload the blocklist and control Gist on all alts |
-| `/setchannel` / `/replacechannel` | Verify and update channel IDs live |
+| `/settings` | Display current runtime parameters, channels, and safety configurations |
+| `/channels` | Interactive visual channel manager to view, add, remove, and rescan channels |
+| `/uploadimage` | Upload or update an ad image file directly to an alt's GitHub repository |
+| `/setchannel` / `/replacechannel` | Verify and update channel IDs live (persisted to GitHub secrets) |
+| `/rescan_channels` | Force an alt to immediately rescan and verify channel permissions |
+| `/resetcaution` | Clear caution backoff and slowmode flags on a channel or all channels |
 | `/setinterval` | Set the permitted 3/5-minute interval |
 | `/setruntime` | Set the permitted 6/12/18/24/48-hour runtime |
-| `/logs` | Show typed/filterable buffered lines for an alt |
+| `/logs` | Show typed/filterable buffered lines for an alt with optional keyword search |
+| `/diagnose` | Causal Event Explorer: deep root-cause diagnostic timeline, transition triggers, and recommendations |
+| `/topology` | Displays the live fleet topology, target channels, yield grades, and routing relationship graph |
+| `/simulate` | Runs a sandboxed dry-run simulation of ad copy, variation generators, and cadence |
+| `/squad` | Manages fleet squad pools, squad-based grouping, and assignments |
+| `/policy` | Applies preset operational channel policy templates (stealth, aggressive, peak_hour, balanced) |
+| `/canary` | Performs synthetic in-band health probes testing GitHub, Gist, and webhook infrastructure |
+| `/reply` | Relays an operator reply through the selected alt directly to a buyer's DM |
 | `/deals` | Show separate deal-alert counters and latest timestamps |
 | `/refresh` | Refresh GitHub state and the persistent dashboard |
 | `/dashboard` | Post a fresh dashboard snapshot |

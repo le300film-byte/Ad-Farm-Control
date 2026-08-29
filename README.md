@@ -16,6 +16,7 @@ alts, each isolated in its own private repository and workflow.
   existing repositories, private channels, named webhooks, Gists, secrets,
   variables, and channel mappings where possible.
 - **Single-alt deployment:** see [`SETUP_GUIDE.md`](./SETUP_GUIDE.md).
+- **Architectural roadmap & quick wins:** see [`ROADMAP.md`](./ROADMAP.md).
 
 ## V6 architecture
 
@@ -54,6 +55,15 @@ alts, each isolated in its own private repository and workflow.
   item-aware scanner without changing ad posting. Tokens are written through GitHub CLI
   stdin and are never echoed or logged. `/altremove` keeps the repository by
   default and requires the literal `DELETE` confirmation for removal.
+- `/diagnose` provides a deep root-cause Causal Event Explorer for an alt's
+  operational history; `/topology` renders the live visual fleet topology and
+  routing relationship graph; `/simulate` provides sandboxed dry-run evaluations;
+  `/squad` organizes alts into logical pools; `/policy` applies pre-packaged
+  operational profiles; `/canary` performs synthetic latency and health probes;
+  and `/reply` relays operator replies directly into buyer DMs.
+- `send_ads.py` features dynamic Chat Velocity cadence scaling with strict
+  slowmode hard floor guarantees, multi-alt channel collision staggering ($90\text{s}$ spacing),
+  fine-grained cascading circuit breakers, and automated buyer DM intent classification.
 
 ## Files
 
