@@ -331,6 +331,61 @@ class ControlRuntimeTests(unittest.TestCase):
             embed = view._build_embed()
             self.assertIn("Fleet Tuning & Settings", embed.title)
 
+    def test_live_log_and_heartbeat_post_recency_updates(self):
+        manager = AltStateManager({1: "yodonttryme46"}, alt_ids=[1])
+        alt = manager.get(1)
+        alt.online = False
+        alt.status = "offline"
+        alt.last_post_ts = 0.0
+
+        # Simulate incoming SEND log message from alt webhook
+        log_msg = SimpleNamespace(
+            content="[19:25:12] [INFO] SEND #「」market (1542936792939102219) | img | total=19 | id=1543340766095482992",
+            author=SimpleNamespace(id=1, display_name="yodonttryme46", name="yodonttryme46", bot=True),
+            channel=SimpleNamespace(id=config.LOG_CH_ID or 100),
+            webhook_id=999,
+        )
+
+        with mock.patch.object(control_bot_module, "state", manager):
+            control_bot_module._parse_log_message(1, log_msg)
+
+        # Alt should now be recognized as online and active with recency updated
+        self.assertTrue(alt.online)
+        self.assertEqual(alt.status, "active")
+        self.assertEqual(alt.total_sent, 19)
+        self.assertGreater(alt.last_post_ts, 0.0)
+        self.assertIn("1542936792939102219", alt.channels)
+        self.assertEqual(alt.channels["1542936792939102219"]["sent"], 1)
+        self.assertGreater(alt.channels["1542936792939102219"]["last_post"], 0)
+
+    def test_alt_add_modal_auto_provisioning(self):
+        manager = AltStateManager({1: "Alt 1"}, alt_ids=[1])
+        modal = control_bot_module.AltAddModal()
+        modal.user_token = SimpleNamespace(value="valid_alt_token_xyz")
+        modal.name = SimpleNamespace(value="")
+        modal.alt_id = SimpleNamespace(value="")
+        modal.repository = SimpleNamespace(value="")
+        modal.discord_user_id = SimpleNamespace(value="")
+
+        inter = _Interaction(user_id=42)
+
+        mock_profile = {"id": 99887766, "username": "AutoSeller2", "global_name": "Auto Seller 2"}
+
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}), \
+             mock.patch.object(control_bot_module.github_api, "fetch_discord_user_profile", return_value=(True, mock_profile)), \
+             mock.patch.object(control_bot_module.github_api, "provision_alt_repository_files_and_secrets", return_value=(True, "OK")), \
+             mock.patch.object(control_bot_module, "_persist_alt_registry", new=mock.AsyncMock(return_value=(True, "OK"))):
+
+            asyncio.run(modal.on_submit(inter))
+
+            self.assertTrue(inter.response.deferred)
+            reply = inter.followup.messages[0][0][0]
+            self.assertIn("AutoSeller2", reply)
+            self.assertIn("Alt 2", reply)
+            # Verify alt was added to manager
+            self.assertIn(2, manager.alt_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

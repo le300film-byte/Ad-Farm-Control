@@ -157,7 +157,11 @@ class Bootstrap:
             self.run_command(["gh", "auth", "refresh", "-h", "github.com", "-s", "repo,workflow,gist"])
         elif self.non_interactive:
             print("Using the masked GitHub CLI token supplied to this workflow.")
-        token = self.run_command(["gh", "auth", "token"]).stdout.strip()
+        env_token = os.environ.get("GH_TOKEN", "").strip() or os.environ.get("GITHUB_PAT", "").strip()
+        if env_token:
+            token = env_token
+        else:
+            token = self.run_command(["gh", "auth", "token"]).stdout.strip()
         if not token:
             raise SetupError("'gh auth token' returned no token.")
         self.gh_token = token
@@ -650,7 +654,7 @@ class Bootstrap:
         print(f"  ✓ created private repository: {full}")
         return full
 
-    def upload_template(self, repo: str, relative: str) -> None:
+    def upload_template(self, repo: str, relative: str, retry_count: int = 0) -> None:
         local = ROOT / relative
         if not local.is_file():
             raise SetupError(f"Template file is missing from the core repo: {relative}")
@@ -668,10 +672,23 @@ class Bootstrap:
         status, response = self.github("PUT", f"/repos/{repo}/contents/{encoded_path}", body=body)
         if status not in (200, 201):
             message = response.get("message", "") if isinstance(response, dict) else ""
+            if status == 403 and "Resource not accessible by integration" in message and retry_count == 0:
+                if not self.non_interactive:
+                    print(f"\n⚠️  The default GitHub Codespaces/Actions token cannot write to external alt repository '{repo}'.")
+                    print("   Please provide a GitHub Personal Access Token (classic PAT with 'repo, workflow, gist' scopes):")
+                    pat = self.ask("GitHub Personal Access Token (PAT)", secret=True, env="GH_TOKEN")
+                    if pat:
+                        self.gh_token = pat
+                        return self.upload_template(repo, relative, retry_count=1)
+                raise SetupError(
+                    f"Could not upload {relative} to {repo} (HTTP 403): {message}.\n"
+                    "In GitHub Codespaces, the default token cannot write to other alt repositories. "
+                    "Run 'gh auth login' with a Personal Access Token (or export GH_TOKEN=ghp_...) and retry."
+                )
             raise SetupError(f"Could not upload {relative} to {repo} (HTTP {status}): {message}")
         print(f"    ✓ {relative}")
 
-    def create_gist(self, filename: str, content: str, description: str) -> str:
+    def create_gist(self, filename: str, content: str, description: str, retry_count: int = 0) -> str:
         status, response = self.github(
             "POST", "/gists",
             body={
@@ -682,6 +699,18 @@ class Bootstrap:
         )
         if status not in (200, 201) or not isinstance(response, dict) or not response.get("id"):
             message = response.get("message", "") if isinstance(response, dict) else ""
+            if status == 403 and "Resource not accessible by integration" in message and retry_count == 0:
+                if not self.non_interactive:
+                    print(f"\n⚠️  The default GitHub Codespaces/Actions token cannot create Gists.")
+                    print("   Please provide a GitHub Personal Access Token (classic PAT with 'repo, workflow, gist' scopes):")
+                    pat = self.ask("GitHub Personal Access Token (PAT)", secret=True, env="GH_TOKEN")
+                    if pat:
+                        self.gh_token = pat
+                        return self.create_gist(filename, content, description, retry_count=1)
+                raise SetupError(
+                    f"Could not create {filename} Gist (HTTP 403): {message}.\n"
+                    "In GitHub Codespaces, run 'gh auth login' with a Personal Access Token (or export GH_TOKEN=ghp_...) and retry."
+                )
             raise SetupError(f"Could not create {filename} Gist (HTTP {status}): {message}")
         return str(response["id"])
 

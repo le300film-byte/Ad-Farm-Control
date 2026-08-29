@@ -733,12 +733,37 @@ def _apply_alt_registry(repos: dict[int, str], discord_ids: dict[int, int], name
     config.ALT_NAMES.update(names)
 
 
-class AltAddModal(discord.ui.Modal, title="Add prepared alt"):
-    alt_id = discord.ui.TextInput(label="Alt ID (1–4)", placeholder="2", max_length=2, required=True)
-    repository = discord.ui.TextInput(label="Existing alt repository", placeholder="owner/alt2-sell or alt2-sell", max_length=100, required=True)
-    discord_user_id = discord.ui.TextInput(label="Alt Discord user ID", placeholder="123456789012345678", max_length=30, required=True)
-    name = discord.ui.TextInput(label="Display name", placeholder="Second seller", max_length=80, required=True)
-    user_token = discord.ui.TextInput(label="Alt user token", max_length=600, required=True)
+class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
+    user_token = discord.ui.TextInput(
+        label="Alt Discord User Token",
+        placeholder="Paste user account token here (securely stored)",
+        max_length=600,
+        required=True,
+    )
+    name = discord.ui.TextInput(
+        label="Display Name (optional)",
+        placeholder="Leave blank to auto-detect Discord username",
+        max_length=80,
+        required=False,
+    )
+    alt_id = discord.ui.TextInput(
+        label="Alt ID 1–4 (optional)",
+        placeholder="Leave blank for next available ID",
+        max_length=2,
+        required=False,
+    )
+    repository = discord.ui.TextInput(
+        label="GitHub Repository (optional)",
+        placeholder="Leave blank to auto-create private repo",
+        max_length=100,
+        required=False,
+    )
+    discord_user_id = discord.ui.TextInput(
+        label="Discord User ID (optional)",
+        placeholder="Leave blank to auto-detect from token",
+        max_length=30,
+        required=False,
+    )
 
     async def on_submit(self, inter: discord.Interaction):
         if not _is_owner(inter):
@@ -746,43 +771,83 @@ class AltAddModal(discord.ui.Modal, title="Add prepared alt"):
             return
         def value(item) -> str:
             return str(getattr(item, "value", item) or "").strip()
-        try:
-            alt_id = int(value(self.alt_id))
-        except (TypeError, ValueError):
-            return await inter.response.send_message("❌ Alt ID must be 1, 2, 3, or 4.", ephemeral=True)
-        repo = value(self.repository)
-        did = value(self.discord_user_id)
-        name = re.sub(r"[\r\n]", " ", value(self.name))[:80]
         token = value(self.user_token)
-        if alt_id not in {1, 2, 3, 4}:
-            return await inter.response.send_message("❌ Alt ID must be between 1 and 4.", ephemeral=True)
-        if alt_id in state.alt_ids:
-            return await inter.response.send_message("❌ That alt ID is already configured. Use `/altupdate` instead.", ephemeral=True)
-        if not _valid_repo_name(repo):
-            return await inter.response.send_message("❌ Repository must be `owner/name` or a simple repository name.", ephemeral=True)
-        if not did.isdigit() or not name or not token:
-            return await inter.response.send_message("❌ Discord ID, display name, and token are required.", ephemeral=True)
+        if not token:
+            return await inter.response.send_message("❌ User token is required.", ephemeral=True)
+
         await inter.response.defer(ephemeral=True)
-        exists, detail = await asyncio.to_thread(github_api.repository_exists, repo)
-        if not exists:
-            return await inter.followup.send(f"❌ Cannot add alt: {detail}", ephemeral=True)
-        ok, detail = await asyncio.to_thread(github_api.set_repository_secret, repo, "USER_TOKEN", token)
-        if not ok:
-            return await inter.followup.send(f"❌ Token was not stored: {detail}", ephemeral=True)
+
+        # 1. Validate token with Discord API and extract profile
+        ok_prof, profile = await asyncio.to_thread(github_api.fetch_discord_user_profile, token)
+        if not ok_prof or not isinstance(profile, dict) or not profile.get("id"):
+            err_msg = profile.get("error", "Invalid user token") if isinstance(profile, dict) else "Invalid token"
+            return await inter.followup.send(f"❌ Could not authenticate alt with Discord: {err_msg}", ephemeral=True)
+
+        detected_did = str(profile.get("id"))
+        detected_name = str(profile.get("username") or profile.get("global_name") or "alt")
+
+        # 2. Resolve Alt ID
+        raw_aid = value(self.alt_id)
+        if raw_aid:
+            try:
+                alt_id = int(raw_aid)
+            except (TypeError, ValueError):
+                return await inter.followup.send("❌ Alt ID must be an integer between 1 and 4.", ephemeral=True)
+        else:
+            free_ids = [i for i in (1, 2, 3, 4) if i not in state.alt_ids]
+            if not free_ids:
+                return await inter.followup.send("❌ All 4 alt slots are currently occupied. Remove one with `/altremove` first.", ephemeral=True)
+            alt_id = free_ids[0]
+
+        if alt_id not in {1, 2, 3, 4}:
+            return await inter.followup.send("❌ Alt ID must be between 1 and 4.", ephemeral=True)
+        if alt_id in state.alt_ids:
+            return await inter.followup.send(f"❌ Alt `{alt_id}` is already configured. Use `/altupdate` to modify it.", ephemeral=True)
+
+        # 3. Resolve Display Name & Discord User ID
+        custom_name = value(self.name)
+        name = custom_name if custom_name else detected_name
+        name = re.sub(r"[\r\n]", " ", name)[:80].strip() or f"Alt {alt_id}"
+
+        custom_did = value(self.discord_user_id)
+        did = custom_did if (custom_did and custom_did.isdigit()) else detected_did
+
+        # 4. Resolve Repository (auto-create if blank or missing)
+        raw_repo = value(self.repository)
+        if raw_repo:
+            repo = raw_repo if "/" in raw_repo else f"{config.GITHUB_OWNER}/{raw_repo}"
+        else:
+            clean_slug_name = re.sub(r"[^a-zA-Z0-9_-]", "", name.lower().replace(" ", "-")) or f"alt{alt_id}"
+            owner = config.GITHUB_OWNER or (config.CORE_REPO.split("/")[0] if "/" in config.CORE_REPO else "owner")
+            repo = f"{owner}/alt{alt_id}-{clean_slug_name}"
+
+        # 5. Auto-create repo on GitHub, upload templates, and populate secrets
+        ok_prov, prov_detail = await asyncio.to_thread(github_api.provision_alt_repository_files_and_secrets, repo, token)
+        if not ok_prov:
+            return await inter.followup.send(f"❌ Auto-provisioning failed for `{repo}`: {prov_detail}", ephemeral=True)
+
+        # 6. Persist alt in core fleet registry
         repos = dict(config.ALT_REPOS); repos[alt_id] = repo
         discord_ids = dict(config.ALT_DISCORD_IDS); discord_ids[alt_id] = int(did)
         names = dict(config.ALT_NAMES); names[alt_id] = name
         persisted, persist_detail = await _persist_alt_registry(repos, discord_ids, names)
         if not persisted:
-            await asyncio.to_thread(github_api.delete_repository_secret, repo, "USER_TOKEN")
-            return await inter.followup.send(f"❌ Alt was not registered in the core map: {persist_detail}", ephemeral=True)
+            return await inter.followup.send(f"❌ Alt was not registered in core map: {persist_detail}", ephemeral=True)
+
         _apply_alt_registry(repos, discord_ids, names)
         state.add_alt(alt_id, name)
-        text = (f"✅ Added **{name}** as alt `{alt_id}` using `{repo}`. "
-                "USER_TOKEN was stored without echoing it. The repository must already contain the sender workflow and common secrets; use `/altupdate` for later token/metadata changes.")
+
+        text = (
+            f"🎉 **Alt {alt_id} (@{detected_name}) successfully added!**\n"
+            f"• **Repository:** `{repo}` (auto-provisioned with workflows & secrets)\n"
+            f"• **Discord ID:** `{did}`\n"
+            f"• **Display Name:** `{name}`\n"
+            f"• **Token:** Verified and securely stored in GitHub secrets\n\n"
+            f"👉 *You can now launch this alt directly with `/run` without running setup!*"
+        )
         await inter.followup.send(text, ephemeral=True)
-        await _log_control(text)
-        state.append_log(alt_id, text, emoji="➕", color=0x57F287, kind="CONTROL")
+        await _log_control(f"Added alt {alt_id} ({name}) with auto-provisioned repo `{repo}`")
+        state.append_log(alt_id, f"Alt added: {name} ({repo})", emoji="➕", color=0x57F287, kind="CONTROL")
 
 
 class AltUpdateModal(discord.ui.Modal):

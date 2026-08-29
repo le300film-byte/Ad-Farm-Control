@@ -298,6 +298,91 @@ def list_runs(alt_id: int, limit: int = 5) -> list[dict]:
     return []
 
 
+def fetch_discord_user_profile(user_token: str) -> tuple[bool, dict]:
+    """Validate token and fetch Discord user profile (@me)."""
+    if not user_token:
+        return False, {"error": "Token is empty."}
+    try:
+        r = requests.get(
+            "https://discord.com/api/v9/users/@me",
+            headers={"Authorization": user_token.strip(), "User-Agent": "Mozilla/5.0"},
+            timeout=_HTTP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            return True, r.json()
+        return False, {"error": f"Discord returned HTTP {r.status_code}"}
+    except Exception as exc:
+        return False, {"error": str(exc)}
+
+
+def create_alt_repository(repo_slug_or_name: str, private: bool = True) -> tuple[bool, str]:
+    """Ensure an alt repository exists on GitHub, creating it if necessary."""
+    slug = _repo_slug(repo_slug_or_name)
+    exists, _ = repository_exists(slug)
+    if exists:
+        return True, slug
+    repo_name = slug.split("/")[-1] if "/" in slug else slug
+    url = f"{GH}/user/repos"
+    payload = {"name": repo_name, "private": private, "auto_init": True, "description": f"Ad Farm alt {repo_name}"}
+    try:
+        r = requests.post(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+        if r.status_code in (200, 201):
+            return True, slug
+    except Exception:
+        pass
+    if shutil.which("gh") and config.GITHUB_TOKEN:
+        env = os.environ.copy()
+        env["GH_TOKEN"] = config.GITHUB_TOKEN
+        res = subprocess.run(
+            ["gh", "repo", "create", slug, "--private", "--add-readme"],
+            capture_output=True, text=True, timeout=_HTTP_TIMEOUT, env=env, check=False,
+        )
+        if res.returncode == 0 or "already exists" in (res.stderr or "").lower():
+            return True, slug
+    return False, f"Could not create repository `{slug}` on GitHub."
+
+
+def provision_alt_repository_files_and_secrets(repo: str, user_token: str) -> tuple[bool, str]:
+    """Upload canonical workflows and sender script, and populate required secrets."""
+    slug = _repo_slug(repo)
+    ok_repo, msg = create_alt_repository(slug)
+    if not ok_repo:
+        return False, msg
+
+    # Files to sync from local workspace or core repo
+    files_to_sync = [
+        "send_ads.py",
+        ".github/workflows/send_ads.yml",
+        ".github/workflows/self_check.yml",
+    ]
+    for rel_path in files_to_sync:
+        if os.path.isfile(rel_path):
+            with open(rel_path, "rb") as f:
+                content = f.read()
+            upload_repository_file(slug, rel_path, content, message=f"bootstrap: install {rel_path}")
+
+    # Set USER_TOKEN secret
+    set_repository_secret(slug, "USER_TOKEN", user_token)
+
+    # Clone common secrets from environment or config
+    common_secrets = [
+        ("DM_WEBHOOK_URL", os.environ.get("DM_WEBHOOK_URL") or config._raw("DM_WEBHOOK_URL")),
+        ("LOG_WEBHOOK_URL", os.environ.get("LOG_WEBHOOK_URL") or config._raw("LOG_WEBHOOK_URL")),
+        ("DASHBOARD_WEBHOOK_URL", os.environ.get("DASHBOARD_WEBHOOK_URL") or config._raw("DASHBOARD_WEBHOOK_URL")),
+        ("DEAL_WEBHOOK_URL", os.environ.get("DEAL_WEBHOOK_URL") or config._raw("DEAL_WEBHOOK_URL")),
+        ("GIST_ID", os.environ.get("GIST_ID") or config._raw("GIST_ID")),
+        ("GIST_TOKEN", os.environ.get("GIST_TOKEN") or config._raw("GIST_TOKEN") or config.GITHUB_TOKEN),
+        ("CONTROL_GIST_ID", config.CONTROL_GIST_ID or os.environ.get("CONTROL_GIST_ID") or ""),
+        ("CONTROLLER_USER_IDS", ",".join(str(x) for x in config.OWNER_IDS)),
+        ("CHANNEL_IDS", os.environ.get("CHANNEL_IDS") or config._raw("CHANNEL_IDS")),
+    ]
+    for sec_name, sec_val in common_secrets:
+        if sec_val:
+            set_repository_secret(slug, sec_name, str(sec_val))
+
+    return True, f"Repository `{slug}` auto-provisioned successfully with canonical files and secrets."
+
+
 def upload_repository_file(repo: str, file_path: str, content_bytes: bytes, message: str = "Update file from control bot") -> tuple[bool, str]:
     """Upload or overwrite a file in a GitHub repository."""
     if not repo or not file_path:
