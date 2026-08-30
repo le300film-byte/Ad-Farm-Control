@@ -42,6 +42,42 @@ class SetupValidationTests(unittest.TestCase):
         ), self.assertRaises(bootstrap_module.SetupError):
             bootstrap.collect_discord_inputs()
 
+    def test_interactive_setup_runtime_option_prompts(self):
+        """Verify interactive setup prompts for all flags with explanation and accepts yes/no."""
+        bootstrap = bootstrap_module.Bootstrap(non_interactive=False)
+
+        # Mock yes_no answers: quick=yes, force=no, forums=yes, upgrade=yes, abort=no
+        with mock.patch.object(bootstrap, "yes_no", side_effect=[True, False, True, True, False]):
+            bootstrap.collect_runtime_options()
+
+        self.assertTrue(bootstrap.quick)
+        self.assertFalse(bootstrap.force)
+        self.assertTrue(bootstrap.use_forums)
+        self.assertTrue(bootstrap.upgrade_forums)
+        self.assertFalse(bootstrap.abort_on_failure)
+
+    def test_cli_flags_override_interactive_prompts(self):
+        """Verify CLI flags override interactive prompts and do not ask for explicitly passed flags."""
+        bootstrap = bootstrap_module.Bootstrap(
+            non_interactive=False,
+            quick=False,
+            force=True,
+            use_forums=False,
+            upgrade_forums=False,
+            abort_on_failure=True,
+        )
+
+        with mock.patch.object(bootstrap, "yes_no") as mock_yes_no:
+            bootstrap.collect_runtime_options()
+            # None of the flags should trigger yes_no since all were passed via CLI
+            mock_yes_no.assert_not_called()
+
+        self.assertFalse(bootstrap.quick)
+        self.assertTrue(bootstrap.force)
+        self.assertFalse(bootstrap.use_forums)
+        self.assertFalse(bootstrap.upgrade_forums)
+        self.assertTrue(bootstrap.abort_on_failure)
+
 
 if __name__ == "__main__":
     unittest.main()

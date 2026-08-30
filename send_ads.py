@@ -491,6 +491,7 @@ _runtime_hours = 0               # current/next runtime choice for heartbeat sta
 _runtime_message = None          # overridden MESSAGE (set via !setmessage)
 _runtime_rate = None             # overridden rate (set via !setprice)
 _runtime_ad_type = None          # overridden ad_type (set via !setmode)
+_runtime_policy_template = "balanced" # overridden policy preset
 _runtime_deal_keywords = None    # overridden item aliases (set via !setdealkeywords)
 _runtime_deal_scan_enabled = None  # overridden scanner toggle
 _runtime_deal_delta = None          # overridden alert edge
@@ -544,14 +545,16 @@ def _sleep_chunked_respecting_pause(seconds, end_time=None):
         return True
     stop = time.time() + seconds
     while time.time() < stop:
+        if _panic_event.is_set() or _stop_event.is_set():
+            return False
         if end_time and time.time() >= end_time:
             return False
         if not public_activity_allowed():
             # In pause: just sleep without doing anything public
-            wait = min(15, stop - time.time())
+            wait = min(15, max(0.1, stop - time.time()))
             time.sleep(wait)
             continue
-        time.sleep(min(5, stop - time.time()))
+        time.sleep(min(5, max(0.1, stop - time.time())))
     return True
 
 # --------------------------------------------------------------------------- #
@@ -702,11 +705,11 @@ def sleep_chunked(seconds, end_time=None):
         return
     stop = time.time() + seconds
     while time.time() < stop:
-        if _panic_event.is_set():
+        if _panic_event.is_set() or _stop_event.is_set():
             return
         if end_time and time.time() >= end_time:
             return
-        time.sleep(min(5, stop - time.time()))
+        time.sleep(min(5, max(0.1, stop - time.time())))
 
 def _apply_global_cooldown():
     global _global_cooldown_until
@@ -714,6 +717,8 @@ def _apply_global_cooldown():
     # (e.g. retry_after=3600) doesn't freeze the main thread for an hour,
     # and so that KeyboardInterrupt / SystemExit can be delivered promptly.
     while True:
+        if _panic_event.is_set() or _stop_event.is_set():
+            return
         now = time.time()
         remaining = _global_cooldown_until - now
         if remaining <= 0:
@@ -1880,6 +1885,17 @@ def discover_channel_by_name(guild_id, channel_name):
             log(f"   ⚠️ [DISC] {len(matches)} channels matched '{target}' in guild {gid}; using first "
                 f"(#{matches[0].get('name')}).")
         if not matches:
+            # Third pass: clean alphanumeric fuzzy match (handles emojis like 「💵」・market or trading﹒☆˚₊࿔)
+            clean_target = re.sub(r"[^\w\s-]", "", target).strip().replace(" ", "-")
+            if clean_target:
+                for ch in channels:
+                    if not isinstance(ch, dict) or ch.get("type") != 0:
+                        continue
+                    nm = (ch.get("name") or "").strip().lower()
+                    clean_nm = re.sub(r"[^\w\s-]", "", nm).strip().replace(" ", "-")
+                    if clean_target == clean_nm or clean_target in clean_nm or clean_nm in clean_target:
+                        matches.append(ch)
+        if not matches:
             continue
         new_cid = matches[0].get("id")
         new_name = matches[0].get("name", target)
@@ -2542,7 +2558,7 @@ def _extract_my_rate():
         except Exception: return None
     return None
 
-def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind, item):
+def _send_deal_alert(cid, seller, price, ref_rate, profit_margin, snippet, jump_url, kind, item):
     global _deal_alerts_sent, _last_deal_ts
     if not DEAL_WEBHOOK_URL:
         event_log("DEAL", "Deal matched but DEAL_WEBHOOK_URL is not configured.")
@@ -2556,77 +2572,123 @@ def _send_deal_alert(cid, seller, price, my_rate, snippet, jump_url, kind, item)
         _deal_alerts_sent += 1
         _last_deal_ts = now
     snip = (snippet or "").replace("\n", " ⏎ ")[:180]
+    pct = (profit_margin / ref_rate * 100) if ref_rate > 0 else 0.0
     if kind == "buyer":
-        title = "📈 DEAL ALERT — HIGH BUY"
+        title = "📈 ARBITRAGE ALERT — HIGH-PAYING BUYER"
         color = 0x57F287
-        delta = f"+${price - my_rate:.2f}/1k above your sell rate"
+        edge_label = f"+${profit_margin:.2f}/1k above cost ({pct:.1f}% profit)"
+        action_type = "🔵 BUYER DETECTED (Sell High Opportunity)"
     else:
-        title = "📈 DEAL ALERT — CHEAP SELL"
+        title = "🎯 SUPPLIER ALERT — UNDER-MARKET SELLER"
         color = 0xFEE75C
-        delta = f"-${my_rate - price:.2f}/1k below your buy rate"
+        edge_label = f"+${profit_margin:.2f}/1k discount ({pct:.1f}% discount)"
+        action_type = "🟢 SELLER DETECTED (Buy Low Opportunity)"
     embed = {
         "title": title,
         "color": color,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "url": jump_url,
         "fields": [
-            {"name": "Item",     "value": item, "inline": True},
-            {"name": "User",     "value": f"@{seller.get('username') or seller.get('global_name') or '?'}", "inline": True},
-            {"name": "Channel",  "value": f"<#{cid}>", "inline": True},
-            {"name": "Price",    "value": f"**${price:.2f}/1k**", "inline": True},
-            {"name": "Your rate","value": f"${my_rate:.2f}/1k", "inline": True},
-            {"name": "Edge",     "value": delta, "inline": True},
-            {"name": "Snippet",  "value": f"```{snip}```[Jump to message]({jump_url})", "inline": False},
+            {"name": "Category", "value": action_type, "inline": True},
+            {"name": "Target Item", "value": f"**{item}**", "inline": True},
+            {"name": "Market User", "value": f"@{seller.get('username') or seller.get('global_name') or '?'}", "inline": True},
+            {"name": "Channel", "value": f"<#{cid}>", "inline": True},
+            {"name": "Detected Price", "value": f"**${price:.2f}/1k**", "inline": True},
+            {"name": "Reference Baseline", "value": f"${ref_rate:.2f}/1k", "inline": True},
+            {"name": "Net Profit Edge", "value": f"**{edge_label}**", "inline": True},
+            {"name": "Chat Excerpt", "value": f"```{snip}```[🔗 Jump to Discord message]({jump_url})", "inline": False},
         ],
     }
-    thread_title = f"💰 [{delta[:15]}] {item} @ ${price:.2f}/1k"
+    thread_title = f"💰 [{'+$' if profit_margin>=0 else '-$'}{abs(profit_margin):.2f}/1k] {item} @ ${price:.2f}"
     try:
         send_deal_webhook(embed, thread_name=thread_title)
-        event_log("DEAL", f"🔥 {item} — @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (yours ${my_rate:.2f})")
+        event_log("DEAL", f"🔥 [{action_type[:15]}] {item} — @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (margin: +${profit_margin:.2f})")
     except Exception as e:
         dbg(f"[DEAL] alert error: {e}")
 
 def scan_deals(cid, msgs):
-    """Passive scan of msgs (already fetched) — no extra API calls."""
+    """Passive directional arbitrage scan — categorizes seller vs buyer opportunities."""
     if not _get_active_deal_scan_enabled() or not msgs:
         return
-    my_rate = _extract_my_rate()
-    if not my_rate or my_rate <= 0:
+    baseline_rate = _extract_my_rate()
+    if not baseline_rate or baseline_rate <= 0:
         return
     active_ad_type = _get_active_ad_type()
+    delta = _get_active_deal_delta()
     gid = _guild_id_cache.get(cid, "@me")
     jump_base = f"https://discord.com/channels/{gid}/{cid}/"
+
+    sell_benchmark = baseline_rate if active_ad_type == "sell" else baseline_rate + delta
+    buy_benchmark = baseline_rate if active_ad_type == "buy" else max(0.10, baseline_rate - delta)
+
     for m in msgs[:20]:
         try:
             aid = m.get("author", {}).get("id")
-            if aid == _me_cache.get("id"): continue
-            if m.get("author", {}).get("bot"): continue
+            if aid == _me_cache.get("id"):
+                continue
+            if m.get("author", {}).get("bot"):
+                continue
             content = (m.get("content") or "").strip()
-            if not content or len(content) < 6: continue
-            if content[0] in "!/-.?": continue
+            if not content or len(content) < 6:
+                continue
+            if content[0] in "!/-.?":
+                continue
             item = _match_deal_item(content)
-            if not item: continue
+            if not item:
+                continue
             sell_m = _DEAL_SELL_KW.search(content)
-            buy_m  = _DEAL_BUY_KW.search(content)
-            if not sell_m and not buy_m: continue
-            if active_ad_type == "buy"  and not sell_m: continue  # we buy, care about sellers
-            if active_ad_type == "sell" and not buy_m:  continue  # we sell, care about buyers
+            buy_m = _DEAL_BUY_KW.search(content)
+            if not sell_m and not buy_m:
+                continue
+
             price = None
             for pat in _DEAL_PRICE_PATTERNS:
                 pm = pat.search(content)
                 if pm:
-                    try: price = float(pm.group(1)); break
-                    except Exception: continue
-            if price is None or price <= 0 or price > 20: continue
-            is_deal, kind = False, None
-            delta = _get_active_deal_delta()
-            if active_ad_type == "buy"  and price <= my_rate - delta:
-                is_deal, kind = True, "seller"
-            elif active_ad_type == "sell" and price >= my_rate + delta:
-                is_deal, kind = True, "buyer"
-            if is_deal:
-                _send_deal_alert(cid, m.get("author", {}), price, my_rate,
-                                 content, jump_base + m.get("id", ""), kind, item)
+                    try:
+                        price = float(pm.group(1))
+                        break
+                    except Exception:
+                        continue
+            if price is None or price <= 0 or price > 20:
+                continue
+
+            is_deal = False
+            kind = None
+            ref_rate = None
+            margin = 0.0
+
+            # 1. Other user is SELLING: We can BUY low if price is under our buy benchmark or sell price
+            if sell_m and not buy_m:
+                if price <= buy_benchmark - delta:
+                    is_deal = True
+                    kind = "seller"
+                    ref_rate = buy_benchmark
+                    margin = buy_benchmark - price
+                elif active_ad_type == "buy" and price <= baseline_rate - delta:
+                    is_deal = True
+                    kind = "seller"
+                    ref_rate = baseline_rate
+                    margin = baseline_rate - price
+
+            # 2. Other user is BUYING: We can SELL high if price is above our sell benchmark or buy cost
+            elif buy_m and not sell_m:
+                if price >= sell_benchmark + delta:
+                    is_deal = True
+                    kind = "buyer"
+                    ref_rate = sell_benchmark
+                    margin = price - sell_benchmark
+                elif active_ad_type == "sell" and price >= baseline_rate + delta:
+                    is_deal = True
+                    kind = "buyer"
+                    ref_rate = baseline_rate
+                    margin = price - baseline_rate
+
+            if is_deal and kind and margin >= delta:
+                _send_deal_alert(
+                    cid, m.get("author", {}), price, ref_rate, margin,
+                    content, jump_base + m.get("id", ""), kind, item
+                )
         except Exception as e:
             dbg(f"[DEAL] msg error: {e}")
 
@@ -2873,7 +2935,7 @@ def _apply_rate_to_message(text, new_rate):
 def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, reply=True, reply_fn=None):
     """Parse and act on a DM command from a controller user. Returns True if handled."""
     global _paused_by_controller, _runtime_message, _runtime_rate, _runtime_ad_type, _runtime_hours, _runtime_deal_keywords
-    global _runtime_deal_scan_enabled, _runtime_deal_delta
+    global _runtime_deal_scan_enabled, _runtime_deal_delta, _runtime_policy_template, INTERVAL_MIN
     def respond(text):
         if reply_fn is not None:
             reply_fn(text)
@@ -3043,6 +3105,30 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
                 respond(f"❌ Could not open DM with user `{target_uid}` (HTTP {r_chan.status_code}).")
         except Exception as e:
             respond(f"❌ Error sending DM: {e}")
+    elif cmd == "policy":
+        t_clean = args.strip().lower()
+        if t_clean not in {"stealth", "aggressive", "peak_hour", "balanced"}:
+            respond("❌ Policy template must be `stealth`, `aggressive`, `peak_hour`, or `balanced`.")
+            return True
+        _runtime_policy_template = t_clean
+        if t_clean == "stealth":
+            INTERVAL_MIN = 5
+            _runtime_deal_scan_enabled = False
+        elif t_clean == "aggressive":
+            INTERVAL_MIN = 3
+            _runtime_deal_scan_enabled = True
+            _runtime_deal_delta = 0.05
+        elif t_clean == "peak_hour":
+            INTERVAL_MIN = 3
+            _runtime_deal_scan_enabled = True
+            _runtime_deal_delta = 0.03
+        elif t_clean == "balanced":
+            INTERVAL_MIN = 5
+            _runtime_deal_scan_enabled = True
+            _runtime_deal_delta = 0.05
+        event_log("CONTROL", f"policy template applied by controller: {t_clean.upper()} (interval={INTERVAL_MIN}m, deal_scan={'on' if _runtime_deal_scan_enabled else 'off'})")
+        send_log_webhook(f"🛡️ **POLICY APPLIED** → `{t_clean.upper()}` (interval={INTERVAL_MIN}m, deals={'on' if _runtime_deal_scan_enabled else 'off'})", kind="CONTROL")
+        respond(f"✅ Policy template **{t_clean.upper()}** active (interval={INTERVAL_MIN}m, deal_scan={'on' if _runtime_deal_scan_enabled else 'off'}).")
     elif cmd in ("setchannel", "replacechannel"):
         # Safe live channel update. The target must be numeric and readable
         # before it enters the scheduler; this avoids phantom/typo channels.
@@ -3155,7 +3241,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         send_log_webhook(f"🚨 **CAUTION RESET** → {detail} (controller)")
         respond(f"✅ Caution mode, strike history, and channel error backoffs cleared for {detail}.")
     elif cmd == "help":
-        respond("Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !setdealkeywords <a,b,c> !setdealscan <on|off> !setdealdelta <0..5> !setchannel <id> [name] !replacechannel <old> <new> !setinterval <3|5> !setruntime <6|12|18|24|48> !sync !ping !rescan !resetcaution [id]")
+        respond("Commands: !status !pause !resume !stop !setprice <x> !setmode <sell|buy> !setmessage <text> !setdealkeywords <a,b,c> !setdealscan <on|off> !setdealdelta <0..5> !setchannel <id> [name] !replacechannel <old> <new> !policy <preset> !setinterval <3|5> !setruntime <6|12|18|24|48> !sync !ping !rescan !resetcaution [id] !reply <uid> <text>")
     else:
         respond(f"❓ Unknown command `{cmd}`. Try !help")
     return True
@@ -3268,6 +3354,8 @@ def _sync_control_gist(force=False):
             _runtime_ad_type = data["ad_type"]
         if isinstance(data.get("message"), str) and data["message"]:
             _runtime_message = data["message"][:1900]
+        if data.get("interval_min") in (3, 5):
+            INTERVAL_MIN = int(data["interval_min"])
         if isinstance(data.get("deal_keywords"), list):
             keywords = _parse_deal_keywords(",".join(str(x) for x in data["deal_keywords"]))
             if keywords:
@@ -3410,6 +3498,7 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
         "rate": _get_active_rate(),
         "rate_currency": "$/1k",
         "interval_min": INTERVAL_MIN,
+        "policy_template": _runtime_policy_template,
         "runtime_hours": _runtime_hours or max(1, round(TOTAL_RUN_MIN / 60)),
         "message_preview": _get_active_message().split("\n")[0][:120],
         "total_sent": total_sent,
@@ -3447,6 +3536,7 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
         {"name": "Status", "value": f"{title_dot} `{status}`", "inline": True},
         {"name": "Mode", "value": f"`{_get_active_ad_type()}`", "inline": True},
         {"name": "Rate", "value": f"${_get_active_rate()}/1k" if _get_active_rate() else "—", "inline": True},
+        {"name": "Cadence", "value": f"`{INTERVAL_MIN}m`", "inline": True},
         {"name": "Activity", "value": f"Sent: `{total_sent}` · Errors: `{total_err}` · Skips: `{total_skip}`", "inline": False},
         {"name": "Deals", "value": f"`{_deal_alerts_sent}` alert(s)", "inline": True},
         {"name": "Scanner", "value": f"{'ON' if _get_active_deal_scan_enabled() else 'OFF'} · edge ${_get_active_deal_delta():.2f}/1k", "inline": True},
@@ -4327,16 +4417,25 @@ def in_break(breaks, now):
 class _KeepaliveSleep:
     def __init__(self):
         self.last_ping = time.time()
+        self.last_gist_poll = time.time()
+
     def sleep(self, seconds, end_time=None):
         if seconds <= 0:
             return
         stop = time.time() + seconds
         while time.time() < stop:
+            if _panic_event.is_set() or _stop_event.is_set():
+                return
             if end_time and time.time() >= end_time:
                 return
-            chunk = min(30, stop - time.time())
+            chunk = min(15, max(1, stop - time.time()))
             time.sleep(chunk)
-            # Only fire keepalive if we're allowed to do public activity
+            if CONTROL_GIST_ID and GIST_TOKEN and time.time() - self.last_gist_poll >= 15:
+                try:
+                    _sync_control_gist()
+                except Exception:
+                    pass
+                self.last_gist_poll = time.time()
             if public_activity_allowed() and time.time() - self.last_ping >= 270:
                 keepalive()
                 self.last_ping = time.time()
@@ -4876,8 +4975,11 @@ def main():
             in_afk, afk_left = in_break(breaks, now)
             if in_afk:
                 resume_ts = time.time() + afk_left
+                resume_str = datetime.fromtimestamp(resume_ts).strftime('%H:%M:%S')
                 log(f"☕ AFK BREAK — stepping away for {afk_left/60:.1f} min.")
-                log(f"   Resuming around {datetime.fromtimestamp(resume_ts).strftime('%H:%M:%S')}. All public posting paused (simulating being offline).")
+                log(f"   Resuming around {resume_str}. All public posting paused (simulating being offline).")
+                if not returning_from_afk:
+                    send_log_webhook(f"☕ **AFK BREAK** — stepping away for {afk_left/60:.1f} min (resuming ~{resume_str}). Public posting safely paused.", kind="AFK")
                 sleep_with_keepalive(min(60, afk_left), run_end)
                 returning_from_afk = True
                 # Reset next-post times so we don't spam a burst of overdue
@@ -4891,6 +4993,7 @@ def main():
             if returning_from_afk:
                 ret_wait = random.uniform(15, 45)
                 log(f"👋 BACK FROM AFK — re-orienting for {ret_wait:.0f}s (catching up on missed messages, simulating reopening Discord)...")
+                send_log_webhook("👋 **BACK FROM AFK** — catching up on chat and resuming active posting rotation.", kind="ACTIVE")
                 sleep_chunked(ret_wait, run_end)
                 for _cid in active_channels:
                     if time.time() >= _get_run_end(run_end):

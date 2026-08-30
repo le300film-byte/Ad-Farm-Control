@@ -191,10 +191,13 @@ behavior.
 |---|---|---|
 | `ALLOWED_COUNTRIES` | _(empty)_ | Optional comma-separated ISO codes (e.g. `FR,ES,NL,DE,IE,GB,PT,MA,IT`). If WARP/proxy exits in a country NOT on this list, the run aborts before posting. Empty disables only the country allow-list; outbound IP and provider verification remain mandatory. |
 
-#### 📌 Deal scanner (V6)
+#### 📌 Directional Arbitrage Deal scanner (V6)
 
 Passively scans messages it already fetches (no extra API calls) and
-alerts when someone posts a rate better than yours by ≥ delta.
+categorizes profitable arbitrage opportunities:
+- **`🟢 SUPPLIER ALERT`**: Detects other users selling below your buy benchmark or sell price (`price <= buy_benchmark - delta`).
+- **`🔵 ARBITRAGE SALE`**: Detects buyers offering high bids above your sell benchmark (`price >= sell_benchmark + delta`).
+- **Noise Filtering**: Rejects lowball buyers and overpriced sellers.
 
 | Secret | Default | What it does |
 |---|---|---|

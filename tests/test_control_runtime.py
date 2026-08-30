@@ -386,6 +386,60 @@ class ControlRuntimeTests(unittest.TestCase):
             # Verify alt was added to manager
             self.assertIn(2, manager.alt_ids)
 
+    def test_cmd_squad_batch_operations(self):
+        manager = AltStateManager({1: "Alt 1", 2: "Alt 2"}, alt_ids=[1, 2])
+        manager.set_squad(1, "Alpha")
+        manager.set_squad(2, "Alpha")
+
+        inter_view = _Interaction(user_id=42)
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}), \
+             mock.patch.object(control_bot_module, "_cooldowns", {}):
+            asyncio.run(control_bot_module.cmd_squad.callback(inter_view, action="view", squad_name="Alpha"))
+        embed = inter_view.response.messages[0][1]["embed"]
+        self.assertIn("Squad Overview: Alpha", embed.title)
+        self.assertIn("Fleet Count", embed.description)
+
+        control_bot_module._cooldowns.clear()
+        inter_batch = _Interaction(user_id=42)
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}), \
+             mock.patch.object(control_bot_module, "_cooldowns", {}), \
+             mock.patch.object(control_bot_module, "_send_control_wait_ack", new=mock.AsyncMock(return_value="✅ ACK")), \
+             mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
+            asyncio.run(control_bot_module.cmd_squad.callback(inter_batch, action="policy", squad_name="Alpha", value="aggressive"))
+            self.assertTrue(inter_batch.response.deferred)
+            reply = inter_batch.followup.messages[0][0][0]
+            self.assertIn("Batch POLICY", reply)
+            self.assertEqual(manager.get(1).policy_template, "aggressive")
+            self.assertEqual(manager.get(2).policy_template, "aggressive")
+
+    def test_hierarchical_subcommand_architecture(self):
+        """Verify hierarchical command groups correctly route to their underlying handlers."""
+        manager = AltStateManager({1: "Alt 1"}, alt_ids=[1])
+
+        # Test /fleet analytics subcommand
+        inter_fleet = _Interaction(user_id=42)
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}), \
+             mock.patch.object(control_bot_module, "_fresh_state", new=mock.AsyncMock()):
+            sub = control_bot_module.fleet_group.get_command("analytics")
+            asyncio.run(sub.callback(inter_fleet, alt=1))
+            embed = inter_fleet.response.messages[0][1]["embed"]
+            self.assertIn("ADVANCED FLEET ANALYTICS", embed.title)
+
+        # Test /tune price subcommand
+        control_bot_module._cooldowns.clear()
+        inter_tune = _Interaction(user_id=42)
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}), \
+             mock.patch.object(control_bot_module, "_send_dm_wait_ack", new=mock.AsyncMock(return_value="✅ ACK")), \
+             mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
+            sub = control_bot_module.tune_group.get_command("price")
+            asyncio.run(sub.callback(inter_tune, alt=1, new_price="2.80"))
+            self.assertTrue(inter_tune.response.deferred)
+            self.assertIn("price validated", inter_tune.followup.messages[0][0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

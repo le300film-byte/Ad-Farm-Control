@@ -168,6 +168,8 @@ class AltStateManager:
                         alt.interval_min = value
                     elif field_name == "runtime_hours" and value in {6, 12, 18, 24, 48}:
                         alt.runtime_hours = value
+            if isinstance(payload.get("policy_template"), str) and payload["policy_template"] in {"stealth", "aggressive", "peak_hour", "balanced"}:
+                alt.policy_template = payload["policy_template"]
             for field_name in (
                 "total_sent", "total_errors", "total_skips", "total_edits",
                 "active_channels", "total_channels", "deal_alerts",
@@ -450,6 +452,18 @@ class AltStateManager:
             if ratio >= 0.60:
                 return "🟡 B"
             return "🔴 C"
+
+    def get_yield_grade(self, alt_id: int) -> str:
+        score = self.get_health_index(alt_id)
+        if score >= 90:
+            return "Grade A+ (Prime)"
+        if score >= 75:
+            return "Grade A (Good)"
+        if score >= 50:
+            return "Grade B (Fair)"
+        if score > 0:
+            return "Grade C (Degraded)"
+        return "Grade F (Offline)"
 
     def record_causal_event(self, alt_id: int, event_type: str, description: str, details: str = "") -> None:
         with self._lock:

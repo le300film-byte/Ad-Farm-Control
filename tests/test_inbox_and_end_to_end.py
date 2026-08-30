@@ -242,3 +242,166 @@ def test_github_api_health_and_user_profile():
         assert ok is True
         assert latency >= 0.0
 
+
+def test_setup_text_channel_mode_option():
+    """Verify setup.py configures standard text channels when use_forums=False."""
+    b = Bootstrap(non_interactive=True, use_forums=False)
+    assert b.use_forums is False
+    b.guild_id = "11223344"
+    b.bot_token = "dummy_token"
+
+    mock_created = []
+
+    def mock_discord(method, path, *args, **kwargs):
+        if method == "GET" and "/webhooks" in path:
+            return 200, []
+        if method == "GET" and "/channels" in path:
+            return 200, []
+        if method == "POST" and "/webhooks" in path:
+            return 201, {"id": "wh1", "token": "tok1", "url": "https://discord.com/api/webhooks/wh1/tok1"}
+        if method == "POST" and "/channels" in path:
+            body = kwargs.get("body", {})
+            mock_created.append(body)
+            return 201, {"id": "3001", "name": body.get("name"), "type": body.get("type")}
+        return 404, {}
+
+    with patch.object(b, "discord", side_effect=mock_discord):
+        b.provision_discord()
+        assert b.channels["dm-inbox"] == "3001"
+        assert b.channels["deals"] == "3001"
+        # Verify dm-inbox was requested as type 0 (Text), not type 15 (Forum)
+        dm_req = next(req for req in mock_created if req.get("name") == "dm-inbox")
+        assert dm_req["type"] == 0
+
+
+def test_spaced_out_buyer_dm_context_memory_and_thread_continuation():
+    """Verify spaced-out buyer DMs preserve context history, cumulative intent, and thread ID."""
+    with patch("send_ads.DM_WEBHOOK_URL", "https://discord.com/api/webhooks/123/abc"), \
+         patch("send_ads._dm_forward_failures", 0), \
+         patch("send_ads._buyer_forum_threads", {}), \
+         patch("send_ads._buyer_context_history", {}), \
+         patch("send_ads.creq.post") as mock_post:
+
+        mock_resp1 = MagicMock()
+        mock_resp1.status_code = 200
+        mock_resp1.json.return_value = {"id": "msg1", "channel_id": "forum_thread_888"}
+
+        mock_resp2 = MagicMock()
+        mock_resp2.status_code = 200
+        mock_resp2.json.return_value = {"id": "msg2", "channel_id": "forum_thread_888"}
+
+        mock_post.side_effect = [mock_resp1, mock_resp2]
+
+        user_obj = {"id": "7788990011", "username": "BuyerAlex", "avatar": "av123"}
+
+        # Message 1: "hi" (general greeting)
+        send_ads.forward_dm_message("dm_ch_1", user_obj, "hi", [])
+        assert send_ads._buyer_forum_threads.get("7788990011") == "forum_thread_888"
+
+        # Message 2: "are you selling blade ball tokens for crypto? need 100k"
+        send_ads.forward_dm_message("dm_ch_1", user_obj, "are you selling blade ball tokens for crypto? need 100k", [])
+
+        # Verify second call continued in existing thread_id=forum_thread_888
+        assert mock_post.call_count == 2
+        second_call_url = mock_post.call_args_list[1][0][0]
+        assert "thread_id=forum_thread_888" in second_call_url
+
+        # Verify history context memory retained both messages
+        history = send_ads._buyer_context_history.get("7788990011")
+        assert len(history) == 2
+        assert history[0]["text"] == "hi"
+        assert "blade ball" in history[1]["text"]
+
+
+def test_sender_policy_command_and_fuzzy_channel_discovery():
+    """Verify !policy changes runtime parameters and discover_channel_by_name handles emoji/decorated channel names."""
+    replies = []
+    def mock_reply(text):
+        replies.append(text)
+
+    # Test !policy command
+    with patch("send_ads.CONTROLLER_USER_IDS", {"999"}), \
+         patch("send_ads.send_log_webhook") as mock_webhook:
+        handled = send_ads._handle_controller_dm("ch_1", "999", "!policy aggressive", trusted_source=True, reply_fn=mock_reply)
+        assert handled is True
+        assert any("AGGRESSIVE" in r for r in replies)
+        assert send_ads.INTERVAL_MIN == 3
+        assert send_ads._runtime_deal_scan_enabled is True
+
+    # Test discover_channel_by_name fuzzy emoji match
+    guild_channels = [
+        {"id": "555111", "name": "「💵」・trade-market", "type": 0},
+        {"id": "555222", "name": "chat-lounge", "type": 0},
+    ]
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = guild_channels
+
+    with patch("send_ads.api", return_value=mock_resp):
+        found = send_ads.discover_channel_by_name("guild_123", "trade-market")
+        assert found is not None
+        assert found["id"] == "555111"
+
+
+def test_directional_arbitrage_deal_scanner_filtering():
+    """Verify deal scanner categorizes directional deals and ignores non-deal noise."""
+    alerts = []
+    def mock_deal_webhook(embed, thread_name=None):
+        alerts.append((embed, thread_name))
+
+    with patch("send_ads.DEAL_WEBHOOK_URL", "https://discord.com/api/webhooks/deals/123"), \
+         patch("send_ads.DEAL_SCAN_ENABLED", True), \
+         patch("send_ads.DEAL_ITEM_KEYWORDS", ["Blade Ball"]), \
+         patch("send_ads.DEAL_ALERT_DELTA", 0.05), \
+         patch("send_ads._runtime_rate", 2.00), \
+         patch("send_ads.AD_TYPE", "sell"), \
+         patch("send_ads.send_deal_webhook", side_effect=mock_deal_webhook):
+
+        # 1. Cheap buyer post: "WTB Blade Ball $0.50/1k" (Should be REJECTED, not a deal for seller)
+        msgs_cheap_buyer = [{"id": "m1", "author": {"id": "u1", "username": "Lowballer"}, "content": "WTB Blade Ball 100k for $0.50/1k"}]
+        send_ads.scan_deals("ch_trade", msgs_cheap_buyer)
+        assert len(alerts) == 0
+
+        # 2. High paying buyer post: "WTB Blade Ball $2.80/1k" (Should be ALERTED as premium buyer)
+        msgs_high_buyer = [{"id": "m2", "author": {"id": "u2", "username": "HighBuyer"}, "content": "WTB Blade Ball 50k at $2.80/1k fast"}]
+        send_ads.scan_deals("ch_trade", msgs_high_buyer)
+        assert len(alerts) == 1
+        assert "BUYER DETECTED" in alerts[0][0]["fields"][0]["value"]
+        assert alerts[0][0]["fields"][4]["value"] == "**$2.80/1k**"
+
+        # 3. Cheap supplier post: "WTS Blade Ball $1.20/1k stock" (Should be ALERTED as supplier deal)
+        msgs_supplier = [{"id": "m3", "author": {"id": "u3", "username": "CheapSeller"}, "content": "WTS Blade Ball 200k in stock $1.20 per 1k"}]
+        send_ads.scan_deals("ch_trade", msgs_supplier)
+        assert len(alerts) == 2
+        assert "SELLER DETECTED" in alerts[1][0]["fields"][0]["value"]
+
+
+def test_visual_analytics_embed_generation():
+    """Verify build_analytics_embed generates complete metrics, gauges, and channel matrices."""
+    from control_bot.alt_state import AltStateManager
+    from control_bot.dashboard import build_analytics_embed
+
+    mgr = AltStateManager({1: "Alt 1", 2: "Alt 2"}, alt_ids=[1, 2])
+    mgr.update_from_heartbeat(1, {
+        "status": "active",
+        "total_sent": 30,
+        "total_errors": 1,
+        "total_skips": 4,
+        "total_edits": 5,
+        "deal_alerts": 2,
+        "uptime_sec": 3600,
+        "channels": {
+            "111222": {"name": "trading", "sent": 15, "errors": 0, "slowmode": 120, "last_post": time.time()},
+            "333444": {"name": "market", "sent": 15, "errors": 1, "slowmode": 60, "last_post": time.time()},
+        }
+    })
+
+    embed = build_analytics_embed(mgr, target_alt=0)
+    assert "ADVANCED FLEET ANALYTICS" in embed.title
+    assert "Delivery Success Rate" in embed.description
+    assert any("Alt Throughput & Health Gauges" in f.name for f in embed.fields)
+    assert any("Channel Reliability" in f.name for f in embed.fields)
+    assert any("Anti-Detection" in f.name for f in embed.fields)
+
+
+

@@ -70,7 +70,10 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
             raw_prior = prior.get("content") or ""
             parsed_prior = json.loads(raw_prior) if raw_prior else {}
             if isinstance(parsed_prior, dict):
-                payload.update({k: v for k, v in parsed_prior.items() if k in {"deal_keywords", "deal_scan_enabled", "deal_alert_delta"}})
+                payload.update({k: v for k, v in parsed_prior.items() if k in {
+                    "deal_keywords", "deal_scan_enabled", "deal_alert_delta",
+                    "paused", "rate", "interval_min", "policy_template", "ad_type", "message"
+                }})
     except Exception:
         # The PATCH below remains authoritative; inability to read an old
         # optional setting must not prevent a command from being queued.
@@ -83,7 +86,47 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
         "issued_at": time.time(),
         "transport": "control_gist",
     })
-    if command == "setdealkeywords":
+    if command == "pause":
+        payload["paused"] = True
+    elif command == "resume":
+        payload["paused"] = False
+    elif command == "setprice":
+        try:
+            payload["rate"] = float(args.strip())
+        except Exception:
+            pass
+    elif command == "setmode":
+        if args.lower().strip() in {"sell", "buy"}:
+            payload["ad_type"] = args.lower().strip()
+    elif command == "setmessage":
+        if args.strip():
+            payload["message"] = args.strip()[:1900]
+    elif command == "setinterval":
+        try:
+            val = int(args.strip())
+            if val in (3, 5):
+                payload["interval_min"] = val
+        except Exception:
+            pass
+    elif command == "policy":
+        if args.lower().strip() in {"stealth", "aggressive", "peak_hour", "balanced"}:
+            payload["policy_template"] = args.lower().strip()
+            if args.lower().strip() == "stealth":
+                payload["interval_min"] = 5
+                payload["deal_scan_enabled"] = False
+            elif args.lower().strip() == "aggressive":
+                payload["interval_min"] = 3
+                payload["deal_scan_enabled"] = True
+                payload["deal_alert_delta"] = 0.05
+            elif args.lower().strip() == "peak_hour":
+                payload["interval_min"] = 3
+                payload["deal_scan_enabled"] = True
+                payload["deal_alert_delta"] = 0.03
+            elif args.lower().strip() == "balanced":
+                payload["interval_min"] = 5
+                payload["deal_scan_enabled"] = True
+                payload["deal_alert_delta"] = 0.05
+    elif command == "setdealkeywords":
         payload["deal_keywords"] = [item.strip()[:60] for item in args.split(",") if item.strip()][:20]
     elif command == "setdealscan":
         payload["deal_scan_enabled"] = args.casefold().strip() in {"on", "true", "1", "enable", "enabled"}

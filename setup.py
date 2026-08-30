@@ -65,15 +65,24 @@ class SetupError(RuntimeError):
 
 
 class Bootstrap:
-    def __init__(self, non_interactive: bool = False, *, force: bool = False,
-                 abort_on_failure: bool = False, quick: bool = False,
-                 upgrade_forums: bool = False, use_forums: bool | None = None):
+    def __init__(self, non_interactive: bool = False, *, force: bool | None = None,
+                 abort_on_failure: bool | None = None, quick: bool | None = None,
+                 upgrade_forums: bool | None = None, use_forums: bool | None = None):
         self.non_interactive = non_interactive
-        self.force = force
-        self.abort_on_failure = abort_on_failure
-        self.quick = quick
-        self.upgrade_forums = upgrade_forums
-        self.use_forums = use_forums
+        self.cli_force = force
+        self.cli_abort_on_failure = abort_on_failure
+        self.cli_quick = quick
+        self.cli_upgrade_forums = upgrade_forums
+        self.cli_use_forums = use_forums
+
+        # Effective runtime values (defaults before interactive prompt or CI resolution)
+        self.force: bool = bool(force) if force is not None else (os.environ.get("SETUP_FORCE", "").lower() in {"1", "true", "yes"})
+        self.abort_on_failure: bool = bool(abort_on_failure) if abort_on_failure is not None else (os.environ.get("SETUP_ABORT_ON_FAILURE", "").lower() in {"1", "true", "yes"})
+        self.quick: bool = bool(quick) if quick is not None else (os.environ.get("SETUP_QUICK", "").lower() in {"1", "true", "yes"})
+        self.upgrade_forums: bool = bool(upgrade_forums) if upgrade_forums is not None else (os.environ.get("SETUP_UPGRADE_FORUMS", "").lower() in {"1", "true", "yes"})
+        self.use_forums: bool | None = use_forums if use_forums is not None else (
+            os.environ.get("USE_FORUMS", "").lower() in {"1", "true", "yes"} if os.environ.get("USE_FORUMS") else None
+        )
         self.self_check_failures: list[str] = []
         self._existing_cache: dict[tuple[str, str], set[str]] = {}
         self.gh_token = ""
@@ -1038,8 +1047,98 @@ class Bootstrap:
         else:
             print("⚠️ Farm resources are provisioned, but self-check warnings must be fixed before deployment.")
 
+    def prompt_option_toggle(
+        self,
+        title: str,
+        cli_flag: str,
+        explanation: str,
+        cli_value: bool | None,
+        default: bool,
+        env_var: str | None = None,
+    ) -> bool:
+        """Prompt for a configuration toggle with explanation if not already specified via CLI/env."""
+        if cli_value is not None:
+            state_text = "ENABLED" if cli_value else "DISABLED"
+            print(f"✓ {title} ({cli_flag}): {state_text} (from command-line argument)")
+            return cli_value
+        if env_var and os.environ.get(env_var, "").strip():
+            val = os.environ.get(env_var, "").strip().lower() in {"1", "y", "yes", "true", "on"}
+            state_text = "ENABLED" if val else "DISABLED"
+            print(f"✓ {title} ({cli_flag}): {state_text} (from {env_var} environment variable)")
+            return val
+
+        print(f"\n⚙️  {title} (`{cli_flag}`)")
+        print(f"   ℹ️  {explanation}")
+        default_str = "yes" if default else "no"
+        return self.yes_no(f"   👉 Enable {title.lower()}?", default=default)
+
+    def collect_runtime_options(self) -> None:
+        """Present an interactive prompt with explanations for all bootstrap flags."""
+        if self.non_interactive:
+            if self.use_forums is None:
+                env_val = os.environ.get("USE_FORUMS", "").strip().lower()
+                self.use_forums = env_val not in ("0", "false", "no") if env_val else True
+            return
+
+        print("\n" + "=" * 70)
+        print("🛠️  AD FARM BOOTSTRAP CONFIGURATION & SAFETY POLICIES")
+        print("   Configure your setup options interactively below.")
+        print("=" * 70)
+
+        # 1. Quick Setup Mode
+        self.quick = self.prompt_option_toggle(
+            title="Quick Setup Mode",
+            cli_flag="--quick",
+            explanation="Uses recommended production defaults for repository naming, fleet count, and channel mapping, asking only for essential tokens and IDs.",
+            cli_value=self.cli_quick,
+            default=True,
+            env_var="SETUP_QUICK",
+        )
+
+        # 2. Force Overwrite
+        self.force = self.prompt_option_toggle(
+            title="Force Overwrite Secrets & Variables",
+            cli_flag="--force",
+            explanation="Automatically replaces and updates existing GitHub secrets and repository variables across your core and alt repos without prompting on each one.",
+            cli_value=self.cli_force,
+            default=False,
+            env_var="SETUP_FORCE",
+        )
+
+        # 3. Discord Forum Channels
+        self.use_forums = self.prompt_option_toggle(
+            title="Discord Forum Channels for #dm-inbox & #deals",
+            cli_flag="--forums / --no-forums",
+            explanation="Uses ticket-board Forum channels where each buyer has an isolated conversation thread and deal alerts stay separated (recommended over single scrolling text channels).",
+            cli_value=self.cli_use_forums,
+            default=True,
+            env_var="USE_FORUMS",
+        )
+
+        # 4. Recreate / Upgrade Existing Channels
+        self.upgrade_forums = self.prompt_option_toggle(
+            title="Recreate / Upgrade Existing Discord Channels",
+            cli_flag="--upgrade-forums",
+            explanation="Automatically deletes and recreates existing #dm-inbox or #deals channels if their current type in Discord doesn't match your selection (e.g. converting text channels to forums).",
+            cli_value=self.cli_upgrade_forums,
+            default=False,
+            env_var="SETUP_UPGRADE_FORUMS",
+        )
+
+        # 5. Strict Alt Pre-flight Validation
+        self.abort_on_failure = self.prompt_option_toggle(
+            title="Strict Pre-flight Validation",
+            cli_flag="--abort-on-failure",
+            explanation="Immediately halts setup if any alt fails pre-flight validation (e.g. invalid user token, Cloudflare WARP proxy failure) instead of continuing with the remaining alts.",
+            cli_value=self.cli_abort_on_failure,
+            default=False,
+            env_var="SETUP_ABORT_ON_FAILURE",
+        )
+        print("\n" + "=" * 70 + "\n")
+
     def run(self) -> None:
         self.preflight()
+        self.collect_runtime_options()
         self.collect_discord_inputs()
         self.determine_github_owner()
         self.collect_alt_inputs()
@@ -1059,23 +1158,55 @@ def main() -> int:
     )
     parser.add_argument(
         "--quick", "-q",
+        dest="quick",
         action="store_true",
+        default=None,
         help="quick setup mode: accept smart defaults and prompt only for required tokens and IDs",
     )
     parser.add_argument(
+        "--no-quick",
+        dest="quick",
+        action="store_false",
+        help="disable quick setup mode and customize all parameters manually",
+    )
+    parser.add_argument(
         "--force",
+        dest="force",
         action="store_true",
+        default=None,
         help="replace existing GitHub secrets and variables without prompting",
     )
     parser.add_argument(
+        "--no-force",
+        dest="force",
+        action="store_false",
+        help="do not force overwrite existing GitHub secrets and variables",
+    )
+    parser.add_argument(
         "--abort-on-failure",
+        dest="abort_on_failure",
         action="store_true",
+        default=None,
         help="stop with an error if any alt self-check fails",
     )
     parser.add_argument(
+        "--no-abort-on-failure",
+        dest="abort_on_failure",
+        action="store_false",
+        help="continue even if an alt self-check fails",
+    )
+    parser.add_argument(
         "--upgrade-forums",
+        dest="upgrade_forums",
         action="store_true",
+        default=None,
         help="convert existing #dm-inbox and #deals channels to the selected type (forum or text)",
+    )
+    parser.add_argument(
+        "--no-upgrade-forums",
+        dest="upgrade_forums",
+        action="store_false",
+        help="keep existing channels without converting their type",
     )
     parser.add_argument(
         "--forums",
@@ -1091,22 +1222,12 @@ def main() -> int:
         help="use standard Discord Text channels for #dm-inbox and #deals instead of forums",
     )
     args = parser.parse_args()
-    force = args.force or os.environ.get("SETUP_FORCE", "").lower() in {"1", "true", "yes"}
-    abort_on_failure = (
-        args.abort_on_failure
-        or os.environ.get("SETUP_ABORT_ON_FAILURE", "").lower() in {"1", "true", "yes"}
-    )
-    quick = args.quick or os.environ.get("SETUP_QUICK", "").lower() in {"1", "true", "yes"}
-    upgrade_forums = (
-        args.upgrade_forums
-        or os.environ.get("SETUP_UPGRADE_FORUMS", "").lower() in {"1", "true", "yes"}
-    )
     setup = Bootstrap(
         non_interactive=args.non_interactive,
-        force=force,
-        abort_on_failure=abort_on_failure,
-        quick=quick,
-        upgrade_forums=upgrade_forums,
+        force=args.force,
+        abort_on_failure=args.abort_on_failure,
+        quick=args.quick,
+        upgrade_forums=args.upgrade_forums,
         use_forums=args.use_forums,
     )
     try:

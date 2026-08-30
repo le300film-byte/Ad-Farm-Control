@@ -36,6 +36,8 @@ from .dashboard import (
     build_single_alt_embed,
     build_topology_embed,
     build_diagnose_embed,
+    build_analytics_embed,
+    _status_dot,
 )
 
 
@@ -184,6 +186,8 @@ async def _check_perms(inter: discord.Interaction) -> bool:
     return True
 
 
+_unreachable_state_channels: set[int] = set()
+
 async def _hydrate_discord_state() -> None:
     """Rebuild live state from recent dedicated webhook messages after a restart."""
     channel_ids = [
@@ -196,10 +200,16 @@ async def _hydrate_discord_state() -> None:
         if not channel_id or channel_id in seen:
             continue
         seen.add(channel_id)
+        if channel_id in _unreachable_state_channels:
+            continue
         channel = bot.get_channel(channel_id)
         if channel is None:
             try:
                 channel = await bot.fetch_channel(channel_id)
+            except discord.NotFound:
+                _unreachable_state_channels.add(channel_id)
+                print(f"[STATE] Channel {channel_id} no longer exists on Discord (HTTP 404). Run setup to refresh IDs.")
+                continue
             except Exception as exc:
                 print(f"[STATE] Could not fetch channel {channel_id}: {type(exc).__name__}: {exc}")
                 continue
@@ -509,6 +519,10 @@ class ChannelsView(discord.ui.View):
             if repo and config.GITHUB_TOKEN:
                 cids_csv = ",".join(a_obj.channels.keys())
                 await asyncio.to_thread(github_api.set_repository_secret, repo, "CHANNEL_IDS", cids_csv)
+            try:
+                asyncio.create_task(_send_control_wait_ack(self.alt_id, "!rescan", timeout=15))
+            except Exception:
+                pass
         self._build_components()
         embed = self._build_embed()
         await inter.response.edit_message(embed=embed, view=self)
@@ -626,6 +640,11 @@ class FleetTuningView(discord.ui.View):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         chosen_policy = inter.data["values"][0]
         state.set_policy_template(self.alt_id, chosen_policy)
+        try:
+            asyncio.create_task(_send_control_wait_ack(self.alt_id, f"!policy {chosen_policy}", timeout=15))
+            await _log_control(f"🛡️ Policy template **{chosen_policy.upper()}** dispatched to Alt {self.alt_id} from Fleet Tuning UI.")
+        except Exception:
+            pass
         await inter.response.edit_message(embed=self._build_embed(), view=self)
 
     async def _on_rescan(self, inter: discord.Interaction):
@@ -1651,9 +1670,20 @@ async def cmd_simulate(inter: discord.Interaction, alt: int, test_rate: Optional
     await inter.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="squad", description="Manage and view fleet squad pools (e.g. 'Alpha Sellers', 'Night Patrol').")
-@app_commands.describe(action="list, assign, or view squad status", alt="Target alt for assignment", squad_name="Squad name")
-async def cmd_squad(inter: discord.Interaction, action: Literal["list", "assign", "view"], alt: Optional[int] = 0, squad_name: Optional[str] = None):
+@bot.tree.command(name="squad", description="Manage and execute fleet squad operations (view, assign, pause, resume, policy, price).")
+@app_commands.describe(
+    action="Operation (list, assign, view, pause, resume, policy, price)",
+    squad_name="Squad name (e.g. 'Alpha', 'Sellers')",
+    alt="Target alt for individual assignment",
+    value="Value for squad batch operations (preset for policy, or price string for price)",
+)
+async def cmd_squad(
+    inter: discord.Interaction,
+    action: Literal["list", "assign", "view", "pause", "resume", "policy", "price"],
+    squad_name: Optional[str] = None,
+    alt: Optional[int] = 0,
+    value: Optional[str] = None,
+):
     if not await _check_perms(inter):
         return
     if action == "list":
@@ -1661,7 +1691,7 @@ async def cmd_squad(inter: discord.Interaction, action: Literal["list", "assign"
         embed = discord.Embed(title="👥 Fleet Squad Pools", color=0x5865F2)
         for sq, members in squads.items():
             names = [f"Alt {aid} ({state.get_name(aid)})" for aid in members]
-            embed.add_field(name=f"Squad: {sq} ({len(members)})", value=", ".join(names) or "None", inline=False)
+            embed.add_field(name=f"Squad: {sq} ({len(members)} alts)", value=", ".join(names) or "None", inline=False)
         await inter.response.send_message(embed=embed, ephemeral=True)
     elif action == "assign":
         if not alt or not squad_name:
@@ -1675,14 +1705,49 @@ async def cmd_squad(inter: discord.Interaction, action: Literal["list", "assign"
     elif action == "view":
         target_sq = squad_name or "Unassigned"
         members = state.get_squad_members(target_sq)
-        embed = discord.Embed(title=f"👥 Squad: {target_sq}", color=0x5865F2)
+        embed = discord.Embed(title=f"👥 Squad Overview: {target_sq}", color=0x5865F2)
         if members:
+            total_sent = sum(getattr(m, "total_sent", 0) for m in members)
+            total_errors = sum(getattr(m, "error_count", 0) for m in members)
+            avg_health = sum(state.get_health_index(m.alt_id) for m in members) / len(members)
+            embed.description = f"**Fleet Count**: `{len(members)}` | **Avg Health**: `{avg_health:.1f}%` | **Total Posts**: `{total_sent}` | **Errors**: `{total_errors}`"
             for m in members:
                 dot, _ = _status_dot(m)
-                embed.add_field(name=f"{dot} Alt {m.alt_id}: {m.name}", value=f"Health: `{state.get_health_index(m.alt_id)}%` | Status: `{m.status}`", inline=False)
+                embed.add_field(
+                    name=f"{dot} Alt {m.alt_id}: {m.name}",
+                    value=f"Health: `{state.get_health_index(m.alt_id)}%` | Status: `{m.status}` | Sent: `{m.total_sent}` | Policy: `{getattr(m, 'policy_template', 'balanced')}`",
+                    inline=False,
+                )
         else:
             embed.description = f"No alts assigned to squad '{target_sq}'."
         await inter.response.send_message(embed=embed, ephemeral=True)
+    elif action in ("pause", "resume", "policy", "price"):
+        if not squad_name:
+            await inter.response.send_message("❌ `squad_name` is required for batch squad actions.", ephemeral=True)
+            return
+        members = state.get_squad_members(squad_name)
+        if not members:
+            await inter.response.send_message(f"❌ No alts found in squad '{squad_name}'.", ephemeral=True)
+            return
+        if action == "policy" and not value:
+            await inter.response.send_message("❌ `value` parameter required for policy (stealth, aggressive, peak_hour, balanced).", ephemeral=True)
+            return
+        if action == "price" and not value:
+            await inter.response.send_message("❌ `value` parameter required for price (e.g. '$15/mil').", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        results = []
+        for m in members:
+            cmd = f"!{action}" if action in ("pause", "resume") else f"!{action} {value}"
+            ack = await _send_control_wait_ack(m.alt_id, cmd, timeout=10)
+            if action == "policy" and value:
+                state.set_policy_template(m.alt_id, value)
+            elif action == "price" and value:
+                state.set_price(m.alt_id, value)
+            results.append(f"• **Alt {m.alt_id}** ({m.name}): {ack}")
+        summary = f"👥 **Squad '{squad_name}' Batch {action.upper()}** ({len(members)} alts):\n" + "\n".join(results)
+        await inter.followup.send(summary, ephemeral=True)
+        await _log_control(summary)
 
 
 @bot.tree.command(name="policy", description="Apply pre-packaged channel policy templates (stealth, aggressive, peak_hour, balanced).")
@@ -1695,7 +1760,15 @@ async def cmd_policy(inter: discord.Interaction, alt: int, template: Literal["st
         return
     ok = state.set_policy_template(alt, template)
     if ok:
-        await inter.response.send_message(f"✅ Policy template **{template.upper()}** applied to Alt {alt}. Parameters updated.", ephemeral=True)
+        try:
+            asyncio.create_task(_send_control_wait_ack(alt, f"!policy {template}", timeout=15))
+        except Exception:
+            pass
+        await inter.response.send_message(f"✅ Policy template **{template.upper()}** applied to Alt {alt}. Parameters updated and queued to runner.", ephemeral=True)
+        try:
+            await _log_control(f"🛡️ Policy template **{template.upper()}** dispatched to Alt {alt}.")
+        except Exception:
+            pass
     else:
         await inter.response.send_message(f"❌ Failed to apply policy template '{template}'.", ephemeral=True)
 
@@ -1751,6 +1824,232 @@ async def cmd_canary(inter: discord.Interaction, alt: Optional[int] = 0):
     await inter.followup.send(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="analytics", description="View advanced fleet speed matrix, channel velocities, and cadence analytics.")
+@app_commands.describe(alt="Target specific alt (or 0 / blank for all alts)")
+async def cmd_analytics(inter: discord.Interaction, alt: Optional[int] = 0):
+    if not await _check_perms(inter):
+        return
+    await _fresh_state()
+    embed = build_analytics_embed(state, target_alt=alt or 0)
+    await inter.response.send_message(embed=embed, ephemeral=True)
+
+
+# =========================================================================== #
+# Hierarchical Subcommand Architecture (Groups)                               #
+# =========================================================================== #
+fleet_group = app_commands.Group(name="fleet", description="Fleet overview, analytics, topology, canary probes, and global sync")
+alt_group = app_commands.Group(name="alt", description="Alt provisioning, lifecycle, logs, self-check, and runner control")
+channel_group = app_commands.Group(name="channel", description="Advertising channel manager, additions, swaps, and rescans")
+tune_group = app_commands.Group(name="tune", description="Live ad pricing, mode, message, cadence, and operational policy tuning")
+deals_group = app_commands.Group(name="deals_group", description="Passive marketplace deal scanner and arbitrage margin controls")
+
+# --- Fleet Group Subcommands ---
+@fleet_group.command(name="status", description="Fleet-wide dashboard summary or individual alt status card.")
+@app_commands.describe(alt="Target alt (or 0 for all)")
+async def fleet_status_sub(inter: discord.Interaction, alt: Optional[int] = 0):
+    await cmd_status.callback(inter, alt=alt or 0)
+
+@fleet_group.command(name="analytics", description="Advanced speed matrix, channel velocities, and cadence analytics.")
+@app_commands.describe(alt="Target alt (or 0 for all)")
+async def fleet_analytics_sub(inter: discord.Interaction, alt: Optional[int] = 0):
+    await cmd_analytics.callback(inter, alt=alt or 0)
+
+@fleet_group.command(name="topology", description="Render the live visual fleet topology graph.")
+async def fleet_topology_sub(inter: discord.Interaction):
+    await cmd_topology.callback(inter)
+
+@fleet_group.command(name="canary", description="Synthetic in-band health probe testing GitHub, Gist, and webhook infrastructure.")
+@app_commands.describe(alt="Optional specific alt to probe")
+async def fleet_canary_sub(inter: discord.Interaction, alt: Optional[int] = 0):
+    await cmd_canary.callback(inter, alt=alt or 0)
+
+@fleet_group.command(name="sync", description="Broadcast instant reload of control Gists and variation blocklists across all alts.")
+async def fleet_sync_sub(inter: discord.Interaction):
+    await cmd_sync.callback(inter)
+
+@fleet_group.command(name="refresh", description="Force live poll of GitHub Actions workflow states and refresh dashboard embed.")
+async def fleet_refresh_sub(inter: discord.Interaction):
+    await cmd_refresh.callback(inter)
+
+@fleet_group.command(name="dashboard", description="Post fresh persistent 3-card dashboard snapshot in #ad-dashboard.")
+async def fleet_dashboard_sub(inter: discord.Interaction):
+    await cmd_dashboard.callback(inter)
+
+# --- Alt Group Subcommands ---
+@alt_group.command(name="run", description="Start an alt run using the private interactive launcher.")
+async def alt_run_sub(inter: discord.Interaction):
+    await cmd_run.callback(inter)
+
+@alt_group.command(name="stop", description="Stop an alt's run and cancel active workflow.")
+@app_commands.describe(alt="Target alt")
+async def alt_stop_sub(inter: discord.Interaction, alt: int):
+    await cmd_stop.callback(inter, alt=alt)
+
+@alt_group.command(name="pause", description="Pause an alt's public posting.")
+@app_commands.describe(alt="Target alt")
+async def alt_pause_sub(inter: discord.Interaction, alt: int):
+    await cmd_pause.callback(inter, alt=alt)
+
+@alt_group.command(name="resume", description="Resume an alt's public posting.")
+@app_commands.describe(alt="Target alt")
+async def alt_resume_sub(inter: discord.Interaction, alt: int):
+    await cmd_resume.callback(inter, alt=alt)
+
+@alt_group.command(name="list", description="List configured alts without exposing sensitive tokens.")
+async def alt_list_sub(inter: discord.Interaction):
+    await cmd_altlist.callback(inter)
+
+@alt_group.command(name="add", description="Add an alt account through the private modal.")
+async def alt_add_sub(inter: discord.Interaction):
+    await cmd_altadd.callback(inter)
+
+@alt_group.command(name="update", description="Update an alt's credentials or repository slug.")
+@app_commands.describe(alt="Target alt")
+async def alt_update_sub(inter: discord.Interaction, alt: int):
+    await cmd_altupdate.callback(inter, alt=alt)
+
+@alt_group.command(name="remove", description="Remove an alt from the registry.")
+@app_commands.describe(alt="Target alt", confirmation="Type DELETE to confirm", delete_repository="Also delete GitHub repo")
+async def alt_remove_sub(inter: discord.Interaction, alt: int, confirmation: str, delete_repository: bool = False):
+    await cmd_altremove.callback(inter, alt=alt, confirmation=confirmation, delete_repository=delete_repository)
+
+@alt_group.command(name="runs", description="List recent GitHub Actions workflow runs.")
+@app_commands.describe(alt="Target alt", limit="Max runs (1..10)")
+async def alt_runs_sub(inter: discord.Interaction, alt: int, limit: int = 5):
+    await cmd_runs.callback(inter, alt=alt, limit=limit)
+
+@alt_group.command(name="logs", description="Stream typed buffered log events for an alt.")
+@app_commands.describe(alt="Target alt", limit="Max entries (5..50)", kind="Category filter", search="Search keyword")
+async def alt_logs_sub(inter: discord.Interaction, alt: int, limit: int = 15,
+                       kind: Optional[Literal["ALL", "ERROR", "DEAL", "CONTROL", "CHANNEL", "CAUTION", "DEBUG"]] = "ALL",
+                       search: Optional[str] = None):
+    await cmd_logs.callback(inter, alt=alt, limit=limit, kind=kind, search=search)
+
+@alt_group.command(name="clearlogs", description="Clear in-memory buffered log events for an alt.")
+@app_commands.describe(alt="Target alt")
+async def alt_clearlogs_sub(inter: discord.Interaction, alt: int):
+    await cmd_clearlogs.callback(inter, alt=alt)
+
+@alt_group.command(name="diagnose", description="Causal state-transition explorer and root-cause analysis.")
+@app_commands.describe(alt="Target alt")
+async def alt_diagnose_sub(inter: discord.Interaction, alt: int):
+    await cmd_diagnose.callback(inter, alt=alt)
+
+@alt_group.command(name="simulate", description="Sandboxed dry-run previewing variation scores without sending.")
+@app_commands.describe(alt="Target alt", test_rate="Optional test pricing rate")
+async def alt_simulate_sub(inter: discord.Interaction, alt: int, test_rate: Optional[float] = None):
+    await cmd_simulate.callback(inter, alt=alt, test_rate=test_rate)
+
+@alt_group.command(name="selfcheck", description="Dispatch self-check pre-flight validation workflow.")
+@app_commands.describe(alt="Target alt")
+async def alt_selfcheck_sub(inter: discord.Interaction, alt: int):
+    await cmd_selfcheck.callback(inter, alt=alt)
+
+@alt_group.command(name="ping", description="Test round-trip latency of the Gist queue for an alt.")
+@app_commands.describe(alt="Target alt")
+async def alt_ping_sub(inter: discord.Interaction, alt: int):
+    await cmd_pingalt.callback(inter, alt=alt)
+
+# --- Channel Group Subcommands ---
+@channel_group.command(name="list", description="Open the visual Channel Manager UI.")
+@app_commands.describe(alt="Target alt")
+async def channel_list_sub(inter: discord.Interaction, alt: Optional[int] = 1):
+    await cmd_channels.callback(inter, alt=alt or 1)
+
+@channel_group.command(name="add", description="Add and verify a trading channel on an alt.")
+@app_commands.describe(alt="Target alt", channel_id="Discord channel ID", name="Optional channel name/label")
+async def channel_add_sub(inter: discord.Interaction, alt: int, channel_id: str, name: Optional[str] = ""):
+    await cmd_setchannel.callback(inter, alt=alt, channel_id=channel_id, name=name or "")
+
+@channel_group.command(name="replace", description="Swap an old channel with a new one.")
+@app_commands.describe(alt="Target alt", old_id="Old channel ID", new_id="New channel ID", name="Optional name")
+async def channel_replace_sub(inter: discord.Interaction, alt: int, old_id: str, new_id: str, name: Optional[str] = ""):
+    await cmd_replacechannel.callback(inter, alt=alt, old_id=old_id, new_id=new_id, name=name or "")
+
+@channel_group.command(name="rescan", description="Force immediate channel permission and slowmode rescan.")
+@app_commands.describe(alt="Target alt")
+async def channel_rescan_sub(inter: discord.Interaction, alt: int):
+    await cmd_rescan_channels.callback(inter, alt=alt)
+
+@channel_group.command(name="resetcaution", description="Reset Caution Mode backoff and clear strike counters.")
+@app_commands.describe(alt="Target alt", channel_id="Optional channel ID or 'all'")
+async def channel_resetcaution_sub(inter: discord.Interaction, alt: int, channel_id: Optional[str] = None):
+    await cmd_resetcaution.callback(inter, alt=alt, channel_id=channel_id or "")
+
+# --- Tune Group Subcommands ---
+@tune_group.command(name="settings", description="Open the interactive Fleet Tuning UI.")
+@app_commands.describe(alt="Target alt (or 0 for all)")
+async def tune_settings_sub(inter: discord.Interaction, alt: Optional[int] = 0):
+    await cmd_settings.callback(inter, alt=alt or 0)
+
+@tune_group.command(name="price", description="Update active pricing rate.")
+@app_commands.describe(alt="Target alt", new_price="Rate per 1k units (e.g. 2.50)")
+async def tune_price_sub(inter: discord.Interaction, alt: int, new_price: str):
+    await cmd_setprice.callback(inter, alt=alt, new_price=new_price)
+
+@tune_group.command(name="mode", description="Switch trade mode between Seller and Buyer.")
+@app_commands.describe(alt="Target alt", mode="Trade mode")
+async def tune_mode_sub(inter: discord.Interaction, alt: int, mode: Literal["sell", "buy"]):
+    await cmd_setmode.callback(inter, alt=alt, mode=mode)
+
+@tune_group.command(name="message", description="Replace ad message copy and regenerate anti-detection variations.")
+@app_commands.describe(alt="Target alt", new_message="New base message copy")
+async def tune_message_sub(inter: discord.Interaction, alt: int, new_message: str):
+    await cmd_setmessage.callback(inter, alt=alt, new_message=new_message)
+
+@tune_group.command(name="policy", description="Apply pre-packaged operational policy template.")
+@app_commands.describe(alt="Target alt", template="Preset name")
+async def tune_policy_sub(inter: discord.Interaction, alt: int, template: Literal["stealth", "aggressive", "peak_hour", "balanced"]):
+    await cmd_policy.callback(inter, alt=alt, template=template)
+
+@tune_group.command(name="interval", description="Set posting interval (3 or 5 minutes).")
+@app_commands.describe(alt="Target alt", interval="Interval in minutes")
+async def tune_interval_sub(inter: discord.Interaction, alt: int, interval: Literal[3, 5]):
+    await cmd_setinterval.callback(inter, alt=alt, interval=interval)
+
+@tune_group.command(name="runtime", description="Set execution runtime duration.")
+@app_commands.describe(alt="Target alt", hours="Total hours")
+async def tune_runtime_sub(inter: discord.Interaction, alt: int, hours: Literal[6, 12, 18, 24, 48]):
+    await cmd_setruntime.callback(inter, alt=alt, hours=hours)
+
+@tune_group.command(name="image", description="Upload or replace ad image in alt repository.")
+@app_commands.describe(alt="Target alt (or 0 for all)", image="Image file (.png, .jpg, .webp)")
+async def tune_image_sub(inter: discord.Interaction, alt: int, image: discord.Attachment):
+    await cmd_uploadimage.callback(inter, alt=alt, image=image)
+
+@tune_group.command(name="reply", description="Relay private DM reply directly to buyer through alt account.")
+@app_commands.describe(alt="Target alt", user="Buyer Discord User ID", text="Message content")
+async def tune_reply_sub(inter: discord.Interaction, alt: int, user: str, text: str):
+    await cmd_reply.callback(inter, alt=alt, user=user, text=text)
+
+# --- Deals Group Subcommands ---
+@deals_group.command(name="view", description="Display deal-alert metrics, profit margins, and recent alerts.")
+@app_commands.describe(alt="Target alt (or 0 for all)")
+async def deals_view_sub(inter: discord.Interaction, alt: Optional[int] = 0):
+    await cmd_deals.callback(inter, alt=alt or 0)
+
+@deals_group.command(name="scan", description="Toggle passive marketplace deal scanning on or off.")
+@app_commands.describe(alt="Target alt", enabled="Enable or disable scanner")
+async def deals_scan_sub(inter: discord.Interaction, alt: int, enabled: Literal["on", "off"]):
+    await cmd_setdealscan.callback(inter, alt=alt, enabled=enabled)
+
+@deals_group.command(name="delta", description="Set minimum profit margin edge required per 1k units.")
+@app_commands.describe(alt="Target alt", delta="Profit margin threshold (e.g. 0.05)")
+async def deals_delta_sub(inter: discord.Interaction, alt: int, delta: str):
+    await cmd_setdealdelta.callback(inter, alt=alt, delta=delta)
+
+@deals_group.command(name="keywords", description="Configure whole-phrase target item/game aliases for the deal scanner.")
+@app_commands.describe(alt="Target alt", keywords="Comma-separated item aliases (e.g. 'Blade Ball, BB token, BB')")
+async def deals_keywords_sub(inter: discord.Interaction, alt: int, keywords: str):
+    await cmd_setdealkeywords.callback(inter, alt=alt, keywords=keywords)
+
+bot.tree.add_command(fleet_group)
+bot.tree.add_command(alt_group)
+bot.tree.add_command(channel_group)
+bot.tree.add_command(tune_group)
+bot.tree.add_command(deals_group)
+
+
 _COMMAND_GUIDE = {
     "altadd": ("`/altadd` (opens private modal)", "Adds an existing alt repository to the control bot fleet. Prompts privately for Alt ID, Repository slug (`owner/repo`), Display Name, and USER_TOKEN. Secrets are masked and never logged."),
     "altupdate": ("`/altupdate alt:<alt>` (opens private modal)", "Updates an alt's configuration (Token, Repository, Discord ID, or Display Name). Blank fields are left unchanged."),
@@ -1785,8 +2084,13 @@ _COMMAND_GUIDE = {
     "deals": ("`/deals [alt:<alt>|All alts]`", "Displays deal-alert metrics, profit edges, scanner status, threshold, and active item keywords."),
     "diagnose": ("`/diagnose alt:<alt>`", "Causal Event Explorer: deep root-cause diagnostic timeline, transition triggers, health index, and actionable operator recommendations."),
     "topology": ("`/topology`", "Renders the live visual fleet topology graph: alts, squad pools, target Discord channels, yield grades, and egress routing."),
+    "analytics": ("`/analytics [alt:<alt>]`", "Visual Fleet Speed Matrix: renders per-channel velocities, delivery reliability bars, slowmode utilization, and inter-channel interval timelines."),
+    "fleet": ("`/fleet <status|analytics|topology|canary|sync|refresh>`", "Hierarchical fleet group: manage overall fleet status, advanced analytics, topology, synthetic probes, and broadcast sync."),
+    "alt": ("`/alt <run|stop|pause|resume|list|logs|diagnose|selfcheck>`", "Hierarchical alt group: control individual alt lifecycles, streaming logs, root-cause diagnosis, and workflow runs."),
+    "channel": ("`/channel <list|add|replace|rescan|resetcaution>`", "Hierarchical channel group: visual channel management, runtime additions, swaps, permission rescans, and caution clears."),
+    "tune": ("`/tune <settings|price|policy|interval|mode|message>`", "Hierarchical tuning group: ad message copy, pricing rates, operational policy templates, and cadence settings."),
     "simulate": ("`/simulate alt:<alt> [test_rate:float]`", "Sandboxed dry-run simulation: previews variation generation, typist permutations, and estimated survival score without sending live messages."),
-    "squad": ("`/squad action:<list|assign|view> [alt] [squad_name]`", "Fleet Squad Manager: `list` (view all squad pools), `assign` (assign alt to a named squad like 'Alpha Sellers'), `view` (view squad members)."),
+    "squad": ("`/squad action:<list|assign|view|pause|resume|policy|price> [squad_name] [alt] [value]`", "Fleet Squad Manager: `list` (all squads), `assign` (alt to squad), `view` (squad health & members), `pause`/`resume` (batch fleet controls), `policy`/`price` (batch configuration update across squad)."),
     "policy": ("`/policy alt:<alt> template:<stealth|aggressive|peak_hour|balanced>`", "Applies pre-packaged operational profiles:\n• `🛡️ stealth`: 5m interval, max typing jitter, soft copy, strict caution.\n• `⚡ aggressive`: 3m interval, high throughput, fast inter-channel rotation.\n• `🔥 peak_hour`: 3m interval, dynamic chat velocity cadence, active deal scanning.\n• `⚖️ balanced`: 5m interval, standard human jitter, balanced deal thresholds."),
     "canary": ("`/canary [alt]`", "Synthetic In-Band Probe: tests GitHub API, Gist bridge sync, and token latency in milliseconds."),
     "reply": ("`/reply alt:<alt> user:<buyer_id> text:<message>`", "Operator DM Relay: transmits your message through the selected alt account directly into the buyer's private DM."),
@@ -2135,6 +2439,10 @@ def _parse_dashboard_message(message: discord.Message):
                     m = re.search(r"(\d+(?:\.\d{1,2})?)", value)
                     if m:
                         payload["rate"] = float(m.group(1))
+                elif key in {"cadence", "interval"}:
+                    m = re.search(r"(\d+)\s*m?", value)
+                    if m:
+                        payload["interval_min"] = int(m.group(1))
                 elif key == "activity":
                     for label, target in (("sent", "total_sent"), ("errors", "total_errors"), ("skips", "total_skips")):
                         m = re.search(rf"{label}:?\s*`?(\d+)", value, re.I)

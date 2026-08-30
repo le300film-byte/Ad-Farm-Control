@@ -36,51 +36,96 @@
 
 ## 2. Complete Slash Command & Control Manual
 
-When advising the operator on Discord commands, use the exact slash command syntax:
+When advising the operator on Discord commands, both the **Hierarchical Subcommand Syntax** and direct slash command aliases are fully supported:
 
-| Command | Arguments | What it Does & When to Use It |
+### 🌐 Fleet Management (`/fleet ...`)
+| Subcommand | Arguments | Function & Use Case |
 |---|---|---|
-| `/run` | *(None — opens private modal)* | **Start/Launch Run:** Opens 3-step interactive setup wizard (Alt, Sell/Buy, Interval 3/5m, Runtime 6/12/18/24/48h, Rates, Style, Image). |
-| `/status` | `[alt: 0 for All]` | **Fleet Health Overview:** Shows live heartbeat status (`🟢 active`, `🟡 paused`, `⚠️ caution`, `⚫ offline`), sent count, error tally, and uptime. |
-| `/settings` | `[alt: 0 for All]` | **Configuration Inspector:** Aggregates cadence, interval, deal scanner state, repository mapping, and active ad preview. |
-| `/channels` | `[alt: ID]` | **Interactive Channel Manager:** Visual embed with one-click buttons to Add, Remove, Rescan, Reset Caution, or Export channel lists. |
-| `/uploadimage` | `alt: ID (0=All), image: File` | **In-Flight Image Update:** Uploads `.png`/`.jpg`/`.webp` directly into the alt repository as `ad_image.png`. |
-| `/setchannel` | `alt: ID, channel_id: Digits, [name]` | **Add Channel:** Validates and adds a channel ID to the live runner and persists it to GitHub Actions Secrets. |
-| `/replacechannel` | `alt: ID, old_id, new_id, [name]` | **Hot-Swap Channel:** Replaces dead/404 channel with a new one; migrates stats and updates repo secrets. |
-| `/rescan_channels` | `alt: ID` | **Force Channel Rescan:** Forces the alt to refresh guild caches, check permissions, and re-verify channel names. |
-| `/resetcaution` | `alt: ID, [channel_id: 'all' or ID]` | **Clear Strikes & Caution:** Unbans channel from Caution Mode and clears slowmode backoffs. |
-| `/setinterval` | `alt: ID, interval: <3\|5>` | **Cadence Tuning:** Sets posting delay between 3 or 5 minutes (enforces safety limits). |
-| `/setruntime` | `alt: ID, hours: <6\|12\|18\|24\|48>` | **Execution Budget:** Extends or caps runtime hours for GitHub Actions runs. |
-| `/setprice` | `alt: ID, new_price: <0..20>` | **Update Rate:** Dynamically rewrites pricing rate (e.g. `2.50`) inside the active ad message. |
-| `/setmode` | `alt: ID, mode: <sell\|buy>` | **Swap Trade Mode:** Toggles between Seller mode (`💰`) and Buyer mode (`🛒`). |
-| `/setmessage` | `alt: ID, new_message: Text` | **Update Primary Ad Copy:** Pushes fresh base copy; triggers variation builder rebuild. |
-| `/setdealkeywords` | `alt: ID, keywords: List` | **Configure Deal Target Items:** Sets comma-separated item aliases (e.g. `Blade Ball, BB token, BB`) for the deal scanner. |
-| `/setdealscan` | `alt: ID, enabled: <on\|off>` | **Toggle Deal Scanner:** Enables/disables deal scanning without affecting ad rotations. |
-| `/setdealdelta` | `alt: ID, delta: <0..5>` | **Set Profit Margin:** Sets minimum profit edge per 1k units required before triggering a deal alert (default `$0.05`). |
-| `/pause` / `/resume` | `alt: ID` | **Temporary Standby:** Halts or resumes ad delivery without canceling the GitHub workflow. |
-| `/stop` | `alt: ID` | **Graceful Shutdown:** Stops ad sender cleanly, syncs blocklist, and cancels GitHub runner. |
-| `/sync` | *(None)* | **Fleet-Wide State Reload:** Tells all alts to immediately reload shared Gist state and blocklists. |
-| `/logs` | `alt: ID, [limit], [kind], [search]` | **Log Stream:** Filters typed buffered logs (`ALL`, `ERROR`, `DEAL`, `CONTROL`, `CHANNEL`, `CAUTION`, `DEBUG`) with keyword search. |
-| `/diagnose` | `alt: ID` | **Causal Event Explorer:** Deep root-cause diagnostic analysis, causal transition timeline, and operator recommendations. |
-| `/topology` | *(None)* | **Fleet Topology Graph:** Visual mapping of alts, squads, target Discord channels, egress proxies, and Gist bridges. |
-| `/simulate` | `alt: ID, [test_rate]` | **Sandboxed Dry-Run:** Preview ad copy variations, anti-detection flags, and cadence without sending live Discord messages. |
-| `/squad` | `action: <list\|assign\|view>, [alt], [squad_name]` | **Squad Pools:** Group alts into logical squads (`Alpha Sellers`, `Night Patrol`) and manage pool assignments. |
-| `/policy` | `alt: ID, template: <stealth\|aggressive\|peak_hour\|balanced>` | **Policy Preset:** Apply pre-packaged operational profiles (interval, typing jitter, typo rate, caution rules) in one click. |
-| `/canary` | `[alt]` | **Synthetic Health Probe:** In-band probe testing GitHub API, Gist bridge sync, and token latency in milliseconds. |
-| `/reply` | `alt: ID, user: UserID, text: Message` | **DM Operator Relay:** Transmits a message through the selected alt directly to a buyer's DM. |
-| `/selfcheck` | `alt: ID` | **Pre-Flight Sanity Test:** Dispatches `self_check.yml` to validate tokens, webhooks, and routing. |
-| `/runs` | `alt: ID` | **GitHub Run Inspector:** Lists recent workflow runs and direct links without leaking secrets. |
+| `/fleet status` (or `/status`) | `[alt: 0 for All]` | **Fleet Health Overview:** Shows live heartbeat status (`🟢 active`, `🟡 paused`, `⚠️ caution`, `⚫ offline`), sent count, error tally, and uptime. |
+| `/fleet analytics` (or `/analytics`) | `[alt: 0 for All]` | **Advanced Speed Matrix:** Renders ASCII progress gauges, message velocities, per-channel delivery reliability %, and slowmode utilization. |
+| `/fleet topology` (or `/topology`) | *(None)* | **Fleet Topology Graph:** Visual mapping of alts, squads, target Discord channels, egress proxies, and Gist bridges. |
+| `/fleet canary` (or `/canary`) | `[alt: 0 for All]` | **Synthetic Health Probe:** In-band probe testing GitHub API, Gist bridge sync, and token latency in milliseconds. |
+| `/fleet sync` (or `/sync`) | *(None)* | **Fleet-Wide State Reload:** Tells all alts to immediately reload shared Gist state and blocklists. |
+| `/fleet refresh` (or `/refresh`) | *(None)* | **Live Actions Poll:** Forces an immediate poll of active GitHub Actions workflow runs and refreshes dashboard. |
+| `/fleet dashboard` (or `/dashboard`) | *(None)* | **Post Dashboard:** Re-renders and posts the persistent 3-card dashboard snapshot in `#ad-dashboard`. |
+
+### 🤖 Alt Operations (`/alt ...`)
+| Subcommand | Arguments | Function & Use Case |
+|---|---|---|
+| `/alt run` (or `/run`) | *(None — opens private modal)* | **Start/Launch Run:** Opens 3-step interactive setup wizard (Alt, Sell/Buy, Interval 3/5m, Runtime 6/12/18/24/48h, Rates, Style, Image). |
+| `/alt stop` (or `/stop`) | `alt: ID` | **Graceful Shutdown:** Stops ad sender cleanly, syncs blocklist, and cancels GitHub runner. |
+| `/alt pause` (or `/pause`) | `alt: ID` | **Temporary Standby:** Halts public ad delivery without canceling the GitHub workflow. |
+| `/alt resume` (or `/resume`) | `alt: ID` | **Resume Posting:** Resumes public ad delivery from pause. |
+| `/alt list` (or `/altlist`) | *(None)* | **Registry List:** Displays registered fleet alts, repository links, configured mode, and live heartbeat age. |
+| `/alt add` (or `/altadd`) | *(None — opens modal)* | **Add Alt:** Validates token, auto-creates repository, populates secrets, and registers alt into fleet. |
+| `/alt update` (or `/altupdate`) | `alt: ID` | **Update Credentials:** Privately updates an alt's token, repository, Discord ID, or display name. |
+| `/alt remove` (or `/altremove`) | `alt: ID, confirmation: DELETE` | **Remove Alt:** Unregisters an alt from the fleet; optionally permanently deletes repository. |
+| `/alt runs` (or `/runs`) | `alt: ID, [limit: 1..10]` | **Workflow Runs:** Lists recent GitHub Actions workflow runs, statuses, and links without leaking secrets. |
+| `/alt logs` (or `/logs`) | `alt: ID, [limit], [kind], [search]` | **Log Stream:** Filters typed buffered logs (`ALL`, `ERROR`, `DEAL`, `CONTROL`, `CHANNEL`, `CAUTION`, `DEBUG`) with keyword search. |
+| `/alt clearlogs` (or `/clearlogs`) | `alt: ID` | **Clear Buffer:** Clears in-memory buffered log history. |
+| `/alt selfcheck` (or `/selfcheck`) | `alt: ID` | **Pre-Flight Sanity Test:** Dispatches `self_check.yml` to validate tokens, webhooks, and routing. |
+| `/alt diagnose` (or `/diagnose`) | `alt: ID` | **Causal Event Explorer:** Deep root-cause diagnostic analysis, causal transition timeline, and operator recommendations. |
+| `/alt simulate` (or `/simulate`) | `alt: ID, [test_rate]` | **Sandboxed Dry-Run:** Preview ad copy variations, anti-detection flags, and cadence without sending live Discord messages. |
+| `/alt ping` (or `/pingalt`) | `alt: ID` | **Transport Test:** Tests round-trip latency of the Gist command queue without altering settings. |
+
+### 📌 Channel Management (`/channel ...`)
+| Subcommand | Arguments | Function & Use Case |
+|---|---|---|
+| `/channel list` (or `/channels`) | `[alt: ID]` | **Interactive Channel Manager:** Visual embed with one-click buttons to Add, Remove, Rescan, Reset Caution, or Export channel lists. |
+| `/channel add` (or `/setchannel`) | `alt: ID, channel_id: Digits, [name]` | **Add Channel:** Validates and adds a channel ID to the live runner and persists it to GitHub Actions Secrets. |
+| `/channel replace` (or `/replacechannel`) | `alt: ID, old_id, new_id, [name]` | **Hot-Swap Channel:** Replaces dead/404 channel with a new one; migrates stats and updates repo secrets. |
+| `/channel rescan` (or `/rescan_channels`) | `alt: ID` | **Force Channel Rescan:** Forces the alt to refresh guild caches, check permissions, and re-verify channel names. |
+| `/channel resetcaution` (or `/resetcaution`) | `alt: ID, [channel_id: 'all' or ID]` | **Clear Strikes & Caution:** Unbans channel from Caution Mode and clears slowmode backoffs. |
+
+### ⚙️ Ad Tuning & Policy (`/tune ...`)
+| Subcommand | Arguments | Function & Use Case |
+|---|---|---|
+| `/tune settings` (or `/settings`) | `[alt: 0 for All]` | **Configuration Inspector:** Aggregates cadence, interval, deal scanner state, repository mapping, and active ad preview. |
+| `/tune price` (or `/setprice`) | `alt: ID, new_price: <0..20>` | **Update Rate:** Dynamically rewrites pricing rate (e.g. `2.50`) inside the active ad message. |
+| `/tune mode` (or `/setmode`) | `alt: ID, mode: <sell\|buy>` | **Swap Trade Mode:** Toggles between Seller mode (`💰`) and Buyer mode (`🛒`). |
+| `/tune message` (or `/setmessage`) | `alt: ID, new_message: Text` | **Update Primary Ad Copy:** Pushes fresh base copy; triggers variation builder rebuild. |
+| `/tune policy` (or `/policy`) | `alt: ID, template: <stealth\|aggressive\|peak_hour\|balanced>` | **Policy Preset:** Apply pre-packaged operational profiles (interval, typing jitter, typo rate, caution rules) in one click. |
+| `/tune interval` (or `/setinterval`) | `alt: ID, interval: <3\|5>` | **Cadence Tuning:** Sets posting delay between 3 or 5 minutes (enforces safety limits). |
+| `/tune runtime` (or `/setruntime`) | `alt: ID, hours: <6\|12\|18\|24\|48>` | **Execution Budget:** Extends or caps runtime hours for GitHub Actions runs. |
+| `/tune image` (or `/uploadimage`) | `alt: ID (0=All), image: File` | **In-Flight Image Update:** Uploads `.png`/`.jpg`/`.webp` directly into the alt repository as `ad_image.png`. |
+| `/tune reply` (or `/reply`) | `alt: ID, user: UserID, text: Message` | **DM Operator Relay:** Transmits a message through the selected alt directly to a buyer's DM. |
+
+### 💰 Arbitrage Deal Scanner (`/deals ...`)
+| Subcommand | Arguments | Function & Use Case |
+|---|---|---|
+| `/deals view` (or `/deals`) | `[alt: 0 for All]` | **Deal Metrics:** Displays deal-alert counters, profit margins, and latest timestamps. |
+| `/deals scan` (or `/setdealscan`) | `alt: ID, enabled: <on\|off>` | **Toggle Deal Scanner:** Enables/disables deal scanning without affecting ad rotations. |
+| `/deals delta` (or `/setdealdelta`) | `alt: ID, delta: <0..5>` | **Set Profit Margin:** Sets minimum profit edge per 1k units required before triggering a deal alert (default `$0.05`). |
+| `/deals keywords` (or `/setdealkeywords`) | `alt: ID, keywords: List` | **Configure Deal Target Items:** Sets comma-separated item aliases (e.g. `Blade Ball, BB token, BB`) for the deal scanner. |
+
+### 👥 Squad Batch Operations (`/squad ...`)
+| Subcommand | Arguments | Function & Use Case |
+|---|---|---|
+| `/squad list` | *(None)* | **View Squad Pools:** Lists all fleet squad pools and assigned members. |
+| `/squad view` | `squad_name: Name` | **Squad Overview:** Composite squad health score, total posts, error tally, and member statuses. |
+| `/squad assign` | `alt: ID, squad_name: Name` | **Assign Alt:** Assigns an alt to a named squad (e.g. `Alpha Sellers`). |
+| `/squad pause` | `squad_name: Name` | **Batch Pause:** Pauses public ad posting across all alts in the squad simultaneously. |
+| `/squad resume` | `squad_name: Name` | **Batch Resume:** Resumes public ad posting across all alts in the squad simultaneously. |
+| `/squad policy` | `squad_name: Name, value: Template` | **Batch Policy:** Applies an operational policy preset across all alts in the squad. |
+| `/squad price` | `squad_name: Name, value: Rate` | **Batch Price:** Updates the pricing rate across all alts in the squad. |
 
 ---
 
-## 3. Deal Scanner & Keyword Strategy Engine
+## 3. Directional Arbitrage Deal Scanner
 
-The deal scanner continuously monitors marketplace channels, parses other users' trade offers, and fires webhooks into `#deals` when a profitable arbitrage deal is detected.
+The deal scanner continuously monitors marketplace channels, parses other users' trade offers, categorizes them directionally, and fires webhooks into `#deals` when an actionable arbitrage opportunity is detected:
 
-### Deal Detection Mechanics
-- **Formula:** A deal alerts if `(MY_RATE - OFFER_RATE) >= DEAL_ALERT_DELTA` (when buying) or `(OFFER_RATE - MY_RATE) >= DEAL_ALERT_DELTA` (when selling).
-- **Hard Constraint:** A message **only** alerts if it matches at least one keyword in `DEAL_ITEM_KEYWORDS`. This eliminates false positives from other games.
-- **Price Format Support:** Automatically parses standard rates (`2.5$/1k`, `$2.50/1k`), ratios (`rate: 2.05`, `ratio 2.75`), and item-unit notations (`$1.99 ea`, `$2.50 each`).
+### Arbitrage Detection Mechanics
+1. **🟢 SUPPLIER DEAL (`SELLER DETECTED` — Buy Low Opportunity):**
+   - Triggered when another user is selling item/tokens at a price below your buy benchmark or sell price (`price <= buy_benchmark - delta`).
+   - Alerts with discount profit margin and ROI % spread: `+$0.80/1k margin (40.0% discount)`.
+2. **🔵 ARBITRAGE SALE (`BUYER DETECTED` — Sell High Opportunity):**
+   - Triggered when another user is buying item/tokens at a price above your sell benchmark or cost basis (`price >= sell_benchmark + delta`).
+   - Alerts with net profit edge: `+$0.75/1k above cost (37.5% profit)`.
+3. **Noise Filtering:**
+   - Lowball buyer bids (e.g., buying for `$0.50` when your sell rate is `$2.00`) and overpriced sellers are automatically discarded.
+4. **Hard Keyword Constraint:**
+   - Only messages matching whole-word boundaries in `DEAL_ITEM_KEYWORDS` trigger evaluation, eliminating false positives from unrelated game markets.
 
 ### How the AI Should Recommend Keywords
 When the operator asks for keywords for a game or market, generate a comprehensive list covering:
@@ -89,7 +134,7 @@ When the operator asks for keywords for a game or market, generate a comprehensi
 3. **Plural & Spaced Variations:** (e.g., `token`, `tokens`, `robux`, `clean robux`, `godly`, `godlies`)
 4. **Format for Slash Command:** Always provide the ready-to-run slash command:
    ```
-   /setdealkeywords alt:1 keywords:Blade Ball, BB token, BB tokens, BB, Tokens
+   /deals keywords alt:1 keywords:Blade Ball, BB token, BB tokens, BB, Tokens
    ```
 
 ---

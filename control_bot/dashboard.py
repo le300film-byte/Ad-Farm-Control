@@ -369,3 +369,89 @@ def build_diagnose_embed(mgr: AltStateManager, alt_id: int) -> discord.Embed:
         embed.add_field(name="Recent Causal Chain Timeline", value="*No causal state transitions recorded during current run.*", inline=False)
 
     return embed
+
+
+def _render_bar(val: float, max_val: float, length: int = 8) -> str:
+    if max_val <= 0:
+        return "▱" * length
+    ratio = min(1.0, max(0.0, val / max_val))
+    filled = int(round(ratio * length))
+    return "▰" * filled + "▱" * (length - filled)
+
+
+def build_analytics_embed(mgr: AltStateManager, target_alt: int = 0) -> discord.Embed:
+    """Render comprehensive visual analytics, channel speeds, and cadence metrics."""
+    mgr.mark_offline_stale(config.OFFLINE_AFTER_SEC)
+    alts = mgr.all() if target_alt == 0 else ([mgr.get(target_alt)] if mgr.get(target_alt) else [])
+
+    embed = discord.Embed(
+        title="📊 ADVANCED FLEET ANALYTICS & SPEED MATRIX",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if not alts:
+        embed.description = "No alt account telemetry available."
+        return embed
+
+    total_sent = sum(a.total_sent for a in alts)
+    total_errors = sum(a.total_errors for a in alts)
+    total_skips = sum(a.total_skips for a in alts)
+    total_edits = sum(a.total_edits for a in alts)
+    total_deals = sum(a.deal_alerts for a in alts)
+    success_rate = (total_sent / (total_sent + total_errors) * 100) if (total_sent + total_errors) > 0 else 100.0
+
+    embed.description = (
+        f"**Fleet Scope**: `{len(alts)}` alt(s) | **Delivery Success Rate**: `{success_rate:.1f}%`\n"
+        f"**Throughput**: `{total_sent}` posts | **Errors**: `{total_errors}` | **Random Skips**: `{total_skips}` | **Edits**: `{total_edits}` | **Deals**: `{total_deals}`"
+    )
+
+    # 1. Per-Alt Throughput & Health Performance
+    perf_lines = []
+    for a in alts:
+        dot, _ = _status_dot(a)
+        uptime_hr = max(0.1, a.uptime_sec / 3600.0)
+        rate_hr = a.total_sent / uptime_hr
+        health = mgr.get_health_index(a.alt_id)
+        grade = mgr.get_yield_grade(a.alt_id)
+        bar = _render_bar(health, 100, length=8)
+        squad_tag = f"[{a.squad}]" if a.squad else ""
+        perf_lines.append(
+            f"**{dot} Alt {a.alt_id} ({a.name})** {squad_tag}\n"
+            f"└ Health: `[{bar}] {health}% ({grade})` | Cadence: `~{rate_hr:.1f} posts/hr` | Mode: `{a.ad_type.upper()}`"
+        )
+    embed.add_field(name="🚀 Alt Throughput & Health Gauges", value="\n".join(perf_lines)[:1024] or "No active runners", inline=False)
+
+    # 2. Per-Channel Speed & Cadence Matrix
+    ch_map = {}
+    for a in alts:
+        for cid, ch in a.channels.items():
+            ch_map.setdefault(cid, []).append((a, ch))
+
+    if ch_map:
+        ch_lines = []
+        for cid, entries in list(ch_map.items())[:8]:
+            a, ch = entries[0]
+            ch_name = ch.get("name") or cid
+            sent = ch.get("sent", 0)
+            err = ch.get("errors", 0)
+            slow = ch.get("slowmode", 0)
+            rel = (sent / (sent + err) * 100) if (sent + err) > 0 else 100.0
+            last_ts = ch.get("last_post", 0)
+            last_str = f"<t:{int(last_ts)}:R>" if last_ts > 0 else "never"
+            bar = _render_bar(rel, 100, length=6)
+            ch_lines.append(
+                f"**#{ch_name}** (`{cid}`)\n"
+                f"└ Reliability: `[{bar}] {rel:.1f}%` ({sent} sent / {err} err) | Slowmode: `{slow}s` | Last: {last_str}"
+            )
+        embed.add_field(name="⚡ Channel Reliability & Slowmode Utilization", value="\n".join(ch_lines)[:1024], inline=False)
+
+    # 3. Inter-Channel Interval & Anti-Detection Matrix
+    matrix_lines = [
+        "• **Typo Mutation Permutations**: `12–25%` dynamic character transposition with positive survival scoring",
+        "• **Chat Velocity Cadence**: `3m–5m` interval ± dynamic jitter auto-scaled by channel message volume",
+        "• **Multi-Alt Fleet Separation**: `90s` minimum window enforced to prevent channel collision",
+        "• **Arbitrage Deal Scanner**: Real-time supplier under-market & buyer premium categorization",
+    ]
+    embed.add_field(name="🛡️ Anti-Detection & Traffic Cadence Engine", value="\n".join(matrix_lines), inline=False)
+    embed.set_footer(text="Live Fleet Analytics • Updated in real time")
+    return embed

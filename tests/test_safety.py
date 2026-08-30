@@ -157,7 +157,8 @@ class SafetyRegressionTests(unittest.TestCase):
                 "run", "stop", "pause", "resume", "altadd", "altupdate", "altlist", "altremove",
                 "setprice", "setmode", "setmessage", "setdealkeywords", "setdealscan", "setdealdelta", "setchannel", "replacechannel", "rescan_channels", "resetcaution", "channels", "uploadimage", "setinterval", "setruntime",
                 "settings", "sync", "status", "logs", "deals", "pingalt", "selfcheck", "clearlogs", "runs", "refresh", "dashboard", "help",
-                "diagnose", "topology", "simulate", "squad", "policy", "canary", "reply",
+                "diagnose", "topology", "simulate", "squad", "policy", "canary", "reply", "analytics",
+                "fleet", "alt", "channel", "tune", "deals_group",
             },
         )
 
