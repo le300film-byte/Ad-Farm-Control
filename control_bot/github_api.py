@@ -364,15 +364,19 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = True) -> tuple
     exists, _ = repository_exists(slug)
     if exists:
         return True, slug
-    repo_name = slug.split("/")[-1] if "/" in slug else slug
-    url = f"{GH}/user/repos"
+    parts = slug.split("/")
+    repo_name = parts[-1] if len(parts) > 1 else slug
+    owner = parts[0] if len(parts) > 1 else config.GITHUB_OWNER
+
+    # Try creating under org or user via REST API
     payload = {"name": repo_name, "private": private, "auto_init": True, "description": f"Ad Farm alt {repo_name}"}
-    try:
-        r = requests.post(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
-        if r.status_code in (200, 201):
-            return True, slug
-    except Exception:
-        pass
+    for url in (f"{GH}/orgs/{owner}/repos" if (owner and owner != config.GITHUB_OWNER) else f"{GH}/user/repos", f"{GH}/user/repos"):
+        try:
+            r = requests.post(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+            if r.status_code in (200, 201):
+                return True, slug
+        except Exception:
+            pass
     if shutil.which("gh") and config.GITHUB_TOKEN:
         env = os.environ.copy()
         env["GH_TOKEN"] = config.GITHUB_TOKEN
@@ -385,7 +389,7 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = True) -> tuple
     return False, f"Could not create repository `{slug}` on GitHub."
 
 
-def provision_alt_repository_files_and_secrets(repo: str, user_token: str) -> tuple[bool, str]:
+def provision_alt_repository_files_and_secrets(repo: str, user_token: str, channel_ids: str = "") -> tuple[bool, str]:
     """Upload canonical workflows and sender script, and populate required secrets."""
     slug = _repo_slug(repo)
     ok_repo, msg = create_alt_repository(slug)
@@ -398,14 +402,42 @@ def provision_alt_repository_files_and_secrets(repo: str, user_token: str) -> tu
         ".github/workflows/send_ads.yml",
         ".github/workflows/self_check.yml",
     ]
+    repo_root = Path(__file__).resolve().parent.parent
     for rel_path in files_to_sync:
-        if os.path.isfile(rel_path):
-            with open(rel_path, "rb") as f:
-                content = f.read()
+        file_p = repo_root / rel_path
+        if not file_p.is_file() and os.path.isfile(rel_path):
+            file_p = Path(rel_path)
+        content = None
+        if file_p.is_file():
+            content = file_p.read_bytes()
+        elif config.CORE_REPO and config.GITHUB_TOKEN:
+            try:
+                raw_url = f"https://raw.githubusercontent.com/{config.CORE_REPO}/main/{rel_path}"
+                r_raw = requests.get(raw_url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+                if r_raw.status_code == 200:
+                    content = r_raw.content
+            except Exception:
+                pass
+        if content:
             upload_repository_file(slug, rel_path, content, message=f"bootstrap: install {rel_path}")
 
     # Set USER_TOKEN secret
     set_repository_secret(slug, "USER_TOKEN", user_token)
+
+    # Resolve default advertising channels from input, env, or existing fleet state
+    resolved_channels = (channel_ids or "").strip() or os.environ.get("CHANNEL_IDS", "").strip() or config._raw("CHANNEL_IDS")
+    if not resolved_channels:
+        try:
+            from control_bot.alt_state import state
+            for aid in state.alt_ids:
+                a_obj = state.get(aid)
+                if a_obj and a_obj.channels:
+                    cids = [str(c) for c in a_obj.channels.keys() if str(c).isdigit()]
+                    if cids:
+                        resolved_channels = ",".join(cids)
+                        break
+        except Exception:
+            pass
 
     # Clone common secrets from environment or config
     common_secrets = [
@@ -417,7 +449,7 @@ def provision_alt_repository_files_and_secrets(repo: str, user_token: str) -> tu
         ("GIST_TOKEN", os.environ.get("GIST_TOKEN") or config._raw("GIST_TOKEN") or config.GITHUB_TOKEN),
         ("CONTROL_GIST_ID", config.CONTROL_GIST_ID or os.environ.get("CONTROL_GIST_ID") or ""),
         ("CONTROLLER_USER_IDS", ",".join(str(x) for x in config.OWNER_IDS)),
-        ("CHANNEL_IDS", os.environ.get("CHANNEL_IDS") or config._raw("CHANNEL_IDS")),
+        ("CHANNEL_IDS", resolved_channels),
     ]
     for sec_name, sec_val in common_secrets:
         if sec_val:

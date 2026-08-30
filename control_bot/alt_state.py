@@ -83,6 +83,11 @@ class AltStateManager:
         with self._lock:
             return self._alts.get(alt_id)
 
+    def get_name(self, alt_id: int) -> str:
+        with self._lock:
+            a = self._alts.get(alt_id)
+            return a.name if a else f"Alt {alt_id}"
+
     def add_alt(self, alt_id: int, name: str) -> bool:
         """Add one validated alt to the live control-bot registry."""
         with self._lock:

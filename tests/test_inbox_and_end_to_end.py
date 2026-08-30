@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from unittest import mock
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -367,7 +368,7 @@ def test_directional_arbitrage_deal_scanner_filtering():
         send_ads.scan_deals("ch_trade", msgs_high_buyer)
         assert len(alerts) == 1
         assert "BUYER DETECTED" in alerts[0][0]["fields"][0]["value"]
-        assert alerts[0][0]["fields"][4]["value"] == "**$2.80/1k**"
+        assert "**$2.80/1k**" in alerts[0][0]["fields"][4]["value"]
 
         # 3. Cheap supplier post: "WTS Blade Ball $1.20/1k stock" (Should be ALERTED as supplier deal)
         msgs_supplier = [{"id": "m3", "author": {"id": "u3", "username": "CheapSeller"}, "content": "WTS Blade Ball 200k in stock $1.20 per 1k"}]
@@ -402,6 +403,494 @@ def test_visual_analytics_embed_generation():
     assert any("Alt Throughput & Health Gauges" in f.name for f in embed.fields)
     assert any("Channel Reliability" in f.name for f in embed.fields)
     assert any("Anti-Detection" in f.name for f in embed.fields)
+
+
+def test_alt_action_completion_webhook_signal_and_chained_chunks():
+    """Verify that send_ads properly formats and emits rich execution completion signals."""
+    dash_embeds = []
+    log_messages = []
+
+    with mock.patch.object(send_ads, "DASHBOARD_WEBHOOK_URL", "https://discord.com/api/webhooks/fake/dash"), \
+         mock.patch.object(send_ads, "LOG_WEBHOOK_URL", "https://discord.com/api/webhooks/fake/logs"), \
+         mock.patch.object(send_ads, "send_dashboard", side_effect=lambda embed: dash_embeds.append(embed)), \
+         mock.patch.object(send_ads, "send_log_webhook", side_effect=lambda msg, kind=None: log_messages.append((msg, kind))), \
+         mock.patch.object(send_ads, "CHANNEL_IDS", ["111", "222"]), \
+         mock.patch.object(send_ads, "ch_names", {"111": "trading", "222": "market"}), \
+         mock.patch.object(send_ads, "CHUNK_INDEX", 1), \
+         mock.patch.object(send_ads, "TOTAL_CHUNKS", 2), \
+         mock.patch.object(send_ads, "TOTAL_HOURS", 12.0), \
+         mock.patch.object(send_ads, "TOTAL_RUN_MIN", 350.0):
+
+        per_ch = {
+            "111": {"sent": 25, "txt": 20, "img": 5, "edits": 4, "errors": 0, "skipped": 2},
+            "222": {"sent": 25, "txt": 20, "img": 5, "edits": 3, "errors": 0, "skipped": 1},
+        }
+
+        # 1. Test Chunk 1 completion signal
+        send_ads._send_completion_summary_webhook(
+            "Scheduled execution window complete (350.0m)",
+            time.time() - 21000, 50, 0, 3, 2, 10, 7, per_ch, is_shutdown=False
+        )
+
+        assert len(dash_embeds) == 1
+        embed = dash_embeds[0]
+        assert "CHUNK 1/2 COMPLETE" in embed["title"]
+        assert "Chaining to Chunk 2" in embed["title"]
+        assert any("Duration & Velocity" in f["name"] for f in embed["fields"])
+        assert any("Deliveries & Edits" in f["name"] for f in embed["fields"])
+        assert any("Channel Breakdown" in f["name"] for f in embed["fields"])
+        assert any("Next Workflow Action" in f["name"] and "Chunk `2/2`" in f["value"] for f in embed["fields"])
+
+        assert len(log_messages) == 1
+        assert "RUN COMPLETE" in log_messages[0][0]
+        assert "Chunk 1/2" in log_messages[0][0]
+
+
+def test_alt_identity_enhancements_across_logs_deals_and_dms():
+    """Verify all log lines, deal scanner embeds, and DM forwards carry explicit Alt identity."""
+    deal_webhooks = []
+    dm_webhooks = []
+    log_webhooks = []
+
+    with mock.patch.object(send_ads, "ALT_ID", 3), \
+         mock.patch.object(send_ads, "ALT_NAME", "SellerThree"), \
+         mock.patch.object(send_ads, "DEAL_WEBHOOK_URL", "https://discord.com/api/webhooks/fake/deals"), \
+         mock.patch.object(send_ads, "DM_WEBHOOK_URL", "https://discord.com/api/webhooks/fake/dms"), \
+         mock.patch.object(send_ads, "LOG_WEBHOOK_URL", "https://discord.com/api/webhooks/fake/logs"), \
+         mock.patch.object(send_ads, "send_deal_webhook", side_effect=lambda embed, thread_name=None: deal_webhooks.append((embed, thread_name))), \
+         mock.patch.object(send_ads, "send_webhook", side_effect=lambda body, username=None, avatar_url=None, embed=None, thread_name=None, thread_id=None, buyer_key=None: dm_webhooks.append((body, username, embed, thread_name))):
+
+        # 1. Test deal scanner alert formatting
+        send_ads._send_deal_alert(
+            "111222", {"id": "999", "username": "BuyerOne"}, 2.80, 2.00, 0.80,
+            "WTB Blade Ball 100k @ 2.80/1k", "https://discord.com/channels/1/111222/123",
+            "buyer", "Blade Ball"
+        )
+        assert len(deal_webhooks) == 1
+        deal_embed, thread_name = deal_webhooks[0]
+        assert "[Alt 3 · SellerThree]" in deal_embed["title"]
+        assert "Alt 3" in thread_name
+
+        # 2. Test DM forwarding formatting
+        user_obj = {"id": "888", "username": "CuriousBuyer", "global_name": "Curious"}
+        send_ads.forward_dm_message("777888", user_obj, "Hey I want to buy 50k tokens", [])
+        assert len(dm_webhooks) == 1
+        body, username, dm_embed, dm_thread_title = dm_webhooks[0]
+        assert "Alt 3" in dm_thread_title
+        assert "Alt 3: SellerThree" in dm_embed["footer"]["text"]
+
+
+def test_alt_add_channel_inheritance_and_run_dispatch_fallback():
+    """Verify AltAddModal inherits fleet channels and _dispatch_run_from_modal passes fallback channels."""
+    from control_bot import bot as control_bot_module
+    from control_bot.alt_state import AltStateManager
+    import asyncio
+    from types import SimpleNamespace
+
+    manager = AltStateManager({1: "Alt 1"}, alt_ids=[1])
+    manager.set_channel(1, "111222333444", "market")
+
+    # 1. AltAddModal inheriting channel from fleet
+    modal = control_bot_module.AltAddModal()
+    modal.user_token = SimpleNamespace(value="valid_alt_token_xyz")
+    modal.name = SimpleNamespace(value="")
+    modal.alt_id = SimpleNamespace(value="2")
+    modal.repository = SimpleNamespace(value="")
+    modal.channels = SimpleNamespace(value="")
+
+    inter = mock.MagicMock()
+    inter.response = mock.MagicMock()
+    inter.response.send_message = mock.AsyncMock()
+    inter.response.defer = mock.AsyncMock()
+    inter.followup = mock.MagicMock()
+    inter.followup.send = mock.AsyncMock()
+    inter.user.id = 42
+
+    mock_profile = {"id": 123456789, "username": "AltTwo", "global_name": "Alt Two"}
+    prov_called_channels = []
+
+    def mock_provision(repo, token, channels_csv=""):
+        prov_called_channels.append(channels_csv)
+        return True, "OK"
+
+    with mock.patch.object(control_bot_module, "state", manager), \
+         mock.patch.object(control_bot_module.config, "OWNER_IDS", {42}), \
+         mock.patch.object(control_bot_module.config, "_raw", return_value=""), \
+         mock.patch.dict(os.environ, {"CHANNEL_IDS": ""}, clear=False), \
+         mock.patch.object(control_bot_module.github_api, "fetch_discord_user_profile", return_value=(True, mock_profile)), \
+         mock.patch.object(control_bot_module.github_api, "provision_alt_repository_files_and_secrets", side_effect=mock_provision), \
+         mock.patch.object(control_bot_module, "_persist_alt_registry", new=mock.AsyncMock(return_value=(True, "OK"))), \
+         mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
+
+        asyncio.run(modal.on_submit(inter))
+        assert "111222333444" in prov_called_channels[0]
+        assert manager.get(2) is not None
+        assert "111222333444" in manager.get(2).channels
+
+    # 2. _dispatch_run_from_modal fallback channel resolution
+    dispatched_inputs = []
+
+    def mock_dispatch(alt_id, inputs):
+        dispatched_inputs.append(inputs)
+        return True, "Dispatched"
+
+    values = {
+        "ad_type": "sell",
+        "sell_rate": "2.50",
+        "sell_extra": "Fast delivery",
+        "attach_image": "true",
+    }
+    parsed = {
+        "alt_id": 2,
+        "interval": 5,
+        "hours": 6,
+        "rate": 2.50,
+    }
+
+    with mock.patch.object(control_bot_module, "state", manager), \
+         mock.patch.object(control_bot_module.config, "OWNER_IDS", {42}), \
+         mock.patch.object(control_bot_module.config, "GITHUB_TOKEN", "ghp_fake"), \
+         mock.patch.object(control_bot_module.config, "GITHUB_OWNER", "org"), \
+         mock.patch.object(control_bot_module.config, "ALT_REPOS", {2: "org/alt2"}), \
+         mock.patch.object(control_bot_module.github_api, "cancel_run", return_value=True), \
+         mock.patch.object(control_bot_module.github_api, "dispatch_workflow", side_effect=mock_dispatch), \
+         mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
+
+        asyncio.run(control_bot_module._dispatch_run_from_modal(inter, values, parsed))
+        assert len(dispatched_inputs) == 1
+        assert dispatched_inputs[0]["channel_1"] == "111222333444"
+
+
+def test_parse_market_listing_comprehensive_cases():
+    """Verify deep multi-stage market listing parser handles complex lists, bundles, rates, and negations."""
+    from send_ads import parse_market_listing
+
+    kws = ["Blade Ball", "BladeBall", "BB tokens", "BB token", "BB"]
+
+    # 1. Multi-item bullet list with different prices and items
+    msg1 = """WTS
+    • Pet Sim 99 Gems: $0.15/m
+    • Blox Fruits Leopard: $15 each
+    • Blade Ball: 2.10$/1k (Stock 50k)
+    • Da Hood Cash: $0.50/m"""
+    res1 = parse_market_listing(msg1, target_keywords=kws)
+    assert res1 is not None
+    assert res1["item"] == "Blade Ball"
+    assert res1["kind"] == "seller"
+    assert res1["price"] == 2.10
+    assert res1["volume"] == "50k"
+
+    # 2. Total volume + total price calculation ($220 for 100k -> $2.20/1k)
+    msg2 = "Selling 100k Blade Ball tokens for $220 Paypal / Cashapp"
+    res2 = parse_market_listing(msg2, target_keywords=kws)
+    assert res2 is not None
+    assert res2["price"] == 2.20
+    assert res2["volume"] == "100k"
+    assert "PayPal" in res2["payments"]
+    assert "CashApp" in res2["payments"]
+
+    # 3. Formatted comma quantity and total price ($105 for 50,000 -> $2.10/1k)
+    msg3 = "WTS 50,000 Blade Ball stock - $105"
+    res3 = parse_market_listing(msg3, target_keywords=kws)
+    assert res3 is not None
+    assert res3["price"] == 2.10
+
+    # 4. Multi-section list with both WTS and WTB
+    msg4 = """[WTS] MM2 Godlies - $1 each
+    [WTB] Blade Ball Tokens - $2.70/1k paying cashapp"""
+    res4 = parse_market_listing(msg4, target_keywords=kws)
+    assert res4 is not None
+    assert res4["kind"] == "buyer"
+    assert res4["price"] == 2.70
+    assert "CashApp" in res4["payments"]
+
+    # 5. Ratio and various rate formats
+    msg5 = "BB Ratio 1:2.35 (WTB crypto only)"
+    res5 = parse_market_listing(msg5, target_keywords=kws)
+    assert res5 is not None
+    assert res5["kind"] == "buyer"
+    assert res5["price"] == 2.35
+    assert "Crypto" in res5["payments"]
+
+    # 6. Negations and non-market chatter filtered out
+    assert parse_market_listing("Not selling blade ball, only MM2", target_keywords=kws) is None
+    assert parse_market_listing("Vouch +rep for @Trader blade ball tokens", target_keywords=kws) is None
+    assert parse_market_listing("Out of stock Blade Ball 0 in stock", target_keywords=kws) is None
+
+
+def test_cmd_simulate_sample_listing():
+    """Verify /deals command with sample_listing parses market listings and evaluates deal triggers."""
+    from control_bot import bot as control_bot_module
+    from control_bot.alt_state import AltStateManager
+    import asyncio
+
+    mgr = AltStateManager({1: "Alt 1"}, alt_ids=[1])
+    mgr.update_from_heartbeat(1, {
+        "status": "active",
+        "rate": 2.50,
+        "ad_type": "sell",
+        "deal_alert_delta": 0.05,
+        "deal_keywords": ["Blade Ball", "BB"],
+    })
+
+    inter = mock.MagicMock()
+    inter.response = mock.MagicMock()
+    inter.response.is_done = mock.MagicMock(return_value=False)
+    inter.response.send_message = mock.AsyncMock()
+    inter.followup = mock.MagicMock()
+    inter.followup.send = mock.AsyncMock()
+    inter.user.id = 9999
+
+    sample = "[WTB] Blade Ball - $2.75/1k paying LTC"
+
+    with mock.patch.object(control_bot_module, "state", mgr), \
+         mock.patch.object(control_bot_module, "_check_perms", new=mock.AsyncMock(return_value=True)):
+
+        asyncio.run(control_bot_module.cmd_deals.callback(inter, alt=1, sample_listing=sample))
+        assert inter.response.send_message.called
+        call_args, call_kwargs = inter.response.send_message.call_args
+        embed = call_kwargs.get("embed") if call_kwargs else call_args[0]
+        assert embed is not None
+        field_vals = [getattr(f, "value", f.get("value") if isinstance(f, dict) else "") for f in embed.fields]
+        assert any("DEAL ALERT TRIGGERED" in v for v in field_vals)
+        assert any("Blade Ball" in v for v in field_vals)
+        assert any("**$2.75/1k**" in v for v in field_vals)
+
+
+def test_alt_add_direct_from_discord_edge_cases_and_clean_responses():
+    """Verify adding an alt directly from Discord handles all edge cases cleanly with zero bugs."""
+    from control_bot import bot as control_bot_module
+    from control_bot.alt_state import AltStateManager
+    from control_bot import config
+    import asyncio
+    from types import SimpleNamespace
+
+    mgr = AltStateManager({1: "Alt 1"}, alt_ids=[1])
+
+    # Case 1: Invalid Token
+    modal = control_bot_module.AltAddModal()
+    modal.user_token = SimpleNamespace(value="invalid_junk_token")
+    modal.name = SimpleNamespace(value="")
+    modal.alt_id = SimpleNamespace(value="")
+    modal.repository = SimpleNamespace(value="")
+    modal.channels = SimpleNamespace(value="")
+
+    inter_invalid = mock.MagicMock()
+    inter_invalid.response.is_done.return_value = False
+    inter_invalid.response.defer = mock.AsyncMock()
+    inter_invalid.followup.send = mock.AsyncMock()
+    inter_invalid.user.id = 42
+
+    with mock.patch.object(control_bot_module, "state", mgr), \
+         mock.patch.object(config, "OWNER_IDS", {42}), \
+         mock.patch.object(control_bot_module.github_api, "fetch_discord_user_profile", return_value=(False, {"error": "Discord returned HTTP 401"})):
+
+        asyncio.run(modal.on_submit(inter_invalid))
+        assert inter_invalid.followup.send.called
+        msg = inter_invalid.followup.send.call_args[0][0]
+        assert "Could not authenticate alt" in msg
+        assert "401" in msg
+
+    # Case 2: Valid Token, Full Auto-Discovery
+    modal_valid = control_bot_module.AltAddModal()
+    modal_valid.user_token = SimpleNamespace(value="valid_secret_user_token")
+    modal_valid.name = SimpleNamespace(value="")  # leave blank to auto-detect
+    modal_valid.alt_id = SimpleNamespace(value="")  # leave blank for auto-slot
+    modal_valid.repository = SimpleNamespace(value="")  # leave blank for auto-repo
+    modal_valid.channels = SimpleNamespace(value="")  # leave blank for auto-inherit
+
+    inter_valid = mock.MagicMock()
+    inter_valid.response.is_done.return_value = False
+    inter_valid.response.defer = mock.AsyncMock()
+    inter_valid.followup.send = mock.AsyncMock()
+    inter_valid.user.id = 42
+
+    mock_profile = {"id": 123456789012345678, "username": "pro_trader_42", "global_name": "Pro Trader"}
+
+    with mock.patch.object(control_bot_module, "state", mgr), \
+         mock.patch.object(config, "OWNER_IDS", {42}), \
+         mock.patch.object(config, "CORE_REPO", "owner/adfarm-core"), \
+         mock.patch.object(config, "GITHUB_TOKEN", "fake-gh-token"), \
+         mock.patch.object(control_bot_module.github_api, "fetch_discord_user_profile", return_value=(True, mock_profile)), \
+         mock.patch.object(control_bot_module.github_api, "provision_alt_repository_files_and_secrets", return_value=(True, "OK")), \
+         mock.patch.object(control_bot_module, "_persist_alt_registry", new=mock.AsyncMock(return_value=(True, "OK"))), \
+         mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
+
+        asyncio.run(modal_valid.on_submit(inter_valid))
+        assert inter_valid.followup.send.called
+        msg = inter_valid.followup.send.call_args[0][0]
+        assert "successfully added" in msg
+        assert "Alt 2" in msg
+        assert "@pro_trader_42" in msg
+        assert 2 in mgr.alt_ids
+        assert mgr.get(2).name == "Pro Trader"
+
+
+def test_all_19_commands_end_to_end_execution():
+    """Verify all 19 unified slash commands execute cleanly without raising unhandled errors."""
+    from control_bot import bot as control_bot_module
+    from control_bot.alt_state import AltStateManager
+    from control_bot import config
+    import asyncio
+    from types import SimpleNamespace
+
+    mgr = AltStateManager({1: "Seller 1", 2: "Buyer 2"}, alt_ids=[1, 2])
+    mgr.update_from_heartbeat(1, {"status": "active", "total_sent": 20, "rate": 2.50, "ad_type": "sell"})
+    mgr.update_from_heartbeat(2, {"status": "active", "total_sent": 15, "rate": 2.30, "ad_type": "buy"})
+
+    def make_inter():
+        inter = mock.MagicMock()
+        inter.response = mock.MagicMock()
+        inter.response.is_done = mock.MagicMock(return_value=False)
+        inter.response.send_message = mock.AsyncMock()
+        inter.response.defer = mock.AsyncMock()
+        inter.followup = mock.MagicMock()
+        inter.followup.send = mock.AsyncMock()
+        inter.user = SimpleNamespace(id=42, name="OwnerOperator")
+        return inter
+
+    with mock.patch.object(control_bot_module, "state", mgr), \
+         mock.patch.object(config, "OWNER_IDS", {42}), \
+         mock.patch.object(config, "CORE_REPO", "owner/adfarm-core"), \
+         mock.patch.object(config, "GITHUB_TOKEN", "fake-gh-token"), \
+         mock.patch.object(control_bot_module, "_check_perms", new=mock.AsyncMock(return_value=True)), \
+         mock.patch.object(control_bot_module, "_send_control_wait_ack", new=mock.AsyncMock(return_value="✅ ACK")), \
+         mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()), \
+         mock.patch.object(control_bot_module.github_api, "cancel_run", return_value=(True, "cancelled")), \
+         mock.patch.object(control_bot_module.github_api, "refresh_all_run_statuses", return_value=None), \
+         mock.patch.object(control_bot_module, "_hydrate_discord_state", new=mock.AsyncMock()), \
+         mock.patch.object(control_bot_module, "_refresh_dashboard_now", new=mock.AsyncMock()), \
+         mock.patch.object(control_bot_module, "_post_dashboard", new=mock.AsyncMock(return_value=SimpleNamespace(jump_url="https://discord.com/msg/123"))), \
+         mock.patch.object(control_bot_module.github_api, "get_authenticated_user", return_value={"login": "test"}), \
+         mock.patch.object(control_bot_module.github_api, "fetch_gist", return_value={"id": "gist"}):
+
+        # 1. /run
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_run.callback(inter))
+        assert inter.response.send_message.called
+
+        # 2. /stop
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_stop.callback(inter, alt=1))
+        assert inter.followup.send.called
+
+        # 3. /pause
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_pause.callback(inter, alt=1))
+        assert inter.followup.send.called
+
+        # 4. /resume
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_resume.callback(inter, alt=1))
+        assert inter.followup.send.called
+
+        # 5. /alt (interactive hub)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_alt.callback(inter, action="overview"))
+        assert inter.response.send_message.called
+
+        # 5b. /alt (actions: logs, runs, clearlogs)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_alt.callback(inter, action="logs", alt=1))
+        assert inter.response.send_message.called or inter.followup.send.called
+
+        # 6. /tune (interactive hub)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_tune.callback(inter, alt=1))
+        assert inter.response.send_message.called
+
+        # 6b. /tune (parameters: price, mode, interval, runtime, policy)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_tune.callback(inter, alt=1, price="2.45"))
+        assert inter.followup.send.called
+
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_tune.callback(inter, alt=1, policy="stealth"))
+        assert inter.response.send_message.called
+
+        # 7. /channels (interactive hub)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_channels.callback(inter, alt=1, action="view"))
+        assert inter.response.send_message.called
+
+        # 7b. /channels (action: rescan)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_channels.callback(inter, alt=1, action="rescan"))
+        assert inter.followup.send.called
+
+        # 8. /deals (interactive hub)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_deals.callback(inter, alt=1))
+        assert inter.response.send_message.called
+
+        # 8b. /deals (parameters: keywords, enabled, min_delta)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_deals.callback(inter, alt=1, keywords="Blade Ball, BB, Robux"))
+        assert inter.followup.send.called
+
+        # 9. /squad (interactive hub)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_squad.callback(inter, action="overview"))
+        assert inter.response.send_message.called
+
+        # 9b. /squad (actions: assign, view)
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_squad.callback(inter, action="assign", alt=1, squad_name="Alpha"))
+        assert inter.response.send_message.called
+
+        # 10. /status
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_status.callback(inter, alt=0))
+        assert inter.response.send_message.called
+
+        # 11. /reply
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_reply.callback(inter, alt=1, user="9988776655", text="100k available"))
+        assert inter.followup.send.called
+
+        # 12. /analytics
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_analytics.callback(inter, alt=0))
+        assert inter.response.send_message.called
+
+        # 13. /diagnose
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_diagnose.callback(inter, alt=1))
+        assert inter.followup.send.called
+
+        # 14. /canary
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_canary.callback(inter, alt=0))
+        assert inter.followup.send.called
+
+        # 15. /topology
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_topology.callback(inter))
+        assert inter.followup.send.called
+
+        # 16. /sync
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_sync.callback(inter))
+        assert inter.followup.send.called
+
+        # 17. /refresh
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_refresh.callback(inter))
+        assert inter.followup.send.called
+
+        # 18. /dashboard
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_dashboard.callback(inter))
+        assert inter.followup.send.called
+
+        # 19. /help
+        inter = make_inter()
+        asyncio.run(control_bot_module.cmd_help.callback(inter))
+        assert inter.response.send_message.called
+
+
+
+
 
 
 

@@ -5,8 +5,8 @@
 
 ### BOT CORE
 
-* **Hierarchical Subcommand Architecture** – Consolidate sprawling top-level commands into intuitive logical domains (`/alt [add|list|update|remove]`, `/channel [add|replace|rescan|clear]`, `/deal [toggle|rate|keywords]`, `/config [view|export|set]`). Declutters Discord slash menu and groups related workflows together.
-* **Context-Aware Dynamic Autocomplete** – Make slash argument suggestions context-sensitive. If an alt is in `caution` mode, autocomplete proactively elevates `/resetcaution` or `/rescan_channels`. If an alt is `offline`, `/run` becomes the top suggestion.
+* **Unified Interactive Command Architecture** – Consolidated sprawling commands into 19 intuitive interactive hubs (`/alt`, `/channels`, `/deals`, `/tune`, `/squad`, `/run`, etc.) with 1-click rich views, selectors, and modals. Declutters Discord slash menu and provides an effortless, zero-friction operator UX.
+* **Context-Aware Dynamic Autocomplete** – Dynamic autocomplete across all alt, squad, and channel parameters. Provides instantaneous suggested choices for alts, squad pools, and channel IDs directly inside Discord's UI.
 * **Interactive Dashboard Component Controls** – Attach persistent UI buttons and select menus (`Emergency Freeze All`, `Pause All`, `Rescan Channels`, `Switch Mode`) directly to live Discord dashboard embeds for one-click operator actions without typing commands.
 
 ---

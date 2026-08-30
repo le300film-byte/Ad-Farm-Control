@@ -49,7 +49,7 @@ class ControlRuntimeTests(unittest.TestCase):
         with mock.patch.object(control_bot_module, "state", manager), \
              mock.patch.object(config, "OWNER_IDS", {42}), \
              mock.patch.object(control_bot_module, "_cooldowns", {}):
-            asyncio.run(control_bot_module.cmd_setmode.callback(unauthorized, 1, "buy"))
+            asyncio.run(control_bot_module.cmd_tune.callback(unauthorized, alt=1, mode="buy"))
         self.assertIn("authorized", unauthorized.response.messages[0][0][0])
         self.assertEqual(manager.get(1).ad_type, "")
 
@@ -59,7 +59,7 @@ class ControlRuntimeTests(unittest.TestCase):
              mock.patch.object(control_bot_module, "_cooldowns", {}), \
              mock.patch.object(control_bot_module, "_send_dm_wait_ack", new=mock.AsyncMock(return_value="✅ MODE SET")), \
              mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
-            asyncio.run(control_bot_module.cmd_setmode.callback(authorized, 1, "buy"))
+            asyncio.run(control_bot_module.cmd_tune.callback(authorized, alt=1, mode="buy"))
         self.assertEqual(manager.get(1).ad_type, "buy")
         self.assertIn("MODE SET", authorized.followup.messages[0][0][0])
 
@@ -183,7 +183,7 @@ class ControlRuntimeTests(unittest.TestCase):
         with mock.patch.object(control_bot_module, "state", manager), \
              mock.patch.object(config, "OWNER_IDS", {42}), \
              mock.patch.object(control_bot_module, "_cooldowns", {}):
-            asyncio.run(control_bot_module.cmd_settings.callback(inter, alt=1))
+            asyncio.run(control_bot_module.cmd_tune.callback(inter, alt=1))
         self.assertTrue(inter.response.deferred)
         embed = inter.response.messages[0][1]["embed"]
         self.assertIn("Seller A", embed.title)
@@ -196,12 +196,12 @@ class ControlRuntimeTests(unittest.TestCase):
              mock.patch.object(control_bot_module, "_cooldowns", {}), \
              mock.patch.object(control_bot_module, "_send_dm_wait_ack", new=mock.AsyncMock(return_value="✅ ACK")), \
              mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
-            asyncio.run(control_bot_module.cmd_rescan_channels.callback(inter, alt=1))
+            asyncio.run(control_bot_module.cmd_channels.callback(inter, alt=1, action="rescan"))
             self.assertIn("rescan", inter.followup.messages[0][0][0])
 
             control_bot_module._cooldowns.clear()
             inter2 = _Interaction()
-            asyncio.run(control_bot_module.cmd_resetcaution.callback(inter2, alt=1, channel_id="111"))
+            asyncio.run(control_bot_module.cmd_channels.callback(inter2, alt=1, action="reset_caution", channel_id="111"))
             self.assertIn("reset caution", inter2.followup.messages[0][0][0])
 
     def test_setchannel_and_replacechannel_persist_secrets(self):
@@ -215,12 +215,12 @@ class ControlRuntimeTests(unittest.TestCase):
              mock.patch.object(control_bot_module, "_send_dm_wait_ack", new=mock.AsyncMock(return_value="✅ ACK")), \
              mock.patch.object(control_bot_module.github_api, "set_repository_secret") as set_secret, \
              mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
-            asyncio.run(control_bot_module.cmd_setchannel.callback(inter, alt=1, channel_id="111222333", name="general"))
+            asyncio.run(control_bot_module.cmd_channels.callback(inter, alt=1, action="add", channel_id="111222333", name="general"))
             set_secret.assert_called_with("org/alt-repo", "CHANNEL_IDS", "111222333")
 
             control_bot_module._cooldowns.clear()
             inter2 = _Interaction()
-            asyncio.run(control_bot_module.cmd_replacechannel.callback(inter2, alt=1, old_id="111222333", new_id="444555666", name="trading"))
+            asyncio.run(control_bot_module.cmd_channels.callback(inter2, alt=1, action="replace", channel_id="111222333", new_channel_id="444555666", name="trading"))
             set_secret.assert_called_with("org/alt-repo", "CHANNEL_IDS", "444555666")
 
     def test_cmd_channels_view_opens_embed(self):
@@ -230,7 +230,7 @@ class ControlRuntimeTests(unittest.TestCase):
         with mock.patch.object(control_bot_module, "state", manager), \
              mock.patch.object(config, "OWNER_IDS", {42}), \
              mock.patch.object(control_bot_module, "_cooldowns", {}):
-            asyncio.run(control_bot_module.cmd_channels.callback(inter, alt=1))
+            asyncio.run(control_bot_module.cmd_channels.callback(inter, alt=1, action="view"))
         self.assertTrue(inter.response.deferred)
         embed = inter.response.messages[0][1]["embed"]
         self.assertIn("Channel Manager · Seller A", embed.title)
@@ -249,7 +249,7 @@ class ControlRuntimeTests(unittest.TestCase):
              mock.patch.object(config, "ALT_REPOS", {1: "org/alt-repo"}), \
              mock.patch.object(control_bot_module, "_cooldowns", {}), \
              mock.patch.object(control_bot_module.github_api, "upload_repository_file", return_value=(True, "File committed")):
-            asyncio.run(control_bot_module.cmd_uploadimage.callback(inter, alt=1, image=attachment))
+            asyncio.run(control_bot_module.cmd_tune.callback(inter, alt=1, image=attachment))
         self.assertTrue(inter.response.deferred)
         embed = inter.followup.messages[0][1]["embed"]
         self.assertIn("Ad Image Upload", embed.title)
@@ -281,34 +281,34 @@ class ControlRuntimeTests(unittest.TestCase):
 
     def test_cmd_simulate_policy_squad_and_canary(self):
         manager = AltStateManager({1: "Seller A"}, alt_ids=[1])
+        control_bot_module._cooldowns.clear()
         inter_sim = _Interaction()
         with mock.patch.object(control_bot_module, "state", manager), \
-             mock.patch.object(config, "OWNER_IDS", {42}), \
-             mock.patch.object(control_bot_module, "_cooldowns", {}):
-            asyncio.run(control_bot_module.cmd_simulate.callback(inter_sim, alt=1, test_rate=1.25))
+             mock.patch.object(config, "OWNER_IDS", {42}):
+            asyncio.run(control_bot_module.cmd_deals.callback(inter_sim, alt=1, sample_listing="[WTB] Blade Ball - $2.75/1k paying LTC"))
         embed_sim = inter_sim.response.messages[0][1]["embed"]
         self.assertIn("Simulation", embed_sim.title)
 
+        control_bot_module._cooldowns.clear()
         inter_pol = _Interaction()
         with mock.patch.object(control_bot_module, "state", manager), \
-             mock.patch.object(config, "OWNER_IDS", {42}), \
-             mock.patch.object(control_bot_module, "_cooldowns", {}):
-            asyncio.run(control_bot_module.cmd_policy.callback(inter_pol, alt=1, template="stealth"))
+             mock.patch.object(config, "OWNER_IDS", {42}):
+            asyncio.run(control_bot_module.cmd_tune.callback(inter_pol, alt=1, policy="stealth"))
         self.assertIn("STEALTH", inter_pol.response.messages[0][0][0])
         self.assertEqual(manager.get(1).policy_template, "stealth")
 
+        control_bot_module._cooldowns.clear()
         inter_sq = _Interaction()
         with mock.patch.object(control_bot_module, "state", manager), \
-             mock.patch.object(config, "OWNER_IDS", {42}), \
-             mock.patch.object(control_bot_module, "_cooldowns", {}):
+             mock.patch.object(config, "OWNER_IDS", {42}):
             asyncio.run(control_bot_module.cmd_squad.callback(inter_sq, action="assign", alt=1, squad_name="Alpha Sellers"))
         self.assertIn("Alpha Sellers", inter_sq.response.messages[0][0][0])
         self.assertEqual(manager.get(1).squad, "Alpha Sellers")
 
+        control_bot_module._cooldowns.clear()
         inter_canary = _Interaction()
         with mock.patch.object(control_bot_module, "state", manager), \
              mock.patch.object(config, "OWNER_IDS", {42}), \
-             mock.patch.object(control_bot_module, "_cooldowns", {}), \
              mock.patch.object(control_bot_module.github_api, "get_authenticated_user", return_value={"login": "test"}), \
              mock.patch.object(control_bot_module.github_api, "fetch_gist", return_value={"id": "fake"}):
             asyncio.run(control_bot_module.cmd_canary.callback(inter_canary, alt=1))
@@ -414,31 +414,57 @@ class ControlRuntimeTests(unittest.TestCase):
             self.assertEqual(manager.get(1).policy_template, "aggressive")
             self.assertEqual(manager.get(2).policy_template, "aggressive")
 
-    def test_hierarchical_subcommand_architecture(self):
-        """Verify hierarchical command groups correctly route to their underlying handlers."""
+    def test_unified_command_hub_architecture(self):
+        """Verify unified interactive hub commands correctly route and handle parameters."""
         manager = AltStateManager({1: "Alt 1"}, alt_ids=[1])
 
-        # Test /fleet analytics subcommand
+        # Test /analytics command
         inter_fleet = _Interaction(user_id=42)
         with mock.patch.object(control_bot_module, "state", manager), \
              mock.patch.object(config, "OWNER_IDS", {42}), \
              mock.patch.object(control_bot_module, "_fresh_state", new=mock.AsyncMock()):
-            sub = control_bot_module.fleet_group.get_command("analytics")
-            asyncio.run(sub.callback(inter_fleet, alt=1))
+            asyncio.run(control_bot_module.cmd_analytics.callback(inter_fleet, alt=1))
             embed = inter_fleet.response.messages[0][1]["embed"]
             self.assertIn("ADVANCED FLEET ANALYTICS", embed.title)
 
-        # Test /tune price subcommand
+        # Test /tune command with direct price parameter
         control_bot_module._cooldowns.clear()
         inter_tune = _Interaction(user_id=42)
         with mock.patch.object(control_bot_module, "state", manager), \
              mock.patch.object(config, "OWNER_IDS", {42}), \
              mock.patch.object(control_bot_module, "_send_dm_wait_ack", new=mock.AsyncMock(return_value="✅ ACK")), \
              mock.patch.object(control_bot_module, "_log_control", new=mock.AsyncMock()):
-            sub = control_bot_module.tune_group.get_command("price")
-            asyncio.run(sub.callback(inter_tune, alt=1, new_price="2.80"))
+            asyncio.run(control_bot_module.cmd_tune.callback(inter_tune, alt=1, price="2.80"))
             self.assertTrue(inter_tune.response.deferred)
             self.assertIn("price validated", inter_tune.followup.messages[0][0][0])
+
+        # Test /tune command opening interactive hub when called without params
+        control_bot_module._cooldowns.clear()
+        inter_alias = _Interaction(user_id=42)
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}):
+            asyncio.run(control_bot_module.cmd_tune.callback(inter_alias, alt=1))
+            self.assertTrue(inter_alias.response.deferred)
+            embed_tune = inter_alias.response.messages[0][1]["embed"]
+            self.assertIn("Fleet Tuning & Settings", embed_tune.title)
+
+        # Test /squad command interactive overview
+        control_bot_module._cooldowns.clear()
+        inter_sq_list = _Interaction(user_id=42)
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}):
+            asyncio.run(control_bot_module.cmd_squad.callback(inter_sq_list, action="overview"))
+            embed_sq = inter_sq_list.response.messages[0][1]["embed"]
+            self.assertIn("Fleet Squad Hub", embed_sq.title)
+
+        # Test /alt command interactive hub view
+        control_bot_module._cooldowns.clear()
+        inter_alt = _Interaction(user_id=42)
+        with mock.patch.object(control_bot_module, "state", manager), \
+             mock.patch.object(config, "OWNER_IDS", {42}):
+            asyncio.run(control_bot_module.cmd_alt.callback(inter_alt, action="overview"))
+            embed_alt = inter_alt.response.messages[0][1]["embed"]
+            self.assertIn("Fleet Alt Management Hub", embed_alt.title)
 
 
 if __name__ == "__main__":

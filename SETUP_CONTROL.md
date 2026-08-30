@@ -280,63 +280,74 @@ latest run for that alt, dispatches `send_ads.yml`, and posts the run result
 privately. The form and its errors are visible only to the operator who opened
 it.
 
-### Hierarchical Subcommand Architecture
+### Unified Interactive Command Architecture
 
-Commands can be invoked directly at top-level or through clean hierarchical groups:
+The control bot provides 19 streamlined, non-duplicated slash commands. Running base commands without parameters opens interactive rich views with 1-click action buttons, selectors, and modals, while direct optional arguments remain available for power CLI operators:
 
-#### 1. 🌐 `/fleet ...` (Fleet Operations & Telemetry)
-* `/fleet status [alt]` — Unified dashboard summary or single alt diagnostic card.
-* `/fleet analytics [alt]` — Visual speed matrix, message velocities, and reliability gauges.
-* `/fleet topology` — Interactive ASCII fleet routing and proxy topology graph.
-* `/fleet canary [alt]` — Synthetic in-band probe measuring GitHub API, Gist queue, and REST latency in ms.
-* `/fleet sync` — Broadcasts an instant reload of Gist configuration and blocklists to all alts.
-* `/fleet refresh` — Forces an immediate poll of active GitHub Actions workflow runs.
-* `/fleet dashboard` — Re-renders and posts the persistent 3-card dashboard in `#ad-dashboard`.
+#### 1. 🚀 Execution & Runner Lifecycle
+* `/run` — Interactive 3-step runner launcher: select alt/mode, set rates/message, choose cadence & duration.
+* `/stop alt:<alt>` — Gracefully stops an alt, syncs blocklists, and cancels active GitHub Actions workflow run.
+* `/pause alt:<alt>` — Temporarily pauses public ad delivery without terminating the runner.
+* `/resume alt:<alt>` — Resumes public ad delivery from pause.
 
-#### 2. 🤖 `/alt ...` (Alt Account Lifecycle & Management)
-* `/alt run` — Opens the private 3-step launcher form.
-* `/alt stop <alt>` / `/alt pause <alt>` / `/alt resume <alt>` — Controls alt execution state.
-* `/alt list` — Displays all registered alts, repository links, configured modes, and heartbeat recency.
-* `/alt add` / `/alt update <alt>` / `/alt remove <alt>` — Manages the aggregate alt registry.
-* `/alt runs <alt> [limit]` — Lists recent GitHub Actions workflow runs.
-* `/alt logs <alt> [limit] [kind] [search]` — Streams buffered log events with category/keyword filters.
-* `/alt clearlogs <alt>` — Clears in-memory buffered log history.
-* `/alt selfcheck <alt>` — Dispatches `self_check.yml` pre-flight validation in GitHub Actions.
-* `/alt diagnose <alt>` — Causal state-transition explorer and root-cause analysis.
-* `/alt simulate <alt> [test_rate]` — Sandboxed dry-run previewing variation scores and typo mutations.
-* `/alt ping <alt>` — Tests round-trip latency of the Gist queue for an alt.
+#### 2. 🤖 Alt Lifecycle & Fleet Management (`/alt`)
+* `/alt` (no arguments) — Opens the interactive **Alt Management Hub** with buttons for Overview, Add Alt, Update Alt, Remove Alt, View Logs, Clear Logs, Pre-flight Self-Check, and Workflow Runs.
+* `/alt action:<action> [alt] [confirmation] [delete_repository] [limit] [kind] [search]` — Direct CLI execution:
+  * `action:add` — Opens modal to provision new alt account.
+  * `action:update` — Opens modal to update credentials/repository.
+  * `action:remove` — Removes alt from registry (confirm with `confirmation:DELETE`).
+  * `action:logs` — Streams typed buffered log events with category/keyword filters.
+  * `action:clearlogs` — Clears in-memory buffered log history.
+  * `action:runs` — Lists recent GitHub Actions workflow runs.
+  * `action:selfcheck` — Dispatches `self_check.yml` pre-flight validation in GitHub Actions.
 
-#### 3. 📌 `/channel ...` (Trading Channel Operations)
-* `/channel list [alt]` — Opens the interactive visual Channel Manager UI.
-* `/channel add <alt> <channel_id> [name]` — Adds and verifies a trading channel on an alt.
-* `/channel replace <alt> <old_id> <new_id> [name]` — Swaps an old/dead channel with a new one.
-* `/channel rescan <alt>` — Forces an immediate channel permission and slowmode rescan.
-* `/channel resetcaution <alt> [channel_id]` — Clears Caution Mode backoff and strike counters.
+#### 3. ⚙️ Fleet Tuning & Parameters (`/tune`)
+* `/tune` (no arguments) — Opens the interactive **Fleet Tuning UI** with native selects for policy presets, modes, intervals, runtimes, and price/message edit modals.
+* `/tune [alt] [policy] [price] [mode] [message] [interval] [runtime] [image]` — Direct CLI parameter configuration:
+  * `policy:<stealth|aggressive|peak_hour|balanced>` — Applies pre-packaged operational policy preset.
+  * `price:<rate>` — Updates active pricing rate (e.g. `2.50`) in real time.
+  * `mode:<sell|buy>` — Swaps trade mode between Seller (`💰`) and Buyer (`🛒`).
+  * `message:<text>` — Replaces base ad copy and regenerates anti-detection variations.
+  * `interval:<3|5>` — Sets channel posting interval (3 or 5 minutes).
+  * `runtime:<6|12|18|24|48>` — Sets execution duration limit in hours.
+  * `image:<attachment>` — Uploads/replaces ad image (.png, .jpg, .webp < 8MB) in alt repo.
 
-#### 4. ⚙️ `/tune ...` (Ad Copy, Pricing, Policy, & Relays)
-* `/tune settings [alt]` — Opens the interactive Fleet Tuning UI with native Select menus.
-* `/tune price <alt> <new_price>` — Updates active pricing rate (e.g. `2.50`) in real time.
-* `/tune mode <alt> <mode>` — Swaps trade mode between Seller (`💰`) and Buyer (`🛒`).
-* `/tune message <alt> <new_message>` — Pushes new base ad copy (up to 1900 chars).
-* `/tune policy <alt> <template>` — Applies operational policy preset (`stealth`, `aggressive`, `peak_hour`, `balanced`).
-* `/tune interval <alt> <interval>` — Sets channel posting interval (3 or 5 minutes).
-* `/tune runtime <alt> <hours>` — Sets execution duration (6, 12, 18, 24, 48 hours).
-* `/tune image <alt> <image>` — Uploads/replaces an ad image directly in the alt's GitHub repository.
-* `/tune reply <alt> <user> <text>` — Relays a private operator DM directly to a buyer.
+#### 4. 📌 Channel Management (`/channels`)
+* `/channels` (no arguments) — Opens the visual **Channel Manager** dashboard showing channel health, slowmodes, with buttons to Add, Replace, Rescan, and Reset Caution.
+* `/channels [alt] [action] [channel_id] [new_channel_id] [name]` — Direct CLI execution:
+  * `action:add channel_id:<id> [name]` — Adds and verifies a trading channel on an alt.
+  * `action:replace channel_id:<old> new_channel_id:<new> [name]` — Swaps an old/dead channel with a new one.
+  * `action:rescan` — Forces immediate channel permission and slowmode rescan.
+  * `action:reset_caution [channel_id]` — Clears Caution Mode backoff and strike counters.
 
-#### 5. 💰 `/deals ...` (Arbitrage Scanner Controls)
-* `/deals view [alt]` — Displays recent deal alerts, profit margins, and arbitrage metrics.
-* `/deals scan <alt> <enabled>` — Toggles passive marketplace deal scanning on or off.
-* `/deals delta <alt> <delta>` — Sets minimum profit margin threshold ($/1k).
-* `/deals keywords <alt> <keywords>` — Sets whole-phrase target item/game aliases.
+#### 5. 💰 Marketplace Arbitrage & Scanner (`/deals`)
+* `/deals` (no arguments) — Opens the interactive **Market Arbitrage Hub** with real-time scanner metrics, profit margins, and quick-action configuration buttons.
+* `/deals [alt] [enabled] [min_delta] [keywords] [sample_listing]` — Direct CLI configuration:
+  * `enabled:<on|off>` — Toggles passive marketplace deal scanning on or off.
+  * `min_delta:<rate>` — Sets minimum profit margin threshold ($/1k).
+  * `keywords:<aliases>` — Sets whole-phrase target item/game aliases.
+  * `sample_listing:<text>` — Dry-run simulate / test-parse an ad message against deal criteria.
 
-#### 6. 👥 `/squad ...` (Squad Pools & Batch Management)
-* `/squad list` — Views all squad pools and assigned alts.
-* `/squad view <squad_name>` — Composite squad health overview, total posts, errors, and member details.
-* `/squad assign <alt> <squad_name>` — Assigns an alt to a named squad.
-* `/squad pause <squad_name>` / `/squad resume <squad_name>` — Batch pauses/resumes all alts in a squad.
-* `/squad policy <squad_name> <template>` — Batch applies operational policy across a whole squad.
-* `/squad price <squad_name> <price>` — Batch updates pricing across an entire squad.
+#### 6. 👥 Fleet Squads & Batch Operations (`/squad`)
+* `/squad` (no arguments) — Opens the interactive **Squad Control Hub** with squad selector and 1-click batch action buttons.
+* `/squad [action] [squad_name] [alt] [value]` — Direct CLI execution:
+  * `action:list` / `action:view` — Displays squad composite health, sent totals, error rates, and member alts.
+  * `action:assign alt:<alt> squad_name:<name>` — Assigns an alt to a named squad.
+  * `action:pause squad_name:<name>` / `action:resume` — Batch pauses/resumes all alts in a squad.
+  * `action:policy squad_name:<name> value:<preset>` — Batch applies operational policy across a whole squad.
+  * `action:price squad_name:<name> value:<rate>` — Batch updates pricing rate across an entire squad.
+
+#### 7. 📊 Monitoring, Telemetry & Operator Tools
+* `/status [alt]` — Unified fleet dashboard overview or individual alt status card.
+* `/reply alt:<alt> user:<id> text:<message>` — Operator DM Relay: transmits message directly through the alt account into buyer DM.
+* `/analytics [alt]` — Visual Speed Matrix: renders per-channel velocities, delivery reliability gauges, and slowmode utilization.
+* `/diagnose [alt]` — Causal Event Explorer: deep root-cause diagnostic timeline and actionable recommendations.
+* `/canary [alt]` — Synthetic in-band health probe measuring GitHub API, Gist queue, and REST latency in ms.
+* `/topology` — Live visual ASCII/Unicode fleet topology graph.
+* `/sync` — Broadcasts an instant reload of Gist configuration and blocklists to all alts.
+* `/refresh` — Forces an immediate poll of active GitHub Actions workflow runs and updates dashboard.
+* `/dashboard` — Posts a fresh 3-card dashboard snapshot in `#ad-dashboard`.
+* `/help` — Complete interactive reference manual with arguments, options, and permissions.
 
 `CONTROL_GIST_ID` is the preferred command transport. The official control
 bot writes one targeted `control_<ALT_ID>.json` file per alt, and the sender

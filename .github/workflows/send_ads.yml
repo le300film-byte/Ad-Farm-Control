@@ -123,15 +123,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       chunks: ${{ steps.calc.outputs.chunks }}
+      hours: ${{ steps.calc.outputs.hours }}
     steps:
       - id: calc
         shell: bash
         run: |
           set -euo pipefail
-          HOURS="${{ github.event.inputs.total_hours }}"
+          HOURS="${{ github.event.inputs.total_hours || '6' }}"
+          if [ -z "$HOURS" ] || [ "$HOURS" = "null" ]; then HOURS=6; fi
           CHUNKS=$(( (HOURS + 5) / 6 ))
+          if [ "$CHUNKS" -lt 1 ]; then CHUNKS=1; fi
           if [ "$CHUNKS" -gt 8 ]; then CHUNKS=8; fi
           echo "chunks=$CHUNKS" >> "$GITHUB_OUTPUT"
+          echo "hours=$HOURS" >> "$GITHUB_OUTPUT"
           echo "🗓️  ${{ github.event.inputs.ad_type }} @ ${HOURS}h = $CHUNKS chunk(s)"
 
   send-chunk:
@@ -139,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 380
     strategy:
-      fail-fast: true
+      fail-fast: false
       max-parallel: 1
       matrix:
         chunk: [1, 2, 3, 4, 5, 6, 7, 8]
@@ -515,7 +519,10 @@ jobs:
           MESSAGE: ${{ steps.build.outputs.msg }}
           ATTACH_IMAGE: ${{ steps.build.outputs.has_image }}
           INTERVAL_MIN: ${{ github.event.inputs.interval_min }}
-          TOTAL_RUN_MIN: 360
+          TOTAL_RUN_MIN: 350
+          TOTAL_HOURS: ${{ github.event.inputs.total_hours || '6' }}
+          CHUNK_INDEX: ${{ matrix.chunk }}
+          TOTAL_CHUNKS: ${{ needs.plan.outputs.chunks || '1' }}
           IMAGE_PATH: ${{ steps.build.outputs.image_path }}
           CUSTOM_STATUS_TEXT: ${{ secrets.CUSTOM_STATUS_TEXT }}
           STATUS_EMOJI: ${{ secrets.STATUS_EMOJI }}

@@ -245,12 +245,14 @@ def main() -> int:
     tests_dir = ROOT / "tests"
     test_files = sorted(tests_dir.glob("test_*.py")) if tests_dir.is_dir() else []
     if test_files:
-        print(f"\nRunning pytest for {len(test_files)} test files …")
+        print(f"\nRunning test suite for {len(test_files)} test files …")
         code, output = run_command([sys.executable, "-m", "pytest", "-q", "tests"], timeout=300)
+        if code != 0 and "No module named pytest" in output:
+            code, output = run_command([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], timeout=300)
         if code != 0:
-            fail("PYTEST", output, failures)
+            fail("TEST SUITE", output, failures)
         else:
-            print("✅ Pytest passed")
+            print("✅ Test suite passed")
     else:
         warnings.append("No tests/test_*.py files found; pytest was not run")
 

@@ -23,18 +23,21 @@ alts, each isolated in its own private repository and workflow.
 
 - `send_ads.py` is the fail-closed sender. It verifies egress routes before
   Discord warmup, supports 3/5-minute intervals, and caps every runtime at 48 hours.
-- **Hierarchical Subcommand Architecture:** Commands are cleanly grouped into
-  logical domains (`/fleet`, `/alt`, `/channel`, `/tune`, `/deals`, `/squad`)
-  while preserving direct top-level commands (`/status`, `/run`, `/pause`,
-  `/resume`, `/analytics`, etc.) for complete backwards compatibility.
-- **Visual Fleet Analytics & Speed Matrix (`/analytics` / `/fleet analytics`):**
+- **Unified Interactive Hub Architecture:** Streamlined into 19 non-duplicated,
+  interactive top-level slash commands (`/run`, `/stop`, `/pause`, `/resume`,
+  `/alt`, `/tune`, `/channels`, `/deals`, `/squad`, `/status`, `/reply`,
+  `/analytics`, `/diagnose`, `/canary`, `/topology`, `/sync`, `/refresh`,
+  `/dashboard`, `/help`). Running base commands without parameters opens interactive
+  rich views with 1-click action buttons, selectors, and modals, while still
+  supporting direct one-shot CLI arguments for power operators.
+- **Visual Fleet Analytics & Speed Matrix (`/analytics`):**
   Renders live ASCII progress gauges (`[▰▰▰▰▰▰▰▰▱▱]`), delivery reliability percentages,
   slowmode utilization, and inter-channel interval timelines.
-- **Refined Directional Arbitrage Deal Scanner:**
+- **Refined Directional Arbitrage Deal Scanner (`/deals`):**
   - **Supplier Arbitrage (`🟢 SUPPLIER ALERT`):** Detects other users selling under-market (`price <= buy_benchmark - delta`) and calculates discount profit margins.
   - **Premium Buyer Arbitrage (`🔵 ARBITRAGE SALE`):** Detects buyers offering high bids (`price >= sell_benchmark + delta`) and calculates net profit margins.
   - **Noise Filter:** Rejects lowball buyer bids and overpriced sellers.
-- **Fleet Squad Batch Management (`/squad`):** Group alts into named pools (e.g. `Alpha Sellers`) and execute batch controls (`/squad pause`, `/squad resume`, `/squad policy`, `/squad price`) with aggregated health metrics.
+- **Fleet Squad Batch Management (`/squad`):** Group alts into named pools (e.g. `Alpha Sellers`) and execute batch controls (batch pause, resume, policy, price) with aggregated health metrics.
 - **Interactive Setup Configuration:** Running `python setup.py` interactively prompts for every CLI flag (`--quick`, `--force`, `--forums`, `--upgrade-forums`, `--abort-on-failure`) with explanations.
 - **AFK Break Visibility:** Alts log visible status notices to `#farm-logs` when entering and returning from natural 10–30 min AFK breaks, and continuously poll control Gists every 15s.
 - **Fuzzy & Emoji-Resistant Channel Discovery:** Strips unicode symbols and decorative formatting to match channels like `「💵」・trade-market` or `trading﹒☆˚₊࿔`.
@@ -50,7 +53,7 @@ alts, each isolated in its own private repository and workflow.
 | `.github/workflows/control_bot.yml` | Core repository | Owner-gated control bot chained continuously for 24/7 operations; supports 6–48h runs. |
 | `.github/workflows/bootstrap.yml` | Core repository | Masked cloud alternative to the local bootstrap script, including multi-owner setup. |
 | `.github/workflows/sync_to_alts.yml` | Core repository | Copies canonical V6 sender and workflows to configured alt repositories. |
-| `control_bot/` | Core repository | Hierarchical slash commands, private run UI, live state, typed logs, visual analytics, dashboard, and GitHub dispatch. |
+| `control_bot/` | Core repository | Unified interactive slash commands, private run UI, live state, typed logs, visual analytics, dashboard, and GitHub dispatch. |
 | `setup.py` | Core repository | Interactive bootstrap with explanations for all safety flags, Discord/GitHub resource provisioning. |
 
 ## Required safety configuration

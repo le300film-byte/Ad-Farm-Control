@@ -154,11 +154,9 @@ class SafetyRegressionTests(unittest.TestCase):
         self.assertEqual(
             names,
             {
-                "run", "stop", "pause", "resume", "altadd", "altupdate", "altlist", "altremove",
-                "setprice", "setmode", "setmessage", "setdealkeywords", "setdealscan", "setdealdelta", "setchannel", "replacechannel", "rescan_channels", "resetcaution", "channels", "uploadimage", "setinterval", "setruntime",
-                "settings", "sync", "status", "logs", "deals", "pingalt", "selfcheck", "clearlogs", "runs", "refresh", "dashboard", "help",
-                "diagnose", "topology", "simulate", "squad", "policy", "canary", "reply", "analytics",
-                "fleet", "alt", "channel", "tune", "deals_group",
+                "run", "stop", "pause", "resume", "alt", "tune", "channels", "deals",
+                "squad", "status", "reply", "analytics", "diagnose", "canary",
+                "topology", "sync", "refresh", "dashboard", "help",
             },
         )
 

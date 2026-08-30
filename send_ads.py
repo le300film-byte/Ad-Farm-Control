@@ -190,7 +190,10 @@ def log(m, kind="INFO"):
     if category in {"ERROR", "CAUTION", "SECURITY"}:
         globals()["_last_error"] = str(m)[:300]
     clean_msg = _mask_secrets(m)
-    print(f"[{_ts()}] [{category}] {clean_msg}", flush=True)
+    alt_id = globals().get("ALT_ID") or os.environ.get("ALT_ID", "")
+    alt_name = globals().get("ALT_NAME") or os.environ.get("ALT_NAME", "")
+    alt_tag = f"[Alt {alt_id} · {alt_name}] " if (alt_id or alt_name) else ""
+    print(f"[{_ts()}] [{category}] {alt_tag}{clean_msg}", flush=True)
 
 def event_log(kind, message):
     log(message, kind=kind)
@@ -258,7 +261,10 @@ AD_TYPE       = _required("AD_TYPE").lower()
 MESSAGE       = _required("MESSAGE")
 ATTACH_IMAGE  = _bool("ATTACH_IMAGE", False)
 INTERVAL_MIN  = _float("INTERVAL_MIN", 5)
-TOTAL_RUN_MIN = _float("TOTAL_RUN_MIN", 360)
+TOTAL_RUN_MIN = _float("TOTAL_RUN_MIN", 350)
+CHUNK_INDEX   = _int("CHUNK_INDEX", 1)
+TOTAL_CHUNKS  = _int("TOTAL_CHUNKS", 1)
+TOTAL_HOURS   = _float("TOTAL_HOURS", 6.0)
 IMAGE_PATH    = _env("IMAGE_PATH")
 CUSTOM_STATUS_TEXT = _env("CUSTOM_STATUS_TEXT", "Trading")
 STATUS_EMOJI       = _env("STATUS_EMOJI", "💰")
@@ -426,9 +432,10 @@ if BLOCKED_SAFETY_STOP < 2: BLOCKED_SAFETY_STOP = 2
 if TOTAL_RUN_MIN < 5:
     log(f"⚠️ CONFIG: TOTAL_RUN_MIN={TOTAL_RUN_MIN} is too short (minimum safe runtime is 5 min). Clamping to 5.")
     TOTAL_RUN_MIN = 5
-if TOTAL_RUN_MIN > 2880:  # 48h
-    log(f"⚠️ CONFIG: TOTAL_RUN_MIN={TOTAL_RUN_MIN} exceeds the 48h safety cap. Clamping to 2880 min (48h).")
-    TOTAL_RUN_MIN = 2880
+if TOTAL_RUN_MIN > 350:
+    # Single GitHub Actions step safe runtime ceiling is 350m (~5.8h) to allow chained multi-chunk execution
+    log(f"ℹ️ Chunk execution runtime capped to safe step boundary of 350 min (5.8h) for chained multi-chunk support.")
+    TOTAL_RUN_MIN = 350
 
 if AD_TYPE not in ("sell", "buy"):
     log(f"❌ CONFIG ERROR: AD_TYPE must be 'sell' or 'buy', got '{AD_TYPE}'. Check workflow inputs / AD_TYPE env var.")
@@ -506,6 +513,7 @@ total_sent = total_err = total_skip = total_img = total_edits = 0
 total_distractions = 0
 _active_ch_ref = []              # mutable list ref (current active channels)
 _ch_names_ref = {}               # dict ref
+ch_names = _ch_names_ref         # module-level alias
 _slowmodes_ref = {}
 _last_sent_ref = {}
 _my_last_msg_id_ref = {}
@@ -983,14 +991,15 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
 _log_webhook_failures = 0
 
 def send_log_webhook(msg, username=None, kind=None):
-    """Send one typed action-log line to the shared #farm-logs webhook.
+    """Send one typed action-log line to the shared #farm-logs webhook (or dashboard fallback).
 
     Discord lets each webhook message override its display name. Using
     ALT_NAME by default means the control bot can route all four alts through
     one channel without four webhook URLs.
     """
     global _log_webhook_failures
-    if not LOG_WEBHOOK_URL:
+    target_url = LOG_WEBHOOK_URL or DASHBOARD_WEBHOOK_URL
+    if not target_url:
         return
     if _log_webhook_failures >= 5:
         return  # stop trying after repeated failures
@@ -1001,22 +1010,25 @@ def send_log_webhook(msg, username=None, kind=None):
         elif "CAUTION" in upper or "⚠️" in str(msg): category = "CAUTION"
         elif "ERROR" in upper or "FAIL" in upper or "❌" in str(msg): category = "ERROR"
         elif "CONTROL" in upper or "PAUSE" in upper or "RESUME" in upper: category = "CONTROL"
-    line = f"`[{_ts()}]` [{category}] {msg}"
+        elif "AFK" in upper or "☕" in str(msg): category = "AFK"
+    
+    alt_prefix = f"**[Alt {ALT_ID} · {ALT_NAME}]** " if ALT_ID else ""
+    line = f"`[{_ts()}]` [{category}] {alt_prefix}{msg}"
 
     def _send():
         global _log_webhook_failures
         try:
             wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
             payload = {"content": line[:2000],
-                       "username": (username or ALT_NAME)[:80],
+                       "username": (username or f"Alt {ALT_ID}: {ALT_NAME}")[:80],
                        "allowed_mentions": {"parse": []}}
-            r = creq.post(LOG_WEBHOOK_URL + "?wait=true",
+            r = creq.post(target_url + "?wait=true",
                           json=payload,
                           impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                           proxies=wh_proxies)
             if r.status_code == 400:
-                payload["thread_name"] = f"📜 Logs ({ALT_NAME})"
-                r = creq.post(LOG_WEBHOOK_URL + "?wait=true",
+                payload["thread_name"] = f"📜 Logs (Alt {ALT_ID}: {ALT_NAME})"
+                r = creq.post(target_url + "?wait=true",
                               json=payload,
                               impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                               proxies=wh_proxies)
@@ -1050,8 +1062,9 @@ def send_dashboard(embed_dict):
         return False
     try:
         wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
+        sender_name = f"Alt {ALT_ID}: {ALT_NAME} Dashboard" if ALT_ID else "Ad-Bot Dashboard"
         payload = {
-            "username": "Ad-Bot Dashboard",
+            "username": sender_name[:80],
             "allowed_mentions": {"parse": []},
             "embeds": [embed_dict],
         }
@@ -1064,7 +1077,7 @@ def send_dashboard(embed_dict):
                               proxies=wh_proxies)
                 if r.status_code == 400:
                     payload_forum = dict(payload)
-                    payload_forum["thread_name"] = "📊 Live Dashboard"
+                    payload_forum["thread_name"] = f"📊 Dashboard (Alt {ALT_ID}: {ALT_NAME})" if ALT_ID else "📊 Live Dashboard"
                     r = creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
                                   json=payload_forum, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                                   proxies=wh_proxies)
@@ -1097,8 +1110,9 @@ def send_deal_webhook(embed_dict, thread_name=None):
         return False
     try:
         wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
+        sender_name = f"Alt {ALT_ID}: {ALT_NAME} · Deals" if ALT_ID else f"{ALT_NAME} · Deals"
         payload = {
-            "username": f"{ALT_NAME} · deal scanner"[:80],
+            "username": sender_name[:80],
             "allowed_mentions": {"parse": []},
             "embeds": [embed_dict],
         }
@@ -1133,8 +1147,9 @@ def send_deal_webhook(embed_dict, thread_name=None):
 
 def _dashboard_startup_embed(version, ad_type, ch_list, interval_min, runtime_min, variants, use_img, total_channels, active_count):
     """Build the startup dashboard embed."""
+    alt_prefix = f"[Alt {ALT_ID} · {ALT_NAME}] " if ALT_ID else ""
     return {
-        "title": f"🟢 STARTED {version}",
+        "title": f"🟢 {alt_prefix}STARTED {version}",
         "color": 0x57F287,  # green
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [
@@ -1151,7 +1166,8 @@ def _dashboard_startup_embed(version, ad_type, ch_list, interval_min, runtime_mi
 def _dashboard_cycle_embed(cycle, elapsed_min, sent, img_attach, txt_only, edits, errs, skips, per_ch, active_count, total_channels, active_channels_set, ch_names_dict, slowmodes_dict, last_sent_dict, my_last_id_dict, in_afk_flag=False, afk_left=0.0, is_shutdown=False):
     """Build per-cycle / shutdown dashboard embed."""
     color = 0xED4245 if (errs > 0 or is_shutdown) else 0x5865F2  # red/blue
-    title = f"🏁 SHUTDOWN summary" if is_shutdown else f"📊 Cycle {cycle}"
+    alt_prefix = f"[Alt {ALT_ID} · {ALT_NAME}] " if ALT_ID else ""
+    title = f"🏁 {alt_prefix}SHUTDOWN summary" if is_shutdown else f"📊 {alt_prefix}Cycle {cycle}"
     lines = []
     for cid in CHANNEL_IDS:
         name = ch_names_dict.get(cid, cid)
@@ -1185,6 +1201,87 @@ def _dashboard_cycle_embed(cycle, elapsed_min, sent, img_attach, txt_only, edits
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": fields,
     }
+
+def _send_completion_summary_webhook(reason, start_ts, sent, err, skip, distractions, img, edits, per_ch, is_shutdown=False):
+    """Send a rich Discord summary embed to DASHBOARD_WEBHOOK_URL and log notification to LOG_WEBHOOK_URL."""
+    elapsed_sec = max(1.0, time.time() - start_ts)
+    elapsed_min = elapsed_sec / 60.0
+    elapsed_h = elapsed_min / 60.0
+
+    is_chained_handoff = (CHUNK_INDEX < TOTAL_CHUNKS) and not is_shutdown and err == 0
+    if is_shutdown:
+        status_label = "🛑 RUN TERMINATED (Operator / Safety Stop)"
+        color = 0xED4245
+    elif is_chained_handoff:
+        status_label = f"🏁 CHUNK {CHUNK_INDEX}/{TOTAL_CHUNKS} COMPLETE (Chaining to Chunk {CHUNK_INDEX+1})"
+        color = 0x57F287
+    else:
+        status_label = f"🎉 ALL CHUNKS COMPLETED ({TOTAL_HOURS:.0f}h Target Reached)"
+        color = 0x57F287
+
+    total_ops = sent + err
+    error_rate = (err / total_ops * 100) if total_ops > 0 else 0.0
+    velocity = (sent / elapsed_h) if elapsed_h > 0 else 0.0
+
+    fields = [
+        {
+            "name": "⏱️ Duration & Velocity",
+            "value": f"• Elapsed: `{elapsed_min:.1f} min` ({elapsed_h:.2f}h)\n• Throughput: `{velocity:.1f} ads/hr`\n• AFK Breaks: `{distractions}` pauses",
+            "inline": True,
+        },
+        {
+            "name": "📤 Deliveries & Edits",
+            "value": f"• Total Sent: `{sent}` posts\n• 💬 Text: `{sent - img}` · 📷 Image: `{img}`\n• ✏️ Typo Edits: `{edits}` successful",
+            "inline": True,
+        },
+        {
+            "name": "🛡️ Health & Reliability",
+            "value": f"• Errors: `{err}` ({error_rate:.1f}% error rate)\n• Skips: `{skip}` cycles\n• Blacklisted: `{len(_blocked_variations)}`",
+            "inline": True,
+        },
+    ]
+
+    ch_lines = []
+    for cid in CHANNEL_IDS[:8]:
+        s = per_ch.get(cid, {"sent": 0, "errors": 0, "skipped": 0, "txt": 0, "img": 0, "edits": 0})
+        name = ch_names.get(cid, cid) if ch_names else cid
+        ch_lines.append(f"• `#{name}`: **{s['sent']}** sent (💬{s['txt']}/📷{s['img']}/✏️{s['edits']}) · ❌{s['errors']} err")
+    if ch_lines:
+        fields.append({
+            "name": f"📂 Channel Breakdown ({len(CHANNEL_IDS)} targets)",
+            "value": "\n".join(ch_lines[:6]) + (f"\n*+{len(ch_lines)-6} more...*" if len(ch_lines) > 6 else ""),
+            "inline": False,
+        })
+
+    if is_chained_handoff:
+        fields.append({
+            "name": "⏭️ Next Workflow Action",
+            "value": f"🔄 Starting Chunk `{CHUNK_INDEX + 1}/{TOTAL_CHUNKS}` in ~2 minutes (reconnect jitter).",
+            "inline": False,
+        })
+    else:
+        fields.append({
+            "name": "⏭️ Next Workflow Action",
+            "value": "✅ Execution run completed. Runner entering idle standby.",
+            "inline": False,
+        })
+
+    embed = {
+        "title": f"📊 Alt {ALT_ID} ({ALT_NAME}) — {status_label}",
+        "description": f"**Status**: `{reason}`\n**Progress**: Chunk `{CHUNK_INDEX}/{TOTAL_CHUNKS}` · Budget: `{TOTAL_HOURS:.0f}h total` ({TOTAL_RUN_MIN:.0f}m/chunk)",
+        "color": color,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fields": fields,
+        "footer": {
+            "text": f"adfarm-core-AI · Alt {ALT_ID} · Chunk {CHUNK_INDEX}/{TOTAL_CHUNKS}",
+        },
+    }
+
+    send_dashboard(embed)
+    send_log_webhook(
+        f"📊 **[Alt {ALT_ID}] RUN COMPLETE**: {reason} | Sent `{sent}` ads ({sent-img} text, {img} img) | Errors `{err}` | Elapsed `{elapsed_min:.1f}m` (Chunk {CHUNK_INDEX}/{TOTAL_CHUNKS})",
+        kind="CONTROL"
+    )
 
 def _format_attachments(attachments):
     """Return a string listing attachment URLs for forwarding."""
@@ -1246,11 +1343,11 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
     embed = {
         "type": "rich",
         "color": 0x2F3136 if is_me else 0x57F287,  # grey for us, green for buyer
-        "footer": {"text": "Open DM", "icon_url": av},
+        "footer": {"text": f"Alt {ALT_ID}: {ALT_NAME} · Open DM" if ALT_ID else f"{ALT_NAME} · Open DM", "icon_url": av},
         "url": deep_link,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    thread_title = f"💬 {uname[:24]} ({uid[-4:] if len(uid)>=4 else uid})"
+    thread_title = f"💬 [Alt {ALT_ID}] {uname[:20]} ({uid[-4:] if len(uid)>=4 else uid})" if ALT_ID else f"💬 {uname[:24]} ({uid[-4:] if len(uid)>=4 else uid})"
 
     if not is_me and body and body != "*(empty — embed/attachment only)*":
         # Aggregate recent buyer text (last 2 hours) to build cumulative intent across spaced-out DMs
@@ -1278,7 +1375,7 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
         if len(history) > 1:
             hist_lines = []
             for h in history[-5:]:
-                role_label = "Alt" if h.get("is_me") else "Buyer"
+                role_label = f"Alt {ALT_ID}" if h.get("is_me") else "Buyer"
                 ago_str = _format_dm_ago(now_ts - h.get("ts", now_ts))
                 clean_h_text = h.get("text", "").replace("\n", " ")[:70]
                 hist_lines.append(f"• `[{ago_str}]` **{role_label}:** \"{clean_h_text}\"")
@@ -1289,7 +1386,7 @@ def forward_dm_message(channel_id, user_obj, content, attachments, is_me=False):
         embed["fields"] = fields
 
         tag_badge = intent.get('game') or intent['category']
-        thread_title = f"🏷️ [{tag_badge}] {uname[:20]}"
+        thread_title = f"🏷️ [Alt {ALT_ID}] [{tag_badge}] {uname[:18]}" if ALT_ID else f"🏷️ [{tag_badge}] {uname[:20]}"
 
     if not body:
         body = "*(empty — embed/attachment only)*"
@@ -2515,29 +2612,198 @@ def read_channel(cid, limit=15):
     return msgs
 
 # --------------------------------------------------------------------------- #
-# Passive Deal Scanner (F-13 V6) — zero extra API calls                     #
+# Deep Multi-Stage Market Parser & Deal Scanner (F-13 Enhanced V6)          #
 # --------------------------------------------------------------------------- #
-_DEAL_PRICE_PATTERNS = [
-    re.compile(r'(?:\$|usd)?\s*(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?\s*(?:\/|p\s*\/|per|for\s*(?:1\s*k)?)\s*(?:1\s*)?k\b', re.I),
-    re.compile(r'\b(?:rate|ratio|price)\s*[:=]?\s*(?:\$|usd)?\s*(\d+(?:\.\d{1,2})?)\b', re.I),
-    re.compile(r'(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?\s*(?:ea|each)\b', re.I),
-    re.compile(r'(\d+(?:\.\d{1,2})?)\s*\$', re.I),
-    re.compile(r'\$\s*(\d+(?:\.\d{1,2})?)', re.I),
+_PAYMENT_PATTERNS = {
+    "PayPal": re.compile(r"\b(?:paypal|pp|fnf|f&f)\b", re.I),
+    "CashApp": re.compile(r"\b(?:cashapp|ca)\b", re.I),
+    "Crypto": re.compile(r"\b(?:crypto|btc|eth|ltc|sol|usdt|usdc|binance)\b", re.I),
+    "Venmo": re.compile(r"\b(?:venmo)\b", re.I),
+    "Apple Pay": re.compile(r"\b(?:apple\s*pay|ap)\b", re.I),
+    "Robux": re.compile(r"\b(?:robux|wt|w/o\s*tax|after\s*tax)\b", re.I),
+    "Wise": re.compile(r"\b(?:wise|revolut)\b", re.I),
+    "Zelle": re.compile(r"\b(?:zelle)\b", re.I),
+}
+
+_DEAL_SELL_KW = re.compile(r"\b(?:sell(?:ing)?|wts|stock|cheap|shop|offering|have|fs|for\s*sale|supplying|providing)\b", re.I)
+_DEAL_BUY_KW  = re.compile(r"\b(?:buy(?:ing)?|wtb|lf\s*(?:tokens?|rap|bb|items?)?|need|looking\s*for|want|paying|buying\s*all|iso)\b", re.I)
+_NEGATION_KW  = re.compile(r"\b(?:not\s*(?:selling|buying|trading|have|in\s*stock)|don\x27?t\s*(?:have|buy|sell|dm)|no\s*(?:stock|bb|tokens)|out\s*of\s*stock|sold\s*out|0\s*stock|scam(?:mer|med)?|vouch|\+rep|rep\b|proof)\b", re.I)
+
+_DIRECT_RATE_PATTERNS = [
+    # $2.20/1k, 2.20$/1k, 2.20/1k, 2.20 per 1k, 2.20/k, 2.20 / 1000
+    re.compile(r"(?:\$|usd|eur|€|£)?\s*(\d+(?:\.\d{1,2})?)\s*(?:\$|usd|eur|€|£)?\s*(?:\/|p\/|per|for)\s*(?:1\s*)?(?:k|thousand|1000)\b", re.I),
+    # rate: 2.20, ratio 1:2.20, ratio 2.20:1, rate 2.20
+    re.compile(r"\b(?:rate|ratio|ratio:)\s*[:=]?\s*(?:1\s*:\s*)?(?:\$|usd|eur|€|£)?\s*(\d+(?:\.\d{1,2})?)\b", re.I),
+    # 2.20 ea, 2.20 each, $2.20 each
+    re.compile(r"(?:\$|usd|eur|€|£)?\s*(\d+(?:\.\d{1,2})?)\s*(?:\$|usd|eur|€|£)?\s*(?:ea|each|per\s*token)\b", re.I),
+    # @ $2.20, @ 2.20/1k
+    re.compile(r"(?:@|\bat)\s*(?:\$|usd|eur|€|£)?\s*(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?(?:\s*(?:\/|per)\s*(?:1\s*)?k)?\b", re.I),
+    # 2.20$ or $2.20 (standalone with currency symbol)
+    re.compile(r"(?:\$|usd|eur|€|£)\s*(\d+(?:\.\d{1,2})?)(?![a-zA-Z0-9])", re.I),
+    re.compile(r"\b(\d+(?:\.\d{1,2})?)\s*(?:\$|usd|eur|€|£)(?![a-zA-Z0-9])", re.I),
 ]
-_DEAL_SELL_KW = re.compile(r'\b(?:sell(?:ing)?|wts|stock|cheap|shop|offering|have)\b', re.I)
-_DEAL_BUY_KW  = re.compile(r'\b(?:buy(?:ing)?|wtb|lf\s*(?:tokens?|rap|bb|items?)?|need|looking\s*for|want)\b', re.I)
+
+_VOLUME_PATTERNS = [
+    # Explicit stock/qty indicators: stock 50k, qty 100k, 50k stock, 100k tokens
+    re.compile(r"\b(?:stock|qty|amount|vol|volume)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*k\b", re.I),
+    re.compile(r"\b(\d+(?:\.\d+)?)\s*k\s*(?:stock|tokens|left|in\s*stock|total)\b", re.I),
+    # Numbers with comma separator: 50,000, 100,000
+    re.compile(r"(?<!/)(?<!per\s)\b(\d{1,3}(?:,\d{3})+)\b"),
+    # General k/thousand/m volume NOT part of rate denominator (/1k, per 1k)
+    re.compile(r"(?<!/)(?<!per\s)(?<!p/)(?<!for\s)\b(\d+(?:\.\d+)?)\s*k\b", re.I),
+    re.compile(r"(?<!/)(?<!per\s)(?<!p/)\b(\d+(?:\.\d+)?)\s*(?:thousand|mil|million|m)\b", re.I),
+]
 _DEAL_THROTTLE_SEC = 600  # don't re-alert same seller+price for 10min
 
 def _match_deal_item(text):
     """Return the configured item alias found as a whole phrase, if any."""
     source = str(text or "")
-    for keyword in _get_active_deal_keywords():
-        # Word boundaries prevent a short alias such as BB from matching a
-        # larger unrelated word. Spaces and punctuation inside an alias remain
-        # literal and case-insensitive.
+    sorted_keywords = sorted(_get_active_deal_keywords(), key=len, reverse=True)
+    for keyword in sorted_keywords:
         pattern = r"(?<![A-Za-z0-9])" + re.escape(keyword) + r"(?![A-Za-z0-9])"
         if re.search(pattern, source, re.I):
             return keyword
+    return None
+
+def parse_market_listing(text, target_keywords=None):
+    """Deep multi-stage market listing parser.
+    
+    Extracts matched item keyword, trading direction (seller vs buyer),
+    unit-normalized $/1k price, volume/stock, payment methods, and specific segment snippet.
+    Accurately isolates the target item even from long, complex multi-item bulleted lists.
+    """
+    if not text or len(text) < 5:
+        return None
+    if target_keywords is None:
+        target_keywords = _get_active_deal_keywords()
+    
+    sorted_keywords = sorted(target_keywords, key=len, reverse=True)
+
+    lines = [l.strip() for l in re.split(r"[\r\n]+", text) if l.strip()]
+    if not lines:
+        return None
+
+    current_section_direction = None
+
+    for line in lines:
+        upper_line = line.upper()
+        if any(h in upper_line for h in ["WTS", "SELLING", "HAVE", "STOCK"]) and not any(h in upper_line for h in ["WTB", "BUYING", "LF"]):
+            if ":" in line or len(line.split()) <= 3:
+                current_section_direction = "seller"
+        elif any(h in upper_line for h in ["WTB", "BUYING", "LF", "LOOKING FOR", "NEED"]) and not any(h in upper_line for h in ["WTS", "SELLING"]):
+            if ":" in line or len(line.split()) <= 3:
+                current_section_direction = "buyer"
+
+        cleaned_line = re.sub(r"^[\s\u2022\u25aa\u25cf\u25cb\u2219\*\-\>\~]+", "", line).strip()
+        if not cleaned_line:
+            continue
+        parts = [s.strip() for s in re.split(r"[\u2022\u25aa\u25cf\u25cb\u2219\|;\t]+", cleaned_line) if s.strip()]
+        segments = []
+        for part in parts:
+            if "," in part:
+                subparts = [sp.strip() for sp in re.split(r",\s*(?=[a-zA-Z\[\*\•\-])", part) if sp.strip()]
+                segments.extend(subparts)
+            else:
+                segments.append(part)
+
+        if not segments:
+            segments = [cleaned_line]
+
+        for seg in segments:
+            matched_item = None
+            for kw in sorted_keywords:
+                pat = r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])"
+                if re.search(pat, seg, re.I):
+                    matched_item = kw
+                    break
+
+            if not matched_item:
+                continue
+
+            if _NEGATION_KW.search(seg):
+                continue
+
+            has_sell = bool(_DEAL_SELL_KW.search(seg))
+            has_buy  = bool(_DEAL_BUY_KW.search(seg))
+
+            direction = None
+            if has_sell and not has_buy:
+                direction = "seller"
+            elif has_buy and not has_sell:
+                direction = "buyer"
+            elif current_section_direction:
+                direction = current_section_direction
+            elif _DEAL_SELL_KW.search(text) and not _DEAL_BUY_KW.search(text):
+                direction = "seller"
+            elif _DEAL_BUY_KW.search(text) and not _DEAL_SELL_KW.search(text):
+                direction = "buyer"
+
+            if not direction:
+                continue
+
+            payments = [name for name, ppat in _PAYMENT_PATTERNS.items() if ppat.search(seg) or ppat.search(text)]
+
+            volume_str = None
+            vol_val = None
+            for vpat in _VOLUME_PATTERNS:
+                vm = vpat.search(seg)
+                if vm:
+                    raw_v = vm.group(1).replace(",", "")
+                    try:
+                        v_num = float(raw_v)
+                        if "k" in vm.group(0).lower():
+                            vol_val = v_num * 1000
+                            volume_str = f"{v_num:g}k"
+                        elif "m" in vm.group(0).lower() or "mil" in vm.group(0).lower():
+                            vol_val = v_num * 1000000
+                            volume_str = f"{v_num:g}m"
+                        else:
+                            vol_val = v_num
+                            volume_str = f"{v_num:g}"
+                        break
+                    except Exception:
+                        pass
+
+            detected_rate = None
+
+            for pat in _DIRECT_RATE_PATTERNS:
+                pm = pat.search(seg)
+                if pm:
+                    try:
+                        val = float(pm.group(1))
+                        if val > 20 and vol_val and vol_val >= 1000:
+                            calc_rate = (val / (vol_val / 1000.0))
+                            if 0.10 <= calc_rate <= 20.0:
+                                detected_rate = round(calc_rate, 2)
+                                break
+                        elif 0.10 <= val <= 20.0:
+                            detected_rate = val
+                            break
+                    except Exception:
+                        continue
+
+            if detected_rate is None and vol_val and vol_val >= 1000:
+                bm = re.search(r"(?:for|\$|paying|total|price)\s*[:=]?\s*(?:\$|usd)?\s*(\d+(?:\.\d{1,2})?)\s*(?:\$|usd)?", seg, re.I)
+                if bm:
+                    try:
+                        total_p = float(bm.group(1))
+                        calc_rate = total_p / (vol_val / 1000.0)
+                        if 0.10 <= calc_rate <= 20.0:
+                            detected_rate = round(calc_rate, 2)
+                    except Exception:
+                        pass
+
+            if detected_rate is not None and 0.10 <= detected_rate <= 20.0:
+                return {
+                    "matched": True,
+                    "item": matched_item,
+                    "kind": direction,
+                    "price": detected_rate,
+                    "volume": volume_str,
+                    "payments": payments,
+                    "segment": seg,
+                }
+
     return None
 
 def _extract_my_rate():
@@ -2547,7 +2813,7 @@ def _extract_my_rate():
     if _runtime_rate is not None:
         return _runtime_rate
     src = _get_active_message()
-    for pat in _DEAL_PRICE_PATTERNS:
+    for pat in _DIRECT_RATE_PATTERNS:
         m = pat.search(src)
         if m:
             try: return float(m.group(1))
@@ -2573,36 +2839,78 @@ def _send_deal_alert(cid, seller, price, ref_rate, profit_margin, snippet, jump_
         _last_deal_ts = now
     snip = (snippet or "").replace("\n", " ⏎ ")[:180]
     pct = (profit_margin / ref_rate * 100) if ref_rate > 0 else 0.0
+    alt_badge = f"[Alt {ALT_ID} · {ALT_NAME}]" if ALT_ID else f"[{ALT_NAME}]"
     if kind == "buyer":
-        title = "📈 ARBITRAGE ALERT — HIGH-PAYING BUYER"
+        title = f"📈 {alt_badge} ARBITRAGE ALERT — HIGH-PAYING BUYER"
         color = 0x57F287
         edge_label = f"+${profit_margin:.2f}/1k above cost ({pct:.1f}% profit)"
-        action_type = "🔵 BUYER DETECTED (Sell High Opportunity)"
+        action_type = f"🔵 BUYER DETECTED ({alt_badge})"
     else:
-        title = "🎯 SUPPLIER ALERT — UNDER-MARKET SELLER"
+        title = f"🎯 {alt_badge} SUPPLIER ALERT — UNDER-MARKET SELLER"
         color = 0xFEE75C
         edge_label = f"+${profit_margin:.2f}/1k discount ({pct:.1f}% discount)"
-        action_type = "🟢 SELLER DETECTED (Buy Low Opportunity)"
+        action_type = f"🟢 SELLER DETECTED ({alt_badge})"
+
+    user_id = str(seller.get("id") or "")
+    user_handle = seller.get("username") or seller.get("global_name") or "unknown"
+    user_mention = f"<@{user_id}>" if user_id else f"@{user_handle}"
+
+    # Extract payments and volume from snippet
+    payments = [name for name, ppat in _PAYMENT_PATTERNS.items() if ppat.search(snippet or "")]
+    volume_str = None
+    for vpat in _VOLUME_PATTERNS:
+        vm = vpat.search(snippet or "")
+        if vm:
+            raw_v = vm.group(1).replace(",", "")
+            try:
+                v_num = float(raw_v)
+                if "k" in vm.group(0).lower():
+                    volume_str = f"{v_num:g}k"
+                elif "m" in vm.group(0).lower() or "mil" in vm.group(0).lower():
+                    volume_str = f"{v_num:g}m"
+                else:
+                    volume_str = f"{v_num:g}"
+                break
+            except Exception:
+                pass
+
+    rate_display = f"**${price:.2f}/1k**"
+    if volume_str:
+        rate_display += f" (Stock/Vol: `{volume_str}`)"
+
+    fields = [
+        {"name": "Category", "value": action_type, "inline": True},
+        {"name": "Target Item", "value": f"**{item}**", "inline": True},
+        {"name": "Market User", "value": f"{user_mention} (`@{user_handle}`)", "inline": True},
+        {"name": "Channel", "value": f"<#{cid}>", "inline": True},
+        {"name": "Detected Price", "value": rate_display, "inline": True},
+        {"name": "Reference Baseline", "value": f"${ref_rate:.2f}/1k", "inline": True},
+        {"name": "Net Profit Edge", "value": f"**{edge_label}**", "inline": True},
+    ]
+
+    if payments:
+        fields.append({"name": "Payment Methods", "value": " · ".join(f"`{p}`" for p in payments), "inline": True})
+
+    fields.append({"name": "Chat Excerpt", "value": f"```{snip}```[🔗 Jump to Discord message]({jump_url})", "inline": False})
+
+    if user_id and ALT_ID:
+        fields.append({
+            "name": "⚡ Quick Reply Command",
+            "value": f"`/reply alt:{ALT_ID} user:{user_id} text:Hey, I saw your post for {item} @ ${price:.2f}/1k!`",
+            "inline": False,
+        })
+
     embed = {
         "title": title,
         "color": color,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "url": jump_url,
-        "fields": [
-            {"name": "Category", "value": action_type, "inline": True},
-            {"name": "Target Item", "value": f"**{item}**", "inline": True},
-            {"name": "Market User", "value": f"@{seller.get('username') or seller.get('global_name') or '?'}", "inline": True},
-            {"name": "Channel", "value": f"<#{cid}>", "inline": True},
-            {"name": "Detected Price", "value": f"**${price:.2f}/1k**", "inline": True},
-            {"name": "Reference Baseline", "value": f"${ref_rate:.2f}/1k", "inline": True},
-            {"name": "Net Profit Edge", "value": f"**{edge_label}**", "inline": True},
-            {"name": "Chat Excerpt", "value": f"```{snip}```[🔗 Jump to Discord message]({jump_url})", "inline": False},
-        ],
+        "fields": fields,
     }
-    thread_title = f"💰 [{'+$' if profit_margin>=0 else '-$'}{abs(profit_margin):.2f}/1k] {item} @ ${price:.2f}"
+    thread_title = f"💰 [{'+$' if profit_margin>=0 else '-$'}{abs(profit_margin):.2f}/1k] {item} @ ${price:.2f} (Alt {ALT_ID})" if ALT_ID else f"💰 [{'+$' if profit_margin>=0 else '-$'}{abs(profit_margin):.2f}/1k] {item} @ ${price:.2f}"
     try:
         send_deal_webhook(embed, thread_name=thread_title)
-        event_log("DEAL", f"🔥 [{action_type[:15]}] {item} — @{seller.get('username') or seller.get('global_name') or '?'} in #{cid} @ ${price:.2f}/1k (margin: +${profit_margin:.2f})")
+        event_log("DEAL", f"🔥 [{action_type[:15]}] {item} — @{user_handle} in #{cid} @ ${price:.2f}/1k (margin: +${profit_margin:.2f})")
     except Exception as e:
         dbg(f"[DEAL] alert error: {e}")
 
@@ -2618,10 +2926,9 @@ def scan_deals(cid, msgs):
     gid = _guild_id_cache.get(cid, "@me")
     jump_base = f"https://discord.com/channels/{gid}/{cid}/"
 
-    sell_benchmark = baseline_rate if active_ad_type == "sell" else baseline_rate + delta
-    buy_benchmark = baseline_rate if active_ad_type == "buy" else max(0.10, baseline_rate - delta)
+    keywords = _get_active_deal_keywords()
 
-    for m in msgs[:20]:
+    for m in msgs[:25]:
         try:
             aid = m.get("author", {}).get("id")
             if aid == _me_cache.get("id"):
@@ -2629,68 +2936,53 @@ def scan_deals(cid, msgs):
             if m.get("author", {}).get("bot"):
                 continue
             content = (m.get("content") or "").strip()
-            if not content or len(content) < 6:
+            if not content or len(content) < 5:
                 continue
             if content[0] in "!/-.?":
                 continue
-            item = _match_deal_item(content)
-            if not item:
-                continue
-            sell_m = _DEAL_SELL_KW.search(content)
-            buy_m = _DEAL_BUY_KW.search(content)
-            if not sell_m and not buy_m:
+
+            parsed = parse_market_listing(content, target_keywords=keywords)
+            if not parsed or not parsed.get("matched"):
                 continue
 
-            price = None
-            for pat in _DEAL_PRICE_PATTERNS:
-                pm = pat.search(content)
-                if pm:
-                    try:
-                        price = float(pm.group(1))
-                        break
-                    except Exception:
-                        continue
-            if price is None or price <= 0 or price > 20:
-                continue
+            item = parsed["item"]
+            kind = parsed["kind"]
+            price = parsed["price"]
+            segment = parsed.get("segment", content)
 
             is_deal = False
-            kind = None
-            ref_rate = None
+            ref_rate = baseline_rate
             margin = 0.0
 
-            # 1. Other user is SELLING: We can BUY low if price is under our buy benchmark or sell price
-            if sell_m and not buy_m:
-                if price <= buy_benchmark - delta:
+            # 1. Other user is SELLING: We can BUY low if price is under our baseline/sell rate
+            if kind == "seller":
+                if active_ad_type == "buy" and price <= baseline_rate - delta:
                     is_deal = True
-                    kind = "seller"
-                    ref_rate = buy_benchmark
-                    margin = buy_benchmark - price
-                elif active_ad_type == "buy" and price <= baseline_rate - delta:
+                    ref_rate = baseline_rate
+                    margin = baseline_rate - price
+                elif active_ad_type == "sell" and price <= baseline_rate - delta:
                     is_deal = True
-                    kind = "seller"
                     ref_rate = baseline_rate
                     margin = baseline_rate - price
 
-            # 2. Other user is BUYING: We can SELL high if price is above our sell benchmark or buy cost
-            elif buy_m and not sell_m:
-                if price >= sell_benchmark + delta:
+            # 2. Other user is BUYING: We can SELL high if price is above our baseline/buy rate
+            elif kind == "buyer":
+                if active_ad_type == "sell" and price >= baseline_rate + delta:
                     is_deal = True
-                    kind = "buyer"
-                    ref_rate = sell_benchmark
-                    margin = price - sell_benchmark
-                elif active_ad_type == "sell" and price >= baseline_rate + delta:
+                    ref_rate = baseline_rate
+                    margin = price - baseline_rate
+                elif active_ad_type == "buy" and price >= baseline_rate + delta:
                     is_deal = True
-                    kind = "buyer"
                     ref_rate = baseline_rate
                     margin = price - baseline_rate
 
-            if is_deal and kind and margin >= delta:
+            if is_deal and margin >= delta:
                 _send_deal_alert(
                     cid, m.get("author", {}), price, ref_rate, margin,
-                    content, jump_base + m.get("id", ""), kind, item
+                    segment, jump_base + m.get("id", ""), kind, item
                 )
         except Exception as e:
-            dbg(f"[DEAL] msg error: {e}")
+            dbg(f"[DEAL] scan error: {e}")
 
 # --------------------------------------------------------------------------- #
 # Mid-run IP Health Monitor (F-21 V6)                                       #
@@ -4695,6 +4987,7 @@ def main():
     sent_count_global = 0
     last_gist_save = 0
     returning_from_afk = False
+    in_afk_logged = False
 
     # V6: publish mutable refs for the heartbeat/controller thread
     # (set properly after channel browse; placeholder for now)
@@ -4978,8 +5271,9 @@ def main():
                 resume_str = datetime.fromtimestamp(resume_ts).strftime('%H:%M:%S')
                 log(f"☕ AFK BREAK — stepping away for {afk_left/60:.1f} min.")
                 log(f"   Resuming around {resume_str}. All public posting paused (simulating being offline).")
-                if not returning_from_afk:
+                if not in_afk_logged:
                     send_log_webhook(f"☕ **AFK BREAK** — stepping away for {afk_left/60:.1f} min (resuming ~{resume_str}). Public posting safely paused.", kind="AFK")
+                    in_afk_logged = True
                 sleep_with_keepalive(min(60, afk_left), run_end)
                 returning_from_afk = True
                 # Reset next-post times so we don't spam a burst of overdue
@@ -4991,6 +5285,7 @@ def main():
                 continue
 
             if returning_from_afk:
+                in_afk_logged = False
                 ret_wait = random.uniform(15, 45)
                 log(f"👋 BACK FROM AFK — re-orienting for {ret_wait:.0f}s (catching up on missed messages, simulating reopening Discord)...")
                 send_log_webhook("👋 **BACK FROM AFK** — catching up on chat and resuming active posting rotation.", kind="ACTIVE")
@@ -5457,22 +5752,11 @@ def main():
     if _panic_event.is_set():
         elapsed_min = (time.time() - start)/60
         log("\n🛑 Panic stop — run terminated by remote command.")
-        send_log_webhook(
-            f"🛑 **PANIC STOPPED** | sent=`{total_sent}` "
-            f"(💬{total_sent-total_img}/📷{total_img}) | err=`{total_err}` | "
-            f"elapsed=`{elapsed_min:.1f}min`"
+        _send_completion_summary_webhook(
+            "🛑 Halted by remote command (panic stop)",
+            start, total_sent, total_err, total_skip,
+            total_distractions, total_img, total_edits, stats, is_shutdown=True
         )
-        if DASHBOARD_WEBHOOK_URL:
-            try:
-                _active_now = [c for c in CHANNEL_IDS if c not in dead_channels]
-                send_dashboard(_dashboard_cycle_embed(
-                    cycle, elapsed_min, total_sent, total_img,
-                    total_sent-total_img, total_edits, total_err, total_skip,
-                    stats, len(_active_now), len(CHANNEL_IDS), set(_active_now),
-                    ch_names, slowmodes, last_sent, my_last_msg_id, is_shutdown=True))
-                time.sleep(2)
-            except Exception:
-                pass
         try:
             save_blocked_to_gist(force=True)
         except Exception:
@@ -5485,21 +5769,11 @@ def main():
 
     elapsed_min = (time.time() - start)/60
     log("\n🏁 Reached scheduled end time — run complete.")
-    send_log_webhook(
-        f"🏁 **FINISHED** (scheduled end) | sent=`{total_sent}` "
-        f"(💬{total_sent-total_img}/📷{total_img}) | err=`{total_err}` | "
-        f"edits=`{total_edits}` | elapsed=`{elapsed_min:.1f}min`"
+    _send_completion_summary_webhook(
+        f"Scheduled execution window complete ({elapsed_min:.1f}m)",
+        start, total_sent, total_err, total_skip,
+        total_distractions, total_img, total_edits, stats, is_shutdown=False
     )
-    if DASHBOARD_WEBHOOK_URL:
-        try:
-            send_dashboard(_dashboard_cycle_embed(
-                cycle, elapsed_min, total_sent, total_img, total_sent-total_img,
-                total_edits, total_err, total_skip, stats,
-                len(active_channels), len(CHANNEL_IDS), set(active_channels),
-                ch_names, slowmodes, last_sent, my_last_msg_id, is_shutdown=True))
-            time.sleep(1.5)  # give daemon thread a moment to send
-        except Exception:
-            pass
     save_blocked_to_gist(force=True)
     _print_stats(start, total_sent, total_err, total_skip,
                  total_distractions, total_img, total_edits, stats)
