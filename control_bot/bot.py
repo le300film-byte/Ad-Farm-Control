@@ -24,7 +24,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import discord
 from discord import app_commands
@@ -62,9 +62,22 @@ _cooldowns: dict[int, float] = {}
 _processed_webhook_ids: set[int] = set()
 
 
-def _is_owner(inter: discord.Interaction) -> bool:
-    # Fail closed: an absent owner allow-list must never grant control access.
-    return bool(config.OWNER_IDS) and inter.user.id in config.OWNER_IDS
+def _is_owner(inter_or_user: Any) -> bool:
+    """Fail closed: an absent owner allow-list must never grant control access."""
+    if not config.OWNER_IDS:
+        return False
+    if isinstance(inter_or_user, int):
+        uid = inter_or_user
+    elif hasattr(inter_or_user, "user") and hasattr(inter_or_user.user, "id"):
+        uid = inter_or_user.user.id
+    elif hasattr(inter_or_user, "id"):
+        uid = inter_or_user.id
+    else:
+        try:
+            uid = int(inter_or_user)
+        except (TypeError, ValueError):
+            return False
+    return bool(config.OWNER_IDS) and uid in config.OWNER_IDS
 
 
 def _on_cooldown(uid: int) -> float:
@@ -174,15 +187,19 @@ async def on_ready():
 # ----- Slash commands -----
 async def _check_perms(inter: discord.Interaction) -> bool:
     if not _is_owner(inter):
-        await inter.response.send_message(
-            "🔒 You aren't authorized to run control commands.", ephemeral=True
-        )
+        msg = "🔒 You aren't authorized to run control commands."
+        if inter.response.is_done():
+            await inter.followup.send(msg, ephemeral=True)
+        else:
+            await inter.response.send_message(msg, ephemeral=True)
         return False
     cd = _on_cooldown(inter.user.id)
     if cd > 0:
-        await inter.response.send_message(
-            f"⏱️ Cooldown — wait {cd:.1f}s.", ephemeral=True
-        )
+        msg = f"⏱️ Cooldown — wait {cd:.1f}s."
+        if inter.response.is_done():
+            await inter.followup.send(msg, ephemeral=True)
+        else:
+            await inter.response.send_message(msg, ephemeral=True)
         return False
     return True
 
@@ -248,21 +265,79 @@ async def _fresh_state() -> None:
 
 class RunDetailsModal(discord.ui.Modal):
     def __init__(self, view: "RunStartView"):
-        super().__init__(title=f"V6 {view.ad_type} ad details")
+        super().__init__(title=f"🚀 Launch {view.ad_type.upper()} Ad Campaign")
         self.parent_view = view
         if view.ad_type == "sell":
-            self.rate = discord.ui.TextInput(label="Sell rate (example: 2.5$)", custom_id="sell_rate", placeholder="2.5", max_length=20, required=True)
-            self.extra = discord.ui.TextInput(label="Extra sell text", custom_id="sell_extra", placeholder="DM ME QUICK...", max_length=500, required=False, style=discord.TextStyle.paragraph)
-            self.image = discord.ui.TextInput(label="Attach image? yes or no", custom_id="attach_image", placeholder="yes", max_length=3, required=True, default="yes")
+            self.rate = discord.ui.TextInput(
+                label="Price Rate (per 1k / unit)",
+                custom_id="sell_rate",
+                placeholder="e.g. 2.50 or 2.5$",
+                default="2.50",
+                max_length=20,
+                required=True,
+            )
+            self.extra = discord.ui.TextInput(
+                label="Custom Ad Copy / Extra Details",
+                custom_id="sell_extra",
+                placeholder="e.g. SELLING ITEMS/TOKENS - FAST & TRUSTED - DM ME QUICK",
+                default="DM ME QUICK - FAST DELIVERY",
+                max_length=1500,
+                required=False,
+                style=discord.TextStyle.paragraph,
+            )
+            self.image = discord.ui.TextInput(
+                label="Attach Image? (yes / no)",
+                custom_id="attach_image",
+                placeholder="yes",
+                max_length=3,
+                required=True,
+                default="yes",
+            )
             self.add_item(self.rate)
             self.add_item(self.extra)
             self.add_item(self.image)
         else:
-            self.rate = discord.ui.TextInput(label="Token rate", custom_id="buy_rate", placeholder="2.2", max_length=20, required=True)
-            self.rap = discord.ui.TextInput(label="RAP rate", custom_id="buy_rate_rap", placeholder="1.8", max_length=20, required=True)
-            self.simple_text = discord.ui.TextInput(label="Simple buy text (only for simple style)", custom_id="buy_simple_text", max_length=1900, required=False, style=discord.TextStyle.paragraph)
-            self.style = discord.ui.TextInput(label="Buy style: detailed or simple", custom_id="buy_style", placeholder="detailed", max_length=8, required=True, default="detailed")
-            self.image = discord.ui.TextInput(label="Attach image? yes or no", custom_id="attach_image", placeholder="yes", max_length=3, required=True, default="yes")
+            self.rate = discord.ui.TextInput(
+                label="Buy Rate (Target Price)",
+                custom_id="buy_rate",
+                placeholder="e.g. 2.20",
+                default="2.20",
+                max_length=20,
+                required=True,
+            )
+            self.rap = discord.ui.TextInput(
+                label="Secondary / Item Rate (optional)",
+                custom_id="buy_rate_rap",
+                placeholder="e.g. 1.80 (or same as buy rate)",
+                default="1.80",
+                max_length=20,
+                required=True,
+            )
+            self.simple_text = discord.ui.TextInput(
+                label="Custom Buy Ad Copy (Full Message)",
+                custom_id="buy_simple_text",
+                placeholder="e.g. BUYING ALL ITEMS/TOKENS LF $2.20/1K DM ME QUICK",
+                default="BUYING ALL STOCK - INSTANT PAYMENT - DM ME",
+                max_length=1900,
+                required=False,
+                style=discord.TextStyle.paragraph,
+            )
+            self.style = discord.ui.TextInput(
+                label="Ad Format (simple or detailed)",
+                custom_id="buy_style",
+                placeholder="simple",
+                max_length=8,
+                required=True,
+                default="simple",
+            )
+            self.image = discord.ui.TextInput(
+                label="Attach Image? (yes / no)",
+                custom_id="attach_image",
+                placeholder="yes",
+                max_length=3,
+                required=True,
+                default="yes",
+            )
             self.add_item(self.rate)
             self.add_item(self.rap)
             self.add_item(self.simple_text)
@@ -334,7 +409,7 @@ class RunStartView(discord.ui.View):
         self.add_item(cancel)
 
     async def _guard(self, inter):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             await inter.response.send_message("🔒 This private form belongs to its operator.", ephemeral=True)
             return False
         return True
@@ -476,7 +551,7 @@ class ChannelsView(discord.ui.View):
             self.add_item(remove_select)
 
     async def _on_alt_select(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         self.alt_id = int(inter.data["values"][0])
         self._build_components()
@@ -484,17 +559,17 @@ class ChannelsView(discord.ui.View):
         await inter.response.edit_message(embed=embed, view=self)
 
     async def _on_add_channel(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         await inter.response.send_modal(AddChannelModal(self.alt_id))
 
     async def _on_rescan(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         await _finish_dm_control(inter, self.alt_id, "!rescan", "channel permission rescan queued")
 
     async def _on_reset_caution(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         await _finish_dm_control(
             inter, self.alt_id, "!resetcaution all", "reset caution on all channels",
@@ -502,7 +577,7 @@ class ChannelsView(discord.ui.View):
         )
 
     async def _on_export(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         a_obj = state.get(self.alt_id)
         cids = list(a_obj.channels.keys()) if a_obj else []
@@ -510,7 +585,7 @@ class ChannelsView(discord.ui.View):
         await inter.response.send_message(text, ephemeral=True)
 
     async def _on_remove_channel(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         cid = inter.data["values"][0]
         a_obj = state.get(self.alt_id)
@@ -630,14 +705,14 @@ class FleetTuningView(discord.ui.View):
         return embed
 
     async def _on_alt_select(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         self.alt_id = int(inter.data["values"][0])
         self._build_components()
         await inter.response.edit_message(embed=self._build_embed(), view=self)
 
     async def _on_policy_select(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         chosen_policy = inter.data["values"][0]
         state.set_policy_template(self.alt_id, chosen_policy)
@@ -649,12 +724,12 @@ class FleetTuningView(discord.ui.View):
         await inter.response.edit_message(embed=self._build_embed(), view=self)
 
     async def _on_rescan(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         await _finish_dm_control(inter, self.alt_id, "!rescan", "channel permission rescan queued")
 
     async def _on_reset_caution(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         await _finish_dm_control(
             inter, self.alt_id, "!resetcaution all", "reset caution on all channels",
@@ -662,7 +737,7 @@ class FleetTuningView(discord.ui.View):
         )
 
     async def _on_diagnose(self, inter: discord.Interaction):
-        if inter.user.id != self.owner_id:
+        if inter.user.id != self.owner_id and not _is_owner(inter):
             return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
         embed = build_diagnose_embed(state, self.alt_id)
         await inter.response.send_message(embed=embed, ephemeral=True)
@@ -765,19 +840,19 @@ class DealsManagerModal(discord.ui.Modal):
         super().__init__(title=f"Deal Scanner Config · Alt {alt_id}")
         self.alt_id = alt_id
         alt_obj = state.get(alt_id)
-        curr_kw = ", ".join(alt_obj.deal_keywords) if (alt_obj and alt_obj.deal_keywords) else "Blade Ball, BB token, BB"
+        curr_kw = ", ".join(alt_obj.deal_keywords) if (alt_obj and alt_obj.deal_keywords) else "Robux, MM2, Pet Sim, Blox Fruits, Blade Ball, Tokens"
         curr_delta = f"{alt_obj.deal_alert_delta:.2f}" if alt_obj else "0.05"
         curr_scan = "on" if (alt_obj and alt_obj.deal_scan_enabled) else "off"
 
         self.kw_input = discord.ui.TextInput(
-            label="Target Item Keywords (comma-separated)",
-            placeholder="Blade Ball, BB token, BB, Robux, MM2",
+            label="Target Items / Games (comma-separated)",
+            placeholder="e.g. Robux, MM2, Pet Sim, Blox Fruits, Blade Ball, Tokens",
             default=curr_kw,
             max_length=500,
             required=True,
         )
         self.delta_input = discord.ui.TextInput(
-            label="Min Profit Edge per 1k ($ USD)",
+            label="Min Profit Margin Edge ($ USD)",
             placeholder="0.05",
             default=curr_delta,
             max_length=10,
@@ -896,7 +971,7 @@ class SquadControlView(discord.ui.View):
             def __init__(parent_self):
                 super().__init__(placeholder="Select a Squad to manage...", min_values=1, max_values=1, options=options)
             async def callback(sel_self, inter: discord.Interaction):
-                if inter.user.id != self.owner_id and not _is_owner(inter.user.id):
+                if inter.user.id != self.owner_id and not _is_owner(inter):
                     return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
                 self.current_squad = sel_self.values[0]
                 self._build_items()
@@ -1070,7 +1145,7 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
     )
     repository = discord.ui.TextInput(
         label="GitHub Repository (optional)",
-        placeholder="Leave blank to auto-create private repo",
+        placeholder="Leave blank to auto-create public repo",
         max_length=100,
         required=False,
     )
@@ -1327,7 +1402,7 @@ def _build_deals_overview_embed(selected_alt: Optional[int] = 0) -> discord.Embe
     lines = []
     for item in chosen:
         last = datetime.fromtimestamp(item.last_deal_ts, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if item.last_deal_ts else "never"
-        keywords = ", ".join(item.deal_keywords[:20]) or "Blade Ball, BB token, BB"
+        keywords = ", ".join(item.deal_keywords[:20]) or "Robux, MM2, Pet Sim, Blox Fruits, Blade Ball, Tokens"
         scanner = f"{'🟢 ACTIVE' if item.deal_scan_enabled else '🔴 OFF'} · min edge `${item.deal_alert_delta:.2f}/1k`"
         lines.append(
             f"• **[Alt {item.alt_id} · {item.name}]**\n"
@@ -1341,7 +1416,7 @@ def _build_deals_overview_embed(selected_alt: Optional[int] = 0) -> discord.Embe
         color=0x57F287,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(text="Passively extracts target item prices, stock, and directions without extra API calls.")
+    embed.set_footer(text="Passively extracts target item prices, stock, and directions across all configured games/items.")
     return embed
 
 
@@ -1368,7 +1443,7 @@ class AltControlHubView(discord.ui.View):
                 def __init__(parent_self):
                     super().__init__(placeholder="Choose an Alt to manage...", min_values=1, max_values=1, options=options, row=0)
                 async def callback(sel_self, inter: discord.Interaction):
-                    if not _is_owner(inter.user.id):
+                    if not _is_owner(inter):
                         return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
                     self.selected_alt = int(sel_self.values[0])
                     self._build_items()
@@ -1385,39 +1460,39 @@ class AltControlHubView(discord.ui.View):
         btn_refresh = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.primary, emoji="🔄", row=2)
 
         async def _cb_add(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await inter.response.send_modal(AltAddModal())
 
         async def _cb_update(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             if not state.get(self.selected_alt):
                 return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
             await inter.response.send_modal(AltUpdateModal(self.selected_alt))
 
         async def _cb_logs(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_logs(inter, self.selected_alt, limit=15)
 
         async def _cb_selfcheck(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_selfcheck(inter, self.selected_alt)
 
         async def _cb_runs(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_runs(inter, self.selected_alt, limit=5)
 
         async def _cb_clearlogs(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_clearlogs(inter, self.selected_alt)
 
         async def _cb_refresh(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             self._build_items()
             embed = self._render_embed()
@@ -1466,7 +1541,7 @@ class DealsHubView(discord.ui.View):
                 def __init__(parent_self):
                     super().__init__(placeholder="Select Alt to configure deals...", min_values=1, max_values=1, options=options, row=0)
                 async def callback(sel_self, inter: discord.Interaction):
-                    if not _is_owner(inter.user.id):
+                    if not _is_owner(inter):
                         return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
                     self.alt_id = int(sel_self.values[0])
                     self._build_items()
@@ -1480,7 +1555,7 @@ class DealsHubView(discord.ui.View):
         btn_refresh = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄", row=1)
 
         async def _cb_toggle(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             target = self.alt_id or (state.alt_ids[0] if state.alt_ids else 1)
             alt_obj = state.get(target)
@@ -1489,13 +1564,13 @@ class DealsHubView(discord.ui.View):
             await _handle_deal_scan(inter, target, new_val)
 
         async def _cb_modal(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             target = self.alt_id or (state.alt_ids[0] if state.alt_ids else 1)
             await inter.response.send_modal(DealsManagerModal(target))
 
         async def _cb_sim(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             class _SimModal(discord.ui.Modal, title="Simulate Market Listing"):
                 sample = discord.ui.TextInput(
@@ -1511,7 +1586,7 @@ class DealsHubView(discord.ui.View):
             await inter.response.send_modal(_SimModal())
 
         async def _cb_refresh(inter: discord.Interaction):
-            if not _is_owner(inter.user.id):
+            if not _is_owner(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             self._build_items()
             embed = self._render_embed()
@@ -1590,22 +1665,21 @@ async def _dispatch_run_from_modal(inter: discord.Interaction, values: dict[str,
 async def _finish_dm_control(inter: discord.Interaction, alt_id: int,
                              command: str, label: str, *, update=None) -> None:
     """Send a control command through the Gist queue (or legacy DM fallback)."""
-    alt = state.get(alt_id)
-    if not alt:
-        if inter.response.is_done():
-            await inter.followup.send("❓ Unknown alt.", ephemeral=True)
-        else:
-            await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-        return
     if not inter.response.is_done():
         await inter.response.defer(ephemeral=True)
+    alt = state.get(alt_id)
+    if not alt:
+        return await inter.followup.send("❓ Unknown alt.", ephemeral=True)
     ack = await _send_control_wait_ack(alt_id, command, timeout=20)
     failed = ack.startswith(("❌", "⏰"))
     queued = ack.startswith("🕒")
     if not failed and update:
-        res = update()
-        if asyncio.iscoroutine(res):
-            await res
+        try:
+            res = update()
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            pass
     if queued:
         status = "Queued in the shared control Gist; the alt will apply it on its next poll and confirm through the next heartbeat."
     else:
@@ -1737,8 +1811,13 @@ async def _handle_alt_remove(inter: discord.Interaction, alt: int, confirmation:
             cleanup_detail = f"Cleanup warning: {cleanup_detail}"
     _apply_alt_registry(repos, discord_ids, names)
     state.remove_alt(alt)
-    deletion = "repository deletion requested" if delete_repository else "USER_TOKEN secret deleted; repository kept"
-    text = f"🗑️ Removed **{current.name}** (alt `{alt}`). {deletion}. {cleanup_detail} Workflow cancellation: {cancel_detail}"
+    deletion = "Repository deletion requested" if delete_repository else "USER_TOKEN secret deleted; repository kept"
+    details = [f"🗑️ Removed **{current.name}** (alt `{alt}`).", f"• {deletion}"]
+    if cleanup_detail:
+        details.append(f"• {cleanup_detail}")
+    if cancel_detail:
+        details.append(f"• {cancel_detail}")
+    text = "\n".join(details)
     await inter.followup.send(text, ephemeral=True)
     await _log_control(text)
 
@@ -1821,7 +1900,7 @@ async def _handle_simulate_listing(inter: discord.Interaction, alt: int, sample_
 # Core Slash Commands (19 Non-Duplicated Unified Top-Level Commands)          #
 # =========================================================================== #
 
-@bot.tree.command(name="run", description="Start an alt run using the interactive 3-step form.")
+@bot.tree.command(name="run", description="Launch Ad Run: start automated posting on an alt account with step-by-step guidance.")
 async def cmd_run(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
@@ -1841,7 +1920,7 @@ async def cmd_run(inter: discord.Interaction):
     await inter.response.send_message(embed=_run_start_embed(view), view=view, ephemeral=True)
 
 
-@bot.tree.command(name="stop", description="Stop an alt's current run and cancel active GitHub workflow.")
+@bot.tree.command(name="stop", description="Stop Ad Run: cancel active GitHub Actions runner and shut down the alt cleanly.")
 @app_commands.describe(alt="Target alt ID to stop")
 async def cmd_stop(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
@@ -1860,51 +1939,51 @@ async def cmd_stop(inter: discord.Interaction, alt: int):
     state.append_log(alt, text, emoji="🛑", color=0xED4245, kind="CONTROL")
 
 
-@bot.tree.command(name="pause", description="Pause an alt's public ad posting.")
-@app_commands.describe(alt="Target alt ID to pause")
+@bot.tree.command(name="pause", description="Pause Posting: temporarily pause public ads while keeping the runner alive.")
+@app_commands.describe(alt="Target alt ID to pause (or choose specific alt)")
 async def cmd_pause(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
         return
     await _finish_dm_control(inter, alt, "!pause", "pause requested")
 
 
-@bot.tree.command(name="resume", description="Resume an alt's public ad posting from pause.")
-@app_commands.describe(alt="Target alt ID to resume")
+@bot.tree.command(name="resume", description="Resume Posting: unpause public ads and restore regular posting schedule.")
+@app_commands.describe(alt="Target alt ID to resume (or choose specific alt)")
 async def cmd_resume(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
         return
     await _finish_dm_control(inter, alt, "!resume", "resume requested")
 
 
-@bot.tree.command(name="alt", description="Unified alt lifecycle manager (overview, add, update, remove, logs, runs, selfcheck).")
+@bot.tree.command(name="alt", description="Alt Account Manager: view status, add accounts, check logs, or test health.")
 @app_commands.describe(
-    action="Management action (leave blank to open interactive hub)",
-    alt="Target alt ID",
-    confirmation="Type DELETE to confirm alt removal",
-    delete_repository="When removing, also delete the private GitHub repository",
-    limit="Log or run history limit (1-50)",
-    kind="Log category filter (ALL, ERROR, DEAL, CONTROL, CHANNEL, CAUTION, DEBUG)",
-    search="Log search keyword",
+    action="Action to perform (leave empty for visual dashboard)",
+    alt="Target alt ID (1-4)",
+    confirmation="Type DELETE to confirm removing an alt",
+    delete_repository="Also delete the GitHub repository on remove (default: false)",
+    limit="Number of log lines or runs to show (1-50)",
+    kind="Log filter category",
+    search="Search word to filter logs",
 )
 @app_commands.choices(
     action=[
-        app_commands.Choice(name="overview - Fleet overview and alt status", value="overview"),
-        app_commands.Choice(name="add - Add a new alt account modal", value="add"),
-        app_commands.Choice(name="update - Update alt credentials/repo modal", value="update"),
-        app_commands.Choice(name="remove - Remove alt from fleet", value="remove"),
-        app_commands.Choice(name="logs - View streaming typed logs", value="logs"),
-        app_commands.Choice(name="clearlogs - Clear local in-memory log buffer", value="clearlogs"),
-        app_commands.Choice(name="runs - View recent GitHub Actions runs", value="runs"),
-        app_commands.Choice(name="selfcheck - Dispatch pre-flight validation workflow", value="selfcheck"),
+        app_commands.Choice(name="👥 Overview - Open visual fleet management hub", value="overview"),
+        app_commands.Choice(name="➕ Add Alt - Connect a new alt account via token", value="add"),
+        app_commands.Choice(name="✏️ Update Alt - Change name, repo, or token", value="update"),
+        app_commands.Choice(name="🗑️ Remove Alt - Disconnect an alt account", value="remove"),
+        app_commands.Choice(name="📜 View Logs - Read live post and heartbeat logs", value="logs"),
+        app_commands.Choice(name="🧹 Clear Logs - Reset in-memory log buffer", value="clearlogs"),
+        app_commands.Choice(name="⏱️ Recent Runs - View recent GitHub Actions runs", value="runs"),
+        app_commands.Choice(name="🔍 Health Self-Check - Test proxy, token, and channel access", value="selfcheck"),
     ],
     kind=[
-        app_commands.Choice(name="ALL", value="ALL"),
-        app_commands.Choice(name="ERROR", value="ERROR"),
-        app_commands.Choice(name="DEAL", value="DEAL"),
-        app_commands.Choice(name="CONTROL", value="CONTROL"),
-        app_commands.Choice(name="CHANNEL", value="CHANNEL"),
-        app_commands.Choice(name="CAUTION", value="CAUTION"),
-        app_commands.Choice(name="DEBUG", value="DEBUG"),
+        app_commands.Choice(name="📋 All Logs", value="ALL"),
+        app_commands.Choice(name="❌ Errors Only", value="ERROR"),
+        app_commands.Choice(name="📈 Deal Alerts", value="DEAL"),
+        app_commands.Choice(name="⚙️ Control Actions", value="CONTROL"),
+        app_commands.Choice(name="📌 Channel Events", value="CHANNEL"),
+        app_commands.Choice(name="⚠️ Caution / Rate Limits", value="CAUTION"),
+        app_commands.Choice(name="🔍 Debug Details", value="DEBUG"),
     ],
 )
 async def cmd_alt(
@@ -1947,38 +2026,38 @@ async def cmd_alt(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="tune", description="Unified fleet tuning & parameter configuration (price, mode, policy, interval, runtime, image).")
+@bot.tree.command(name="tune", description="Live Tuning: change price, message copy, mode, speed, duration, or image on the fly.")
 @app_commands.describe(
-    alt="Target alt ID (or 0 for all alts)",
-    policy="Apply operational policy template (stealth, aggressive, peak_hour, balanced)",
-    price="Set pricing rate per 1k units (e.g. 2.40)",
-    mode="Trade mode (sell or buy)",
-    message="Set base ad message copy",
-    interval="Posting interval in minutes (3 or 5)",
-    runtime="Execution runtime duration in hours (6, 12, 18, 24, 48)",
-    image="Attach ad image file (.png, .jpg, .webp)",
+    alt="Target alt ID (choose specific alt or 0 for all)",
+    policy="Safety / speed preset template",
+    price="Unit price / rate (e.g. 2.40)",
+    mode="Trade direction (sell or buy)",
+    message="Custom ad copy text",
+    interval="Delay between posts per channel",
+    runtime="How many hours to run (6 to 48)",
+    image="Attach new ad image (.png, .jpg, .webp)",
 )
 @app_commands.choices(
     policy=[
-        app_commands.Choice(name="🛡️ stealth - 5m interval, max typing jitter, soft copy, strict caution", value="stealth"),
-        app_commands.Choice(name="⚡ aggressive - 3m interval, high throughput, fast rotation", value="aggressive"),
-        app_commands.Choice(name="🔥 peak_hour - 3m interval, dynamic velocity cadence, active deals", value="peak_hour"),
-        app_commands.Choice(name="⚖️ balanced - 5m interval, standard jitter, balanced thresholds", value="balanced"),
+        app_commands.Choice(name="🛡️ Stealth Safe-Mode (5m interval, max typing jitter, strict caution)", value="stealth"),
+        app_commands.Choice(name="⚡ Aggressive (3m interval, high throughput, fast rotation)", value="aggressive"),
+        app_commands.Choice(name="🔥 Peak-Hour Dynamic (3m interval, dynamic velocity cadence)", value="peak_hour"),
+        app_commands.Choice(name="⚖️ Balanced Standard (5m interval, standard human timing)", value="balanced"),
     ],
     mode=[
-        app_commands.Choice(name="sell - Selling items/tokens (💰)", value="sell"),
-        app_commands.Choice(name="buy - Buying items/tokens (🛒)", value="buy"),
+        app_commands.Choice(name="💰 Sell Mode (Selling items/stock/tokens)", value="sell"),
+        app_commands.Choice(name="🛒 Buy Mode (Buying items/stock/tokens)", value="buy"),
     ],
     interval=[
-        app_commands.Choice(name="3 minutes (high throughput)", value=3),
-        app_commands.Choice(name="5 minutes (high stealth)", value=5),
+        app_commands.Choice(name="⚡ 3 Minutes (High throughput peak hours)", value=3),
+        app_commands.Choice(name="🛡️ 5 Minutes (Recommended standard stealth)", value=5),
     ],
     runtime=[
-        app_commands.Choice(name="6 hours", value=6),
-        app_commands.Choice(name="12 hours", value=12),
-        app_commands.Choice(name="18 hours", value=18),
-        app_commands.Choice(name="24 hours", value=24),
-        app_commands.Choice(name="48 hours", value=48),
+        app_commands.Choice(name="⏱️ 6 Hours (Standard shift)", value=6),
+        app_commands.Choice(name="⏱️ 12 Hours (Half day)", value=12),
+        app_commands.Choice(name="⏱️ 18 Hours", value=18),
+        app_commands.Choice(name="⏱️ 24 Hours (Full day)", value=24),
+        app_commands.Choice(name="⏱️ 48 Hours (Weekend long run)", value=48),
     ],
 )
 async def cmd_tune(
@@ -2080,21 +2159,21 @@ async def cmd_tune(
         )
 
 
-@bot.tree.command(name="channels", description="Unified channel manager (view, add, replace, rescan, reset caution).")
+@bot.tree.command(name="channels", description="Channel Manager: add target trading channels, swap deleted ones, or rescan.")
 @app_commands.describe(
     alt="Target alt ID",
-    action="Channel action (leave blank to open visual manager)",
+    action="Action to perform (leave blank to open visual manager)",
     channel_id="Discord channel ID to add, reset, or replace",
-    new_channel_id="New channel ID (when replacing an old channel)",
-    name="Optional channel name/label",
+    new_channel_id="New channel ID (when replacing an old deleted channel)",
+    name="Friendly name/label for the channel",
 )
 @app_commands.choices(
     action=[
-        app_commands.Choice(name="view - Open visual channel manager UI", value="view"),
-        app_commands.Choice(name="add - Add and verify a trading channel", value="add"),
-        app_commands.Choice(name="replace - Swap old channel with new channel", value="replace"),
-        app_commands.Choice(name="rescan - Force immediate permission and slowmode rescan", value="rescan"),
-        app_commands.Choice(name="reset_caution - Reset Caution Mode backoff and clear strikes", value="reset_caution"),
+        app_commands.Choice(name="📌 View - Open visual channel manager UI", value="view"),
+        app_commands.Choice(name="➕ Add - Connect and verify a target trading channel", value="add"),
+        app_commands.Choice(name="🔁 Replace - Swap an old/deleted channel with a new one", value="replace"),
+        app_commands.Choice(name="🔄 Rescan - Refresh channel permissions and slowmodes", value="rescan"),
+        app_commands.Choice(name="⚠️ Reset Caution - Clear caution backoffs and strikes", value="reset_caution"),
     ]
 )
 async def cmd_channels(
@@ -2170,18 +2249,18 @@ async def cmd_channels(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="deals", description="Unified marketplace arbitrage scanner & deal sensitivity hub.")
+@bot.tree.command(name="deals", description="Marketplace arbitrage scanner: track custom items, games, and price edges.")
 @app_commands.describe(
     alt="Target alt ID (or 0 for all)",
     enabled="Turn deal scanning on or off",
-    min_delta="Minimum profit margin edge required per 1k (e.g. 0.05)",
-    keywords="Comma-separated target item aliases (e.g. 'Blade Ball, BB token, BB')",
-    sample_listing="Dry-run simulate/test parse an ad message listing",
+    min_delta="Minimum profit margin edge required (e.g. 0.05)",
+    keywords="Comma-separated target items/games (e.g. 'Robux, MM2, Pet Sim, Blox Fruits, Tokens')",
+    sample_listing="Test/simulate parse an ad message to check price extraction",
 )
 @app_commands.choices(
     enabled=[
-        app_commands.Choice(name="on - Enable deal scanner", value="on"),
-        app_commands.Choice(name="off - Disable deal scanner", value="off"),
+        app_commands.Choice(name="🟢 On - Enable Deal Scanner", value="on"),
+        app_commands.Choice(name="🔴 Off - Disable Deal Scanner", value="off"),
     ]
 )
 async def cmd_deals(
@@ -2243,23 +2322,23 @@ async def cmd_deals(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="squad", description="Unified fleet squad manager (pools, assignments, batch pausing, pricing, and policy).")
+@bot.tree.command(name="squad", description="Fleet Squads: group alts into teams to sync prices, pauses, or safety policies.")
 @app_commands.describe(
     action="Squad action (leave blank to open interactive hub)",
     squad_name="Squad name (e.g. 'Alpha', 'Sellers', 'Night Patrol')",
-    alt="Target alt ID (for individual assignment)",
-    value="Value for squad batch operations (preset for policy, or price string for price)",
+    alt="Target alt ID (1-4)",
+    value="Value for squad batch operations (e.g. preset name 'stealth' or price '2.40')",
 )
 @app_commands.choices(
     action=[
-        app_commands.Choice(name="overview - Interactive squad control hub", value="overview"),
-        app_commands.Choice(name="list - List all squad pools and members", value="list"),
-        app_commands.Choice(name="view - View squad composite health and stats", value="view"),
-        app_commands.Choice(name="assign - Assign an alt to a squad", value="assign"),
-        app_commands.Choice(name="pause - Batch pause ad posting across squad", value="pause"),
-        app_commands.Choice(name="resume - Batch resume ad posting across squad", value="resume"),
-        app_commands.Choice(name="policy - Batch apply policy preset across squad", value="policy"),
-        app_commands.Choice(name="price - Batch update price rate across squad", value="price"),
+        app_commands.Choice(name="👥 Squad Hub - Open visual squad control hub", value="overview"),
+        app_commands.Choice(name="📋 List Squads - Show all squad teams and members", value="list"),
+        app_commands.Choice(name="📊 Team Status - View composite squad health and statistics", value="view"),
+        app_commands.Choice(name="➕ Assign Alt - Add or move an alt to a squad team", value="assign"),
+        app_commands.Choice(name="⏸️ Pause Squad - Batch pause ads across all squad alts", value="pause"),
+        app_commands.Choice(name="▶️ Resume Squad - Batch resume ads across all squad alts", value="resume"),
+        app_commands.Choice(name="🛡️ Apply Policy - Apply safety preset (stealth/aggressive) to squad", value="policy"),
+        app_commands.Choice(name="💰 Update Price - Set unit price rate across all squad alts", value="price"),
     ]
 )
 async def cmd_squad(
@@ -2345,8 +2424,8 @@ async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
         await inter.response.send_message(embed=build_single_alt_embed(state, alt or 1), ephemeral=True)
 
 
-@bot.tree.command(name="reply", description="Relay an operator reply through an alt directly to a buyer's DM.")
-@app_commands.describe(alt="Alt ID to reply from", user="Buyer Discord User ID", text="Message to send — leave blank to open modal")
+@bot.tree.command(name="reply", description="Reply to Buyer: send a DM from an alt to an interested buyer directly.")
+@app_commands.describe(alt="Alt ID to send from", user="Buyer Discord User ID (from #dm-inbox)", text="Message text to send (leave blank for multiline editor)")
 async def cmd_reply(inter: discord.Interaction, alt: Optional[int] = 1, user: Optional[str] = "", text: Optional[str] = None):
     if not await _check_perms(inter):
         return
@@ -2451,7 +2530,7 @@ async def cmd_topology(inter: discord.Interaction):
     await inter.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="sync", description="Ask every configured alt to reload shared Gist state.")
+@bot.tree.command(name="sync", description="Sync Fleet: push and reload shared settings/prices across all running alts.")
 async def cmd_sync(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
@@ -2467,7 +2546,7 @@ async def cmd_sync(inter: discord.Interaction):
     await _log_control(text)
 
 
-@bot.tree.command(name="refresh", description="Refresh GitHub run state and the live dashboard immediately.")
+@bot.tree.command(name="refresh", description="Refresh Status: instantly fetch latest GitHub Actions workflow status and update dashboard.")
 async def cmd_refresh(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
@@ -2477,7 +2556,7 @@ async def cmd_refresh(inter: discord.Interaction):
     await inter.followup.send("✅ GitHub heartbeat state and dashboard refreshed from current data.", ephemeral=True)
 
 
-@bot.tree.command(name="dashboard", description="Refresh the live three-embed dashboard in the dashboard channel.")
+@bot.tree.command(name="dashboard", description="Live Dashboard: post or update the real-time 3-embed status hub in #dashboard.")
 async def cmd_dashboard(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
@@ -2510,23 +2589,33 @@ _COMMAND_GUIDE = {
 }
 
 
-@bot.tree.command(name="help", description="Private complete reference with arguments, permissions, examples, and effects.")
+@bot.tree.command(name="help", description="Bot Help Guide: view complete command manual, examples, shortcuts, and cheat sheet.")
 async def cmd_help(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
     registered = {cmd.name: cmd for cmd in bot.tree.get_commands()}
     embeds = []
     for name in sorted(registered):
-        usage, effect = _COMMAND_GUIDE.get(name, ("No arguments documented.", "No effect documented."))
+        cmd_obj = registered[name]
+        usage, effect = _COMMAND_GUIDE.get(name, (f"`/{name}`", cmd_obj.description or "No description available."))
         embed = discord.Embed(title=f"/{name}", color=0x5865F2)
-        embed.add_field(name="Arguments / example", value=usage, inline=False)
-        embed.add_field(name="Permission and effect", value=f"Owner IDs only. {effect}", inline=False)
+        embed.add_field(name="Usage & Arguments", value=usage, inline=False)
+        embed.add_field(name="What it does", value=effect, inline=False)
         embeds.append(embed)
-    for offset in range(0, len(embeds), 10):
-        page = discord.Embed(title=f"🛠️ V6 control reference · page {offset // 10 + 1}/{(len(embeds)+9)//10}", color=0x5865F2)
-        for item in embeds[offset:offset + 10]:
-            page.add_field(name=item.title, value="\n".join(field.value for field in item.fields), inline=False)
-        if offset == 0:
+    
+    # Send formatted pages
+    total_pages = (len(embeds) + 5) // 6
+    for page_num in range(total_pages):
+        page = discord.Embed(
+            title=f"📖 Bot Help & Command Guide · Page {page_num + 1}/{total_pages}",
+            description="Here is your complete guide to all available commands in the Ad Farm system:",
+            color=0x5865F2,
+        )
+        for item in embeds[page_num * 6:(page_num + 1) * 6]:
+            combined_desc = f"**Usage:** {item.fields[0].value}\n**Details:** {item.fields[1].value}"
+            page.add_field(name=f"✨ {item.title}", value=combined_desc, inline=False)
+        page.set_footer(text="💡 Tip: Most commands open an easy visual interactive form when run without extra arguments!")
+        if page_num == 0:
             await inter.response.send_message(embed=page, ephemeral=True)
         else:
             await inter.followup.send(embed=page, ephemeral=True)
@@ -3077,45 +3166,78 @@ class DashboardControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Pause All", style=discord.ButtonStyle.secondary, emoji="⏸️", custom_id="dash_pause_all")
+    @discord.ui.button(label="➕ Add Alt", style=discord.ButtonStyle.success, row=0)
+    async def btn_add_alt(self, inter: discord.Interaction, button: discord.ui.Button):
+        await inter.response.send_modal(AltAddModal())
+
+    @discord.ui.button(label="🚀 Launch Run", style=discord.ButtonStyle.primary, row=0)
+    async def btn_launch_run(self, inter: discord.Interaction, button: discord.ui.Button):
+        view = RunStartView(inter.user.id)
+        await inter.response.send_message(embed=_run_start_embed(view), view=view, ephemeral=True)
+
+    @discord.ui.button(label="⚙️ Tune Fleet", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_tune_fleet(self, inter: discord.Interaction, button: discord.ui.Button):
+        target = state.alt_ids[0] if state.alt_ids else 1
+        view = FleetTuningView(owner_id=inter.user.id, alt_id=target)
+        await inter.response.send_message(embed=view._build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="📌 Channels", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_channels(self, inter: discord.Interaction, button: discord.ui.Button):
+        target = state.alt_ids[0] if state.alt_ids else 1
+        view = ChannelsView(owner_id=inter.user.id, alt_id=target)
+        await inter.response.send_message(embed=view._build_embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="⏸️ Pause All", style=discord.ButtonStyle.secondary, emoji="⏸️", custom_id="dash_pause_all", row=1)
     async def on_pause_all(self, inter: discord.Interaction, button: discord.ui.Button):
         if not await _check_perms(inter): return
-        await inter.response.defer(ephemeral=True)
-        for aid in state.alt_ids:
-            await _send_control_wait_ack(aid, "!pause", timeout=8)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        coros = [_send_control_wait_ack(aid, "!pause", timeout=8) for aid in state.alt_ids]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
         await inter.followup.send("⏸️ **Pause command broadcast to all alts.**", ephemeral=True)
 
-    @discord.ui.button(label="Resume All", style=discord.ButtonStyle.success, emoji="▶️", custom_id="dash_resume_all")
+    @discord.ui.button(label="▶️ Resume All", style=discord.ButtonStyle.success, emoji="▶️", custom_id="dash_resume_all", row=1)
     async def on_resume_all(self, inter: discord.Interaction, button: discord.ui.Button):
         if not await _check_perms(inter): return
-        await inter.response.defer(ephemeral=True)
-        for aid in state.alt_ids:
-            await _send_control_wait_ack(aid, "!resume", timeout=8)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        coros = [_send_control_wait_ack(aid, "!resume", timeout=8) for aid in state.alt_ids]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
         await inter.followup.send("▶️ **Resume command broadcast to all alts.**", ephemeral=True)
 
-    @discord.ui.button(label="Rescan Channels", style=discord.ButtonStyle.primary, emoji="🔄", custom_id="dash_rescan_all")
+    @discord.ui.button(label="🔄 Rescan Channels", style=discord.ButtonStyle.primary, emoji="🔄", custom_id="dash_rescan_all", row=1)
     async def on_rescan_all(self, inter: discord.Interaction, button: discord.ui.Button):
         if not await _check_perms(inter): return
-        await inter.response.defer(ephemeral=True)
-        for aid in state.alt_ids:
-            await _send_control_wait_ack(aid, "!rescan", timeout=8)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        coros = [_send_control_wait_ack(aid, "!rescan", timeout=8) for aid in state.alt_ids]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
         await inter.followup.send("🔄 **Channel rescan broadcast to all alts.**", ephemeral=True)
 
-    @discord.ui.button(label="Reset Caution", style=discord.ButtonStyle.secondary, emoji="⚠️", custom_id="dash_reset_all")
+    @discord.ui.button(label="⚠️ Reset Caution", style=discord.ButtonStyle.secondary, emoji="⚠️", custom_id="dash_reset_all", row=1)
     async def on_reset_all(self, inter: discord.Interaction, button: discord.ui.Button):
         if not await _check_perms(inter): return
-        await inter.response.defer(ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        coros = [_send_control_wait_ack(aid, "!resetcaution all", timeout=8) for aid in state.alt_ids]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
         for aid in state.alt_ids:
-            await _send_control_wait_ack(aid, "!resetcaution all", timeout=8)
             state.reset_caution(aid, None)
         await inter.followup.send("⚠️ **Caution reset broadcast to all alts.**", ephemeral=True)
 
-    @discord.ui.button(label="Freeze / Stop All", style=discord.ButtonStyle.danger, emoji="🛑", custom_id="dash_stop_all")
+    @discord.ui.button(label="🛑 Stop All", style=discord.ButtonStyle.danger, emoji="🛑", custom_id="dash_stop_all", row=1)
     async def on_stop_all(self, inter: discord.Interaction, button: discord.ui.Button):
         if not await _check_perms(inter): return
-        await inter.response.defer(ephemeral=True)
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True)
+        coros = [_send_control_wait_ack(aid, "!stop", timeout=8) for aid in state.alt_ids]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
         for aid in state.alt_ids:
-            await _send_control_wait_ack(aid, "!stop", timeout=8)
             asyncio.create_task(asyncio.to_thread(github_api.cancel_run, aid))
         await inter.followup.send("🛑 **Emergency stop broadcast and workflows canceled.**", ephemeral=True)
 

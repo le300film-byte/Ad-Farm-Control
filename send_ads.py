@@ -99,8 +99,13 @@ from pathlib import Path
 from collections import defaultdict, deque
 from urllib.parse import urlparse, quote as urlquote
 
-from curl_cffi import requests as creq
-import curl_cffi
+try:
+    from curl_cffi import requests as creq
+    import curl_cffi
+    _HAS_CURL_CFFI = True
+except Exception:
+    import requests as creq
+    _HAS_CURL_CFFI = False
 
 try:
     from PIL import Image, PngImagePlugin, ImageEnhance
@@ -119,7 +124,7 @@ if _SELF_TEST:
     os.environ.setdefault("USER_TOKEN", "FAKE_TOKEN_FOR_SELF_TEST")
     os.environ.setdefault("CHANNEL_IDS", "000000000000000000,111111111111111111")
     os.environ.setdefault("AD_TYPE", "sell")
-    os.environ.setdefault("MESSAGE", "SELLING BB LF 2.5$/1K DM ME QUICK")
+    os.environ.setdefault("MESSAGE", "SELLING STOCK LF 2.5$/1K DM ME QUICK")
     os.environ.setdefault("ATTACH_IMAGE", "no")
 
 # --------------------------------------------------------------------------- #
@@ -309,8 +314,8 @@ DEAL_ALERT_DELTA     = _float("DEAL_ALERT_DELTA", 0.05)  # alert only if edge >=
 # Deal alerts have their own destination; they never share the dashboard webhook.
 DEAL_WEBHOOK_URL     = _env("DEAL_WEBHOOK_URL") or _env("DEALS_WEBHOOK_URL")
 # Exact, case-insensitive item aliases required before a deal can alert. Keep
-# the default focused on the configured Blade Ball market; change it at runtime
-# with !setdealkeywords or /setdealkeywords (comma-separated).
+# the default focused on versatile multi-item markets; change it at runtime
+# with !setdealkeywords or /deals (comma-separated).
 def _parse_deal_keywords(raw):
     result, seen = [], set()
     for part in str(raw or "").split(","):
@@ -322,7 +327,7 @@ def _parse_deal_keywords(raw):
     return result[:20]
 
 DEAL_ITEM_KEYWORDS = _parse_deal_keywords(
-    _env("DEAL_ITEM_KEYWORDS", "Blade Ball,BladeBall,BB token,BB tokens,BB")
+    _env("DEAL_ITEM_KEYWORDS", "Robux,MM2,Pet Sim,Blox Fruits,Blade Ball,Tokens,RAP")
 )
 IP_HEALTH_CHECK_INTERVAL_MIN = _float("IP_HEALTH_CHECK_INTERVAL_MIN", 30)
 IP_HEALTH_PAUSE_MIN  = _float("IP_HEALTH_PAUSE_MIN", 10)
@@ -3278,7 +3283,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         respond(f"🛑 {ALT_NAME} stopping now.")
         log("🛑 Remote stop received via DM.")
         _panic_trigger(f"controller DM uid={author_id}")
-    elif cmd == "setprice":
+    elif cmd in ("setprice", "price", "rate"):
         new_rate = _extract_rate_value(args)
         if new_rate is None or new_rate <= 0 or new_rate > 20:
             respond(f"❌ Invalid price (got `{args}`). Use e.g. `!setprice 2.3`")
@@ -3291,7 +3296,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         log(f"💰 Price updated by controller → {new_rate}$/1k")
         send_log_webhook(f"💰 **PRICE SET** → ${new_rate:.2f}/1k (controller)")
         respond(f"✅ Price updated to {new_rate}$/1k. Next post uses new rate.")
-    elif cmd == "setmode":
+    elif cmd in ("setmode", "mode"):
         mode = args.lower().strip()
         if mode not in ("sell", "buy"):
             respond(f"❌ Mode must be 'sell' or 'buy'.")
@@ -3300,7 +3305,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         log(f"🔄 Ad type set by controller → {mode}")
         send_log_webhook(f"🔄 **MODE SET** → {mode} (controller). You should also send !setmessage with the new copy.")
         respond(f"✅ Ad type set to `{mode}`. Send `!setmessage <new copy>` to update the ad text.")
-    elif cmd == "setmessage":
+    elif cmd in ("setmessage", "message"):
         if not args:
             respond("❌ Provide the new message text.")
             return True
@@ -3311,7 +3316,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         log(f"📝 Message updated by controller ({len(args)} chars)")
         send_log_webhook(f"📝 **MESSAGE UPDATED** by controller ({len(args)} chars)")
         respond(f"✅ Message updated. {len(args)} chars — next post uses new copy.")
-    elif cmd == "setinterval":
+    elif cmd in ("setinterval", "interval"):
         try:
             new_interval = int(args.strip())
         except (TypeError, ValueError):
@@ -3323,7 +3328,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         INTERVAL_MIN = new_interval
         event_log("CONTROL", f"interval updated by controller → {new_interval} minutes")
         respond(f"✅ Interval updated to {new_interval} minutes. Scheduler state changed live.")
-    elif cmd == "setruntime":
+    elif cmd in ("setruntime", "runtime"):
         try:
             new_hours = int(args.strip())
         except (TypeError, ValueError):
@@ -3336,16 +3341,16 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         _runtime_hours = new_hours
         event_log("CONTROL", f"runtime updated by controller → {new_hours} hours")
         respond(f"✅ Runtime end moved to {new_hours} hours from now (48-hour cap).")
-    elif cmd == "setdealkeywords":
+    elif cmd in ("setdealkeywords", "dealkeywords"):
         keywords = _parse_deal_keywords(args)
         if not keywords:
-            respond("❌ Provide at least one comma-separated item keyword, e.g. `!setdealkeywords Blade Ball, BB token, BB`.")
+            respond("❌ Provide at least one comma-separated item keyword, e.g. `!setdealkeywords Robux, MM2, Pet Sim, Blox Fruits, Tokens`.")
             return True
         _runtime_deal_keywords = keywords
         event_log("DEAL", f"deal item keywords updated by controller → {', '.join(keywords)}")
         send_log_webhook(f"📈 **DEAL KEYWORDS UPDATED** → {', '.join(keywords)}", kind="DEAL")
         respond(f"✅ Deal scanner now requires one of: `{', '.join(keywords)}`")
-    elif cmd == "setdealscan":
+    elif cmd in ("setdealscan", "dealscan"):
         value = args.casefold().strip()
         if value in {"on", "true", "1", "enable", "enabled"}:
             _runtime_deal_scan_enabled = True
@@ -3356,7 +3361,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
             return True
         event_log("DEAL", f"deal scanner {'enabled' if _runtime_deal_scan_enabled else 'disabled'} by controller")
         respond(f"✅ Deal scanner is now `{ 'on' if _runtime_deal_scan_enabled else 'off' }`.")
-    elif cmd == "setdealdelta":
+    elif cmd in ("setdealdelta", "dealdelta"):
         try:
             delta = float(args.strip())
         except (TypeError, ValueError):
@@ -3576,7 +3581,7 @@ def _sync_control_gist(force=False):
     """
     global _paused_by_controller, _runtime_message, _runtime_rate
     global _runtime_ad_type, _runtime_deal_keywords, _runtime_deal_scan_enabled, _runtime_deal_delta, _last_gist_sync
-    global _last_control_command_id
+    global _last_control_command_id, INTERVAL_MIN
     if not CONTROL_GIST_ID or not GIST_TOKEN:
         return
     if not force and (time.time() - _last_gist_sync) < SYNC_GIST_INTERVAL_SEC:

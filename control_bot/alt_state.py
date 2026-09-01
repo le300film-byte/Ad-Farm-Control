@@ -257,7 +257,7 @@ class AltStateManager:
                 alt.dm_ack, alt.dm_ack_ts = str(text)[:500], time.time()
 
     def set_run_config(self, alt_id: int, *, ad_type=None, rate=None, message=None,
-                       interval_min=None, runtime_hours=None) -> None:
+                       interval_min=None, interval=None, runtime_hours=None, runtime=None) -> None:
         with self._lock:
             alt = self._alts.get(alt_id)
             if not alt:
@@ -273,10 +273,12 @@ class AltStateManager:
                     pass
             if isinstance(message, str):
                 alt.message_preview = message[:120]
-            if interval_min in {3, 5}:
-                alt.interval_min = int(interval_min)
-            if runtime_hours in {6, 12, 18, 24, 48}:
-                alt.runtime_hours = int(runtime_hours)
+            effective_interval = interval_min if interval_min is not None else interval
+            if effective_interval in {3, 5}:
+                alt.interval_min = int(effective_interval)
+            effective_runtime = runtime_hours if runtime_hours is not None else runtime
+            if effective_runtime in {6, 12, 18, 24, 48}:
+                alt.runtime_hours = int(effective_runtime)
 
     def set_deal_keywords(self, alt_id: int, keywords: list[str]) -> None:
         with self._lock:

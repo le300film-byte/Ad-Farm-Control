@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import requests  # uses requests; control bot doesn't need curl_cffi impersonation
@@ -86,26 +87,33 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
         "issued_at": time.time(),
         "transport": "control_gist",
     })
-    if command == "pause":
+    if command in ("pause",):
         payload["paused"] = True
-    elif command == "resume":
+    elif command in ("resume",):
         payload["paused"] = False
-    elif command == "setprice":
+    elif command in ("setprice", "price", "rate"):
         try:
             payload["rate"] = float(args.strip())
         except Exception:
             pass
-    elif command == "setmode":
+    elif command in ("setmode", "mode"):
         if args.lower().strip() in {"sell", "buy"}:
             payload["ad_type"] = args.lower().strip()
-    elif command == "setmessage":
+    elif command in ("setmessage", "message"):
         if args.strip():
             payload["message"] = args.strip()[:1900]
-    elif command == "setinterval":
+    elif command in ("setinterval", "interval"):
         try:
             val = int(args.strip())
             if val in (3, 5):
                 payload["interval_min"] = val
+        except Exception:
+            pass
+    elif command in ("setruntime", "runtime"):
+        try:
+            val = int(args.strip())
+            if val in (6, 12, 18, 24, 48):
+                payload["runtime_hours"] = val
         except Exception:
             pass
     elif command == "policy":
@@ -126,11 +134,11 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
                 payload["interval_min"] = 5
                 payload["deal_scan_enabled"] = True
                 payload["deal_alert_delta"] = 0.05
-    elif command == "setdealkeywords":
+    elif command in ("setdealkeywords", "dealkeywords"):
         payload["deal_keywords"] = [item.strip()[:60] for item in args.split(",") if item.strip()][:20]
-    elif command == "setdealscan":
+    elif command in ("setdealscan", "dealscan"):
         payload["deal_scan_enabled"] = args.casefold().strip() in {"on", "true", "1", "enable", "enabled"}
-    elif command == "setdealdelta":
+    elif command in ("setdealdelta", "dealdelta"):
         try:
             value = float(args.strip())
             if 0 <= value <= 5:
@@ -233,7 +241,17 @@ def delete_repository_secret(repo: str, name: str) -> tuple[bool, str]:
     """Delete one repository secret; callers must already have owner auth."""
     if not repo or not name:
         return False, "Repository and secret name are required."
-    return _run_gh_secret(["secret", "delete", name, "--repo", _repo_slug(repo), "--yes"])
+    slug = _repo_slug(repo)
+    # Try GitHub REST API first
+    try:
+        url = f"{GH}/repos/{slug}/actions/secrets/{name}"
+        r = requests.delete(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        if r.status_code in (204, 200, 404):
+            return True, "Secret deleted."
+    except Exception:
+        pass
+    # Fallback to gh CLI (note: gh secret delete does not take --yes)
+    return _run_gh_secret(["secret", "delete", name, "--repo", slug])
 
 
 def delete_repository(repo: str) -> tuple[bool, str]:
@@ -316,7 +334,7 @@ def cancel_run(alt_id: int) -> tuple[bool, str]:
         return False, f"Alt {alt_id} has no repository mapped."
     run_id = _fetch_latest_run_id(repo)
     if not run_id:
-        return False, "Could not find an active run to cancel."
+        return True, "No active workflow run found to cancel."
     url = f"{GH}/repos/{_repo_slug(repo)}/actions/runs/{run_id}/cancel"
     try:
         r = requests.post(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
@@ -324,6 +342,8 @@ def cancel_run(alt_id: int) -> tuple[bool, str]:
         return False, f"Network error: {e}"
     if r.status_code in (202, 204):
         return True, f"Sent cancel for run `{run_id}` in `{repo}`."
+    if r.status_code == 409:
+        return True, f"Workflow run `{run_id}` was already completed."
     return False, f"HTTP {r.status_code}: {r.text[:200]}"
 
 
@@ -358,8 +378,8 @@ def fetch_discord_user_profile(user_token: str) -> tuple[bool, dict]:
         return False, {"error": str(exc)}
 
 
-def create_alt_repository(repo_slug_or_name: str, private: bool = True) -> tuple[bool, str]:
-    """Ensure an alt repository exists on GitHub, creating it if necessary."""
+def create_alt_repository(repo_slug_or_name: str, private: bool = False) -> tuple[bool, str]:
+    """Ensure an alt repository exists on GitHub, creating it if necessary (defaults to public)."""
     slug = _repo_slug(repo_slug_or_name)
     exists, _ = repository_exists(slug)
     if exists:
@@ -367,6 +387,9 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = True) -> tuple
     parts = slug.split("/")
     repo_name = parts[-1] if len(parts) > 1 else slug
     owner = parts[0] if len(parts) > 1 else config.GITHUB_OWNER
+
+    if os.environ.get("ALT_REPO_PRIVATE", "").lower() in ("1", "true"):
+        private = True
 
     # Try creating under org or user via REST API
     payload = {"name": repo_name, "private": private, "auto_init": True, "description": f"Ad Farm alt {repo_name}"}
@@ -380,8 +403,9 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = True) -> tuple
     if shutil.which("gh") and config.GITHUB_TOKEN:
         env = os.environ.copy()
         env["GH_TOKEN"] = config.GITHUB_TOKEN
+        visibility_flag = "--private" if private else "--public"
         res = subprocess.run(
-            ["gh", "repo", "create", slug, "--private", "--add-readme"],
+            ["gh", "repo", "create", slug, visibility_flag, "--add-readme"],
             capture_output=True, text=True, timeout=_HTTP_TIMEOUT, env=env, check=False,
         )
         if res.returncode == 0 or "already exists" in (res.stderr or "").lower():

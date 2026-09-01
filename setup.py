@@ -656,11 +656,14 @@ class Bootstrap:
         if view.returncode == 0:
             print(f"  ✓ repository already exists: {full}")
             return full
+        is_private = getattr(self.args, "private_repos", False) or os.environ.get("ALT_REPO_PRIVATE", "").lower() in ("1", "true")
+        visibility_flag = "--private" if is_private else "--public"
         self.run_command([
-            "gh", "repo", "create", full, "--private", "--add-readme",
+            "gh", "repo", "create", full, visibility_flag, "--add-readme",
             "--description", f"Ad Farm alt {repo_name}",
         ])
-        print(f"  ✓ created private repository: {full}")
+        visibility_str = "private" if is_private else "public"
+        print(f"  ✓ created {visibility_str} repository: {full}")
         return full
 
     def upload_template(self, repo: str, relative: str, retry_count: int = 0) -> None:
@@ -775,6 +778,12 @@ class Bootstrap:
             command = ["gh", "variable", "list", "--repo", repo, "--json", "name", "--jq", ".[].name"]
         result = self.run_command(command, check=False)
         if result.returncode != 0:
+            if kind == "variable":
+                status, data = self.github("GET", f"/repos/{repo}/actions/variables")
+                if status == 200 and isinstance(data, dict) and "variables" in data:
+                    names = {v.get("name") for v in data["variables"] if v.get("name")}
+                    self._existing_cache[cache_key] = names
+                    return names
             detail = (result.stderr or result.stdout).strip()
             raise SetupError(f"Could not inspect existing {kind}s on {repo}: {detail[:400]}")
         names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
@@ -823,15 +832,19 @@ class Bootstrap:
             check=False,
         )
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise SetupError(f"Could not set variable {name} on {repo}: {detail[:400]}")
+            status, _ = self.github("POST", f"/repos/{repo}/actions/variables", {"name": name, "value": str(value)})
+            if status == 409:
+                status, _ = self.github("PATCH", f"/repos/{repo}/actions/variables/{name}", {"name": name, "value": str(value)})
+            if status not in (200, 201, 204):
+                detail = (result.stderr or result.stdout).strip()
+                raise SetupError(f"Could not set variable {name} on {repo}: {detail[:400]}")
 
     def clear_secret(self, repo: str, name: str) -> None:
         """Remove a stale secret when the operator explicitly selects names-only mode."""
         if name not in self.existing_names(repo, "secret"):
             return
         result = self.run_command(
-            ["gh", "secret", "delete", name, "--repo", repo, "--yes"],
+            ["gh", "secret", "delete", name, "--repo", repo],
             check=False,
         )
         if result.returncode != 0:
@@ -1155,6 +1168,13 @@ def main() -> int:
         "--non-interactive",
         action="store_true",
         help="read sensitive inputs from environment variables for CI",
+    )
+    parser.add_argument(
+        "--private-repos",
+        dest="private_repos",
+        action="store_true",
+        default=False,
+        help="create private alt repositories instead of public ones",
     )
     parser.add_argument(
         "--quick", "-q",
