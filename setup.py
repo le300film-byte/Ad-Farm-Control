@@ -41,6 +41,14 @@ DISCORD_API = "https://discord.com/api/v10"
 GITHUB_API = "https://api.github.com"
 ROOT = Path(__file__).resolve().parent
 
+# Configurable market asset name. Defaults remain generic; installations may
+# provide any target item/service through environment variables.
+DEFAULT_ITEM_NAME = os.environ.get("DEFAULT_ITEM_NAME", "item").strip()[:60] or "item"
+DEFAULT_DEAL_KEYWORDS = os.environ.get(
+    "DEAL_ITEM_KEYWORDS",
+    "item,stock,goods,assets",
+).strip() or f"{DEFAULT_ITEM_NAME},{DEFAULT_ITEM_NAME.replace(' ', '')},stock"
+
 # Discord permission bits used for the five private control channels.
 MANAGE_CHANNELS = 1 << 4
 VIEW_CHANNEL = 1 << 10
@@ -105,7 +113,13 @@ class Bootstrap:
     # ---------- process and prompt helpers ----------
     @staticmethod
     def run_command(args: list[str], *, input_text: str | None = None,
-                    check: bool = True) -> subprocess.CompletedProcess[str]:
+                    check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+        """Run one subprocess with a hard wall-clock bound.
+
+        The bootstrap shells out to `gh`; a hung or interactive prompt would
+        otherwise stall a CI job until the workflow timeout. A timeout raises
+        SetupError so the operator sees the exact command that stalled.
+        """
         try:
             proc = subprocess.run(
                 args,
@@ -114,7 +128,12 @@ class Bootstrap:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise SetupError(
+                f"Command {' '.join(args)} timed out after {timeout}s."
+            ) from exc
         except OSError as exc:
             raise SetupError(f"Could not run {' '.join(args)}: {exc}") from exc
         if check and proc.returncode != 0:
@@ -498,7 +517,7 @@ class Bootstrap:
             {"name": "⚡ Instant Flip", "moderated": False},
             {"name": "⏳ Active", "moderated": False},
             {"name": "✅ Claimed", "moderated": False},
-            {"name": "💎 Blade Ball", "moderated": False},
+            {"name": f"💎 {DEFAULT_ITEM_NAME}", "moderated": False},
             {"name": "💰 Arbitrage", "moderated": False},
         ]
         dm_type = 15 if self.use_forums else 0
@@ -899,7 +918,7 @@ class Bootstrap:
             "DASHBOARD_WEBHOOK_URL": self.webhooks["DASHBOARD_WEBHOOK_URL"],
             "DM_WEBHOOK_URL": self.webhooks["DM_WEBHOOK_URL"],
             "DEAL_WEBHOOK_URL": self.webhooks["DEAL_WEBHOOK_URL"],
-            "DEAL_ITEM_KEYWORDS": "Blade Ball,BladeBall,BB token,BB tokens,BB",
+            "DEAL_ITEM_KEYWORDS": DEFAULT_DEAL_KEYWORDS,
             "GIST_TOKEN": self.gh_token,
             "GIST_ID": self.gists["GIST_ID"],
             "CONTROL_GIST_ID": self.gists["CONTROL_GIST_ID"],
@@ -992,7 +1011,7 @@ class Bootstrap:
         failures: list[str] = []
 
         def check_one(alt: dict[str, str]) -> tuple[str, bool, str | None]:
-            repo = alt["full_repo"]
+            repo = str(alt.get("full_repo") or alt.get("repo") or "?")
             try:
                 previous_id = self.dispatch_workflow(repo, "self_check.yml")
                 passed = self.wait_for_workflow(

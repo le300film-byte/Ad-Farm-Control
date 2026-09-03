@@ -154,9 +154,10 @@ class SafetyRegressionTests(unittest.TestCase):
         self.assertEqual(
             names,
             {
-                "run", "stop", "pause", "resume", "alt", "tune", "channels", "deals",
-                "squad", "status", "reply", "analytics", "diagnose", "canary",
-                "topology", "sync", "refresh", "dashboard", "help",
+                "run", "getstarted", "script", "shutdown", "stop", "pause", "resume",
+                "alt", "tune", "channels", "deals", "squad", "status", "reply",
+                "analytics", "diagnose", "canary", "topology", "sync", "refresh",
+                "dashboard", "autorescan", "help",
             },
         )
 

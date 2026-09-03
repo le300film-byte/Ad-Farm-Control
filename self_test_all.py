@@ -256,6 +256,20 @@ def main() -> int:
     else:
         warnings.append("No tests/test_*.py files found; pytest was not run")
 
+    # Phase 3 gate: every committed change must keep the ten-pass function audit
+    # green. Regenerate the log and fail on any new Fail verdict.
+    audit_tool = ROOT / "tools" / "function_audit.py"
+    if audit_tool.is_file():
+        print("\nRunning ten-pass function audit …")
+        code, output = run_command([sys.executable, str(audit_tool), "--check"], timeout=180)
+        last = (output.strip().splitlines() or [""])[-1]
+        if code != 0:
+            fail("FUNCTION AUDIT", output, failures)
+        else:
+            print(f"✅ Function audit passed ({last})")
+    else:
+        warnings.append("tools/function_audit.py is missing; the ten-pass audit was not run")
+
     for warning in warnings:
         print(f"⚠️  {warning}")
 

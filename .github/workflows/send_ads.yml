@@ -3,14 +3,14 @@ name: Marketplace Ad Sender
 run-name: >-
   ${{
     (github.event.inputs.ad_type == 'sell'
-      && format('💰 SELL BB @ {0}/1K', github.event.inputs.sell_rate || '2.5$')
+      && format('💰 SELL ITEM @ {0}/1K', github.event.inputs.sell_rate || '2.5$')
       || (github.event.inputs.buy_style == 'simple'
-        && format('🛒 BUY ALL BB | {0}', github.event.inputs.buy_simple_text || 'DM ME QUICK')
-        || format('🛒 BUY BB @ tok {0}/1K · rap {1}/1K',
+        && format('🛒 BUY ALL ITEM | {0}', github.event.inputs.buy_simple_text || 'DM ME QUICK')
+        || format('🛒 BUY ITEM @ tok {0}/1K · rap {1}/1K',
                   github.event.inputs.buy_rate || '2.2',
                   github.event.inputs.buy_rate_rap || '1.8')))
   }}
-  | ${{ github.event.inputs.interval_min }}min × ${{ github.event.inputs.total_hours }}h
+  | ${{ github.event.inputs.interval_min }}min × ${{ github.event.inputs.runtime_limitless == '1' && '∞ limitless' || format('{0}h', github.event.inputs.total_hours) }}
   ${{ github.event.inputs.attach_image == 'yes' && '| 📷img (after warmup)' || '' }}
   ${{ (github.event.inputs.channel_1 || github.event.inputs.channel_2) && '| 🎯 1-2 channels' || '' }}
 
@@ -25,6 +25,13 @@ on:
         options:
           - 'sell'
           - 'buy'
+
+      # ---- Raw message (all modes) ----
+      message:
+        description: 'Optional exact message or question. When supplied, it is sent as the base copy; no item, price, or RAP is required.'
+        required: false
+        default: ''
+        type: string
 
       # ---- SELL options ----
       sell_rate:
@@ -58,9 +65,9 @@ on:
         default: '1.8'
         type: string
       buy_simple_text:
-        description: '[BUY simple] Full message (e.g. BUYING ALL BLADE BALL DM ME QUICK)'
+        description: '[BUY simple] Full message (e.g. BUYING ALL ITEM DM ME QUICK)'
         required: false
-        default: 'BUYING ALL BLADE BALL DM ME QUICK'
+        default: 'BUYING ALL STOCK - INSTANT PAYMENT - DM ME'
         type: string
 
       # ---- Targeting ----
@@ -105,6 +112,14 @@ on:
           - '18'
           - '24'
           - '48'
+      runtime_limitless:
+        description: 'Limitless mode: run indefinitely until the operator runs /shutdown (sets runtime budget to ∞; the Actions chain still uses up to 8 chunks per dispatch)'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
       attach_image:
         description: 'Attach image to every post after the 3-post text-only warmup? (applies to SELL and BUY in both simple/detailed styles)'
         required: false
@@ -131,7 +146,13 @@ jobs:
           set -euo pipefail
           HOURS="${{ github.event.inputs.total_hours || '6' }}"
           if [ -z "$HOURS" ] || [ "$HOURS" = "null" ]; then HOURS=6; fi
-          CHUNKS=$(( (HOURS + 5) / 6 ))
+          LIMITLESS="${{ github.event.inputs.runtime_limitless || '0' }}"
+          if [ "$LIMITLESS" = "1" ]; then
+            HOURS=0
+            echo "♾️ Limitless mode: no finite sender wall-clock; chaining up to 8 chunks per dispatch."
+          fi
+          if [ "$HOURS" = "0" ]; then BASE_HOURS=48; else BASE_HOURS=$HOURS; fi
+          CHUNKS=$(( (BASE_HOURS + 5) / 6 ))
           if [ "$CHUNKS" -lt 1 ]; then CHUNKS=1; fi
           if [ "$CHUNKS" -gt 8 ]; then CHUNKS=8; fi
           echo "chunks=$CHUNKS" >> "$GITHUB_OUTPUT"
@@ -425,6 +446,7 @@ jobs:
         shell: bash
         env:
           AD_TYPE: ${{ github.event.inputs.ad_type }}
+          RAW_MESSAGE: ${{ github.event.inputs.message }}
           SELL_RATE: ${{ github.event.inputs.sell_rate }}
           SELL_EXTRA: ${{ github.event.inputs.sell_extra }}
           BUY_STYLE: ${{ github.event.inputs.buy_style }}
@@ -433,11 +455,13 @@ jobs:
           BUY_SIMPLE_TEXT: ${{ github.event.inputs.buy_simple_text }}
           ATTACH: ${{ github.event.inputs.attach_image }}
           IMAGE_FILENAME: ${{ secrets.IMAGE_FILENAME }}
+          ITEM_NAME: ${{ secrets.DEFAULT_ITEM_NAME }}
         run: |
           set -euo pipefail
           clean() { echo "${1//$'\r'/}" | tr -d '\n'; }
 
           AD_TYPE_C="$(clean "$AD_TYPE")"
+          RAW_MESSAGE_C="${RAW_MESSAGE//$'\r'/}"
           SELL_RATE_C="$(clean "$SELL_RATE")"
           SELL_EXTRA_C="$(clean "$SELL_EXTRA")"
           BUY_STYLE_C="$(clean "$BUY_STYLE")"
@@ -446,16 +470,21 @@ jobs:
           BUY_SIMPLE_C="$(clean "$BUY_SIMPLE_TEXT")"
           ATTACH_C="$(clean "$ATTACH")"
           IMAGE_FILENAME_C="$(clean "$IMAGE_FILENAME")"
+          ITEM_NAME_C="${ITEM_NAME:-ITEM}"
+          [ -z "$ITEM_NAME_C" ] && ITEM_NAME_C="ITEM"
 
-          if [ "$AD_TYPE_C" = "sell" ]; then
-            MSG="$(printf 'SELLING BB LF %s/1K %s' "$SELL_RATE_C" "$SELL_EXTRA_C")"
+          if [ -n "$RAW_MESSAGE_C" ]; then
+            MSG="$RAW_MESSAGE_C"
+            HAS_IMAGE="$ATTACH_C"
+          elif [ "$AD_TYPE_C" = "sell" ]; then
+            MSG="$(printf 'SELLING %s LF %s/1K %s' "$ITEM_NAME_C" "$SELL_RATE_C" "$SELL_EXTRA_C")"
             HAS_IMAGE="$ATTACH_C"
           elif [ "$BUY_STYLE_C" = "simple" ]; then
             MSG="$BUY_SIMPLE_C"
             HAS_IMAGE="$ATTACH_C"
           else
-            MSG="$(printf 'BUYING BLADE BALL:\n\n-TOKENS %s/1K\n\n-RAP %s$/1K (nlf boosted)\n\nDM me quick' \
-                   "$BUY_RATE_C" "$BUY_RAP_C")"
+            MSG="$(printf 'BUYING %s:\n\n-TOKENS %s/1K\n\n-RAP %s$/1K (nlf boosted)\n\nDM me quick' \
+                   "$ITEM_NAME_C" "$BUY_RATE_C" "$BUY_RAP_C")"
             # Images now attach to ALL buy styles (simple + detailed) after warmup.
             HAS_IMAGE="$ATTACH_C"
           fi
@@ -520,7 +549,8 @@ jobs:
           ATTACH_IMAGE: ${{ steps.build.outputs.has_image }}
           INTERVAL_MIN: ${{ github.event.inputs.interval_min }}
           TOTAL_RUN_MIN: 350
-          TOTAL_HOURS: ${{ github.event.inputs.total_hours || '6' }}
+          TOTAL_HOURS: ${{ github.event.inputs.runtime_limitless == '1' && '0' || github.event.inputs.total_hours || '6' }}
+          RUNTIME_LIMITLESS: ${{ github.event.inputs.runtime_limitless || '0' }}
           CHUNK_INDEX: ${{ matrix.chunk }}
           TOTAL_CHUNKS: ${{ needs.plan.outputs.chunks || '1' }}
           IMAGE_PATH: ${{ steps.build.outputs.image_path }}
@@ -582,6 +612,11 @@ jobs:
           RATELIMIT_JITTER: ${{ secrets.RATELIMIT_JITTER }}
           # V6: auto channel discovery on 404 (all optional)
           CHANNEL_NAMES: ${{ steps.channels.outputs.ch_names }}
+          # Durable per-alt registry is stored in a separate Gist file when
+          # CONTROL_GIST_ID + GIST_TOKEN are configured; local JSON is the
+          # atomic fallback for self-hosted runners.
+          CHANNEL_STATE_FILE: ${{ secrets.CHANNEL_STATE_FILE || '.adfarm_channel_registry.json' }}
+          CHANNEL_STATE_GIST_ID: ${{ secrets.CHANNEL_STATE_GIST_ID || secrets.CONTROL_GIST_ID }}
           CONFIRM_USER_IDS: ${{ secrets.CONFIRM_USER_IDS }}
           CONFIRM_TIMEOUT: ${{ secrets.CONFIRM_TIMEOUT }}
           # V6: centralized remote control (all optional; no config required if you don't use the control bot)

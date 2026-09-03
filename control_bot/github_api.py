@@ -44,6 +44,43 @@ def fetch_gist(gist_id: str) -> dict:
         return {}
 
 
+def fetch_channel_registry_snapshot(alt_id: int) -> dict:
+    """Read one per-alt channel registry file from the shared control Gist."""
+    gist = fetch_gist(config.CHANNEL_STATE_GIST_ID)
+    files = gist.get("files") if isinstance(gist, dict) else None
+    raw_file = files.get(f"channel_state_{int(alt_id)}.json", {}) if isinstance(files, dict) else {}
+    content = raw_file.get("content", "") if isinstance(raw_file, dict) else ""
+    try:
+        payload = json.loads(content) if content else {}
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_channel_registry_snapshot(alt_id: int, snapshot: dict) -> tuple[bool, str]:
+    """Write only one registry file, preserving command files and other alts."""
+    if not config.CHANNEL_STATE_GIST_ID:
+        return False, "CHANNEL_STATE_GIST_ID/CONTROL_GIST_ID is not configured."
+    if not isinstance(snapshot, dict):
+        return False, "Channel registry snapshot must be an object."
+    try:
+        response = requests.patch(
+            f"{GH}/gists/{config.CHANNEL_STATE_GIST_ID}",
+            headers=_auth_headers(),
+            json={"files": {f"channel_state_{int(alt_id)}.json": {"content": json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))}}},
+            timeout=_HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        return False, f"Channel registry Gist network error: {type(exc).__name__}: {exc}"
+    if response.status_code == 200:
+        return True, "Channel registry snapshot saved."
+    try:
+        detail = response.json().get("message", response.text[:200])
+    except Exception:
+        detail = response.text[:200]
+    return False, f"Channel registry Gist HTTP {response.status_code}: {detail}"
+
+
 def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
     """Queue one validated control command in the shared private Gist.
 
@@ -254,6 +291,13 @@ def delete_repository_secret(repo: str, name: str) -> tuple[bool, str]:
     return _run_gh_secret(["secret", "delete", name, "--repo", slug])
 
 
+def set_repository_variable(repo: str, name: str, value: str) -> tuple[bool, str]:
+    """Set a non-secret repository variable (for example ALT_ID / ALT_NAME)."""
+    if not repo or not name or value is None:
+        return False, "Repository, variable name, and value are required."
+    return _run_gh_secret(["variable", "set", name, "--repo", _repo_slug(repo)], value)
+
+
 def delete_repository(repo: str) -> tuple[bool, str]:
     """Delete a repository only when an explicit owner command requested it."""
     if not repo:
@@ -325,6 +369,29 @@ def _fetch_latest_run_id(repo: str) -> Optional[int]:
     except Exception as e:
         print(f"[GH_API] fetch latest run error for {repo}: {e}")
     return None
+
+
+def cancel_workflow_run_by_id(run_id: int, repo: str | None = None) -> tuple[bool, str]:
+    """Cancel an explicit GitHub Actions workflow run by numeric run ID.
+
+    Used by /shutdown to stop the control-bot's own core workflow after it has
+    gracefully stopped every alt.
+    """
+    if not run_id:
+        return False, "No workflow run ID provided."
+    slug = repo or config.CORE_REPO
+    if not slug:
+        return False, "CORE_REPO is not configured."
+    url = f"{GH}/repos/{slug}/actions/runs/{int(run_id)}/cancel"
+    try:
+        r = requests.post(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+    except Exception as e:
+        return False, f"Network error: {e}"
+    if r.status_code in (202, 204):
+        return True, f"Sent cancel for core workflow run `{run_id}` in `{slug}`."
+    if r.status_code == 409:
+        return True, f"Workflow run `{run_id}` in `{slug}` was already completed."
+    return False, f"HTTP {r.status_code}: {r.text[:200]}"
 
 
 def cancel_run(alt_id: int) -> tuple[bool, str]:
@@ -413,18 +480,33 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = False) -> tupl
     return False, f"Could not create repository `{slug}` on GitHub."
 
 
-def provision_alt_repository_files_and_secrets(repo: str, user_token: str, channel_ids: str = "") -> tuple[bool, str]:
-    """Upload canonical workflows and sender script, and populate required secrets."""
+def provision_alt_repository_files_and_secrets(
+    repo: str,
+    user_token: str,
+    channel_ids: str = "",
+    *,
+    alt_id: int | None = None,
+    alt_name: str = "",
+) -> tuple[bool, str]:
+    """Upload canonical workflows and sender script, and populate required secrets.
+
+    The secret/variable set deliberately mirrors ``setup.py`` so an alt added
+    from Discord is indistinguishable from one added by the bootstrap: identity
+    variables, all four webhooks, the Gist control plane, the trust lists, and
+    the scanner aliases are all provisioned before the self-check workflow is
+    uploaded last.
+    """
     slug = _repo_slug(repo)
     ok_repo, msg = create_alt_repository(slug)
     if not ok_repo:
         return False, msg
 
-    # Files to sync from local workspace or core repo
+    # Files to sync from local workspace or core repo. self_check.yml is
+    # uploaded again at the end so its push trigger only fires against a fully
+    # configured repository.
     files_to_sync = [
         "send_ads.py",
         ".github/workflows/send_ads.yml",
-        ".github/workflows/self_check.yml",
     ]
     repo_root = Path(__file__).resolve().parent.parent
     for rel_path in files_to_sync:
@@ -463,6 +545,7 @@ def provision_alt_repository_files_and_secrets(repo: str, user_token: str, chann
         except Exception:
             pass
 
+    owner_ids = ",".join(str(x) for x in sorted(config.OWNER_IDS))
     # Clone common secrets from environment or config
     common_secrets = [
         ("DM_WEBHOOK_URL", os.environ.get("DM_WEBHOOK_URL") or config._raw("DM_WEBHOOK_URL")),
@@ -472,14 +555,45 @@ def provision_alt_repository_files_and_secrets(repo: str, user_token: str, chann
         ("GIST_ID", os.environ.get("GIST_ID") or config._raw("GIST_ID")),
         ("GIST_TOKEN", os.environ.get("GIST_TOKEN") or config._raw("GIST_TOKEN") or config.GITHUB_TOKEN),
         ("CONTROL_GIST_ID", config.CONTROL_GIST_ID or os.environ.get("CONTROL_GIST_ID") or ""),
-        ("CONTROLLER_USER_IDS", ",".join(str(x) for x in config.OWNER_IDS)),
+        ("CONTROLLER_USER_IDS", owner_ids),
+        # Panic and discovery-confirmation trust lists default to the owner set,
+        # exactly like setup.py. Without them the sender refuses remote panic
+        # and refuses channel auto-recovery confirmation.
+        ("PANIC_TRUSTED_IDS", os.environ.get("PANIC_TRUSTED_IDS") or config._raw("PANIC_TRUSTED_IDS") or owner_ids),
+        ("CONFIRM_USER_IDS", os.environ.get("CONFIRM_USER_IDS") or config._raw("CONFIRM_USER_IDS") or owner_ids),
+        ("DEAL_ITEM_KEYWORDS", os.environ.get("DEAL_ITEM_KEYWORDS")
+            or config._raw("DEAL_ITEM_KEYWORDS")
+            or ",".join(config.DEFAULT_DEAL_KEYWORDS)),
         ("CHANNEL_IDS", resolved_channels),
     ]
+    if os.environ.get("TUNING_JSON") or config._raw("TUNING_JSON"):
+        common_secrets.append(("TUNING_JSON", os.environ.get("TUNING_JSON") or config._raw("TUNING_JSON")))
     for sec_name, sec_val in common_secrets:
         if sec_val:
             set_repository_secret(slug, sec_name, str(sec_val))
 
-    return True, f"Repository `{slug}` auto-provisioned successfully with canonical files and secrets."
+    # CHANNEL_IDS and CHANNEL_NAMES are mutually optional. Clear a stale
+    # CHANNEL_NAMES secret so an IDs-only fleet is not silently overridden.
+    channel_names = os.environ.get("CHANNEL_NAMES") or config._raw("CHANNEL_NAMES")
+    if channel_names:
+        set_repository_secret(slug, "CHANNEL_NAMES", channel_names)
+    else:
+        delete_repository_secret(slug, "CHANNEL_NAMES")
+
+    # Identity variables mirror setup.py: the sender's ALT_ID/ALT_NAME drive
+    # per-alt Gist files, log attribution, and heartbeat routing.
+    if alt_id is not None:
+        set_repository_variable(slug, "ALT_ID", str(int(alt_id)))
+    if alt_name:
+        set_repository_variable(slug, "ALT_NAME", str(alt_name)[:80])
+
+    # Upload last so the workflow's push trigger sees a fully configured repo.
+    self_check = repo_root / ".github/workflows/self_check.yml"
+    if self_check.is_file():
+        upload_repository_file(slug, ".github/workflows/self_check.yml", self_check.read_bytes(),
+                              message="bootstrap: install self_check workflow")
+
+    return True, f"Repository `{slug}` auto-provisioned successfully with canonical files, secrets, and identity variables."
 
 
 def upload_repository_file(repo: str, file_path: str, content_bytes: bytes, message: str = "Update file from control bot") -> tuple[bool, str]:

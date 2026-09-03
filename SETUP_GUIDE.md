@@ -226,7 +226,9 @@ Lets you issue DM `!commands` to the alt from trusted Discord user IDs
 |---|---|---|
 | `CONTROLLER_USER_IDS` | _(empty)_ | Comma-separated Discord IDs allowed to send legacy `!setprice`, `!pause`, `!resume`, `!stop`, `!sync`, `!status`, `!setmessage`, `!setmode`, `!setdealkeywords`, `!setchannel`, `!replacechannel`, `!setinterval`, and `!setruntime` via DM. |
 | `CONTROL_GIST_ID` | _(empty)_ | Shared private control queue. The official control bot writes `control_<ALT_ID>.json` here, so slash commands work without adding an alt to the control server. The sender polls and writes an acknowledgement back. `control.json` remains available for broadcast overrides. |
-| `DEAL_ITEM_KEYWORDS` | `Blade Ball,BladeBall,BB token,BB tokens,BB` | Comma-separated, case-insensitive whole-word/phrase aliases required by the separate deal scanner. Runtime `/deals keywords:<aliases>` changes this for the active and subsequent runs. |
+| `DEFAULT_ITEM_NAME` | `item` | Human-readable market asset used in DM classifier fallback, bootstrap forum tags, and default copy placeholders. Change once to re-target the entire farm without source edits. |
+| `DEFAULT_ITEM_KEYWORDS` | `item,stock,goods,assets` | Whole-word/phrase aliases used by the DM intent classifier for the configured asset. |
+| `DEAL_ITEM_KEYWORDS` | `item,stock,goods,assets` | Comma-separated, case-insensitive whole-word/phrase aliases required by the separate deal scanner. Runtime `/deals keywords:<aliases>` changes this for the active and subsequent runs. |
 | `HEARTBEAT_INTERVAL_SEC` | `300` | Seconds between heartbeat pushes to `DASHBOARD_WEBHOOK_URL` (min 60). |
 | `SYNC_GIST_INTERVAL_SEC` | `45` | Seconds between gist polls (min 15). |
 | `CONTROL_CMD_PREFIX` | `!` | Command prefix character. |
@@ -385,7 +387,7 @@ legacy installations without the Gist queue.
 | `!setprice 2.7` | Update rate in-memory (regex auto-updates ad text). |
 | `!setmode sell` or `!setmode buy` | Switch ad type on the fly. |
 | `!setmessage <full text>` | Switch to entirely new ad copy. |
-| `!setdealkeywords Blade Ball, BB token, BB` | Require one of the comma-separated item aliases before a deal alert. |
+| `!setdealkeywords dragon fruit, df, dragonfruit` | Require one of the comma-separated item aliases before a deal alert. |
 | `!setdealscan on` or `!setdealscan off` | Toggle the deal scanner without toggling ad posting. |
 | `!setdealdelta 0.05` | Require at least $0.05/1k edge before a matching offer alerts. |
 | `!pause` | Pause public posting (status goes 🟡). |

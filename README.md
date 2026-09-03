@@ -18,18 +18,38 @@ alts, each isolated in its own private repository and workflow.
 - **Single-alt deployment:** see [`SETUP_GUIDE.md`](./SETUP_GUIDE.md).
 - **AI Co-Pilot & Operator Skill:** see [`SKILL.md`](./SKILL.md) for prompt injection and complete command/keyword reference.
 - **Architectural roadmap & innovations:** see [`ROADMAP.md`](./ROADMAP.md).
+- **Customer-ready bug & risk registry:** see [`BUG_TRACKER.md`](./BUG_TRACKER.md).
 
 ## V6 Architecture & Core Features
 
 - `send_ads.py` is the fail-closed sender. It verifies egress routes before
   Discord warmup, supports 3/5-minute intervals, and caps every runtime at 48 hours.
-- **Unified Interactive Hub Architecture:** Streamlined into 19 non-duplicated,
-  interactive top-level slash commands (`/run`, `/stop`, `/pause`, `/resume`,
-  `/alt`, `/tune`, `/channels`, `/deals`, `/squad`, `/status`, `/reply`,
-  `/analytics`, `/diagnose`, `/canary`, `/topology`, `/sync`, `/refresh`,
-  `/dashboard`, `/help`). Running base commands without parameters opens interactive
-  rich views with 1-click action buttons, selectors, and modals, while still
-  supporting direct one-shot CLI arguments for power operators.
+- **Unified Interactive Hub Architecture:** Streamlined into 23 non-duplicated,
+  interactive top-level slash commands (`/run`, `/getstarted`, `/stop`, `/pause`,
+  `/resume`, `/alt`, `/tune`, `/channels`, `/autorescan`, `/deals`, `/squad`,
+  `/status`, `/reply`, `/analytics`, `/diagnose`, `/canary`, `/topology`,
+  `/sync`, `/refresh`, `/dashboard`, `/script`, `/shutdown`, `/help`). Running
+  base commands without parameters opens interactive rich views with 1-click
+  action buttons, selectors, and modals, while still supporting direct one-shot
+  CLI arguments for power operators.
+- **Zero-Touch Channel Auto-Scan (`/autorescan`):** On first connect each alt's
+  Discord server names and channel IDs are persisted to `channel_state_{n}.json`.
+  Every reconnect or manual `/autorescan` fetches the live channel list, compares
+  it to the persisted table, auto-adds new channels, removes gone channels, and
+  logs the exact diff — the operator never reconfigures channels by hand.
+- **`/run` Preview + Limitless Mode:** `/run` shows a full configuration preview
+  and requires **Confirm Launch** before dispatch. Runtime now includes
+  **`∞ Limitless`**, which sends `RUNTIME_LIMITLESS=1` so a sender keeps running
+  indefinitely until `/shutdown` gracefully stops all alts and workflows.
+- **Configurable Market Asset:** the market asset is driven entirely by
+  `DEFAULT_ITEM_NAME` / `DEFAULT_ITEM_KEYWORDS` / `DEAL_ITEM_KEYWORDS`, so no
+  source edit is needed to target a different item. No item name is hardcoded
+  in the control logic.
+- **Scripting Suite & Sandbox:** `/script action:simulate` (unfiltered
+  dry-run) and `/script action:run` (sandboxed execution) with resource caps,
+  timeout, and network-off by default.
+- **Living Bug Tracker:** see [`BUG_TRACKER.md`](./BUG_TRACKER.md) for the full
+  legacy bug, predicted risk, and validation-round history.
 - **Visual Fleet Analytics & Speed Matrix (`/analytics`):**
   Renders live ASCII progress gauges (`[▰▰▰▰▰▰▰▰▱▱]`), delivery reliability percentages,
   slowmode utilization, and inter-channel interval timelines.

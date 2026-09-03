@@ -99,6 +99,15 @@ def _mode_icon(mode: str) -> str:
     return "💰" if (mode or "").lower() == "sell" else "🛒" if (mode or "").lower() == "buy" else "❔"
 
 
+def _runtime_str(runtime_hours: int) -> str:
+    """Render a normal hour count or the Limitless ∞ mode."""
+    try:
+        value = int(runtime_hours or 0)
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    return "∞ (limitless)" if value == 0 else f"{value}h"
+
+
 def build_summary_embed(mgr: AltStateManager) -> discord.Embed:
     mgr.mark_offline_stale(config.OFFLINE_AFTER_SEC)
     alts = mgr.all()
@@ -127,7 +136,7 @@ def build_summary_embed(mgr: AltStateManager) -> discord.Embed:
             f"@ **{_rate_str(alt)}** · Health **{health}%** `[{spark}]` · `{alt.status}` · "
             f"sent **{alt.total_sent}** · err **{alt.total_errors}** · "
             f"ch **{alt.active_channels}/{alt.total_channels}** · "
-            f"cadence **{alt.interval_min}m/{alt.runtime_hours}h** · "
+            f"cadence **{alt.interval_min}m/{_runtime_str(alt.runtime_hours)}** · "
             f"last {_fmt_ago(alt.last_post_ts)} · run `{workflow}`"
         )
         sent += alt.total_sent
@@ -237,7 +246,7 @@ def build_single_alt_embed(mgr: AltStateManager, alt_id: int) -> discord.Embed:
     embed.add_field(name="Rate", value=_rate_str(alt), inline=True)
     embed.add_field(name="Status", value=f"`{alt.status}`", inline=True)
     embed.add_field(name="Health Score", value=f"**{mgr.get_health_index(alt.alt_id)}%** `[{mgr.get_activity_sparkline(alt.alt_id)}]`", inline=True)
-    embed.add_field(name="Cadence / runtime", value=f"{alt.interval_min}m / {alt.runtime_hours}h", inline=True)
+    embed.add_field(name="Cadence / runtime", value=f"{alt.interval_min}m / {_runtime_str(alt.runtime_hours)}", inline=True)
     embed.add_field(name="Online", value="yes" if alt.online else "no", inline=True)
     embed.add_field(name="Sent / errors / skips", value=f"{alt.total_sent} / {alt.total_errors} / {alt.total_skips}", inline=True)
     embed.add_field(name="Edits / deals", value=f"{alt.total_edits} / {alt.deal_alerts}", inline=True)

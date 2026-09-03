@@ -37,12 +37,16 @@
 
 ## 2. Complete Slash Command & Control Manual
 
-The control plane provides **19 unified, non-duplicated interactive slash commands**. Running base commands without parameters opens interactive rich views with 1-click action buttons and modals, while direct parameters remain available for one-shot CLI execution:
+The control plane provides **23 unified, non-duplicated interactive slash commands**. Running base commands without parameters opens interactive rich views with 1-click action buttons and modals, while direct parameters remain available for one-shot CLI execution:
 
 ### 🚀 Execution & Runner Control
 | Command | Arguments | Function & Use Case |
 |---|---|---|
-| `/run` | *(None — opens interactive 3-step form)* | **Interactive 3-Step Wizard:** Select Alt, Mode (`Sell`/`Buy`), Rates, Message/Image, Cadence (`3m`/`5m`), and Duration (`6h`, `12h`, `18h`, `24h`, `48h`). Cancels old run and dispatches runner workflow. |
+| `/run` | *(None — opens interactive 3-step form)* | **Interactive 3-Step Wizard (raw message — no item word, price, or RAP required):** enter the message or question you want posted; emoji/alteration modifiers are applied automatically. Then select Alt, Mode (`Sell`/`Buy`), Rates, Cadence (`3m`/`5m`), and Duration (`6h`, `12h`, `18h`, `24h`, `48h`, `∞ Limitless`). Cadence (`3m`/`5m`), and Duration (`6h`, `12h`, `18h`, `24h`, `48h`, `∞ Limitless`). Shows a **full preview** of the command/script with options and requires **Confirm Launch** before execution. Cancels old run and dispatches runner workflow. |
+| `/run` | `squad: Name` | **Squad Launch:** Expands the named squad into its member alts and dispatches each one in sequence with a random 200–500 ms pause between launches, so a group launch never fires simultaneously. |
+| `/getstarted` | *(None)* | **Beginner Onboarding:** step-by-step setup, basic commands, common use cases, documentation links. Zero-code path from `/alt action:add` → channels → self-check → preview launch → monitoring → `/shutdown`. |
+| `/script` | `action: <simulate\|run>, code: <python>` | **Scripting Suite:** `simulate` dry-runs a script in a resource-limited sandbox and returns **unfiltered stdout/stderr/errors**; `run` executes it in the same sandbox (still resource-limited, never in the control-bot process). |
+| `/shutdown` | `confirmation: SHUTDOWN` | **Graceful Fleet Shutdown:** stops every alt, cancels all GitHub workflows, cancels the control bot's own Actions run, and terminates the process cleanly. Requires the exact confirmation word. |
 | `/stop` | `alt: ID` | **Graceful Shutdown:** Stops ad sender cleanly, syncs blocklists, and cancels active GitHub Actions workflow run. |
 | `/pause` | `alt: ID` | **Temporary Standby:** Halts public ad delivery without canceling the GitHub Actions runner. |
 | `/resume` | `alt: ID` | **Resume Posting:** Resumes public ad delivery from pause. |
@@ -74,10 +78,14 @@ The control plane provides **19 unified, non-duplicated interactive slash comman
 ### 📌 Channel Operations (`/channels`)
 | Command | Arguments | Function & Use Case |
 |---|---|---|
-| `/channels` | `[alt: ID]` | **Interactive Channel Manager:** Visual embed showing channel yield grades, slowmodes, with buttons to Add Channel, Replace Channel, Rescan, and Reset Caution. |
+| `/channels` | `[alt: ID]` | **Interactive Channel Manager:** Visual embed showing channel yield grades, slowmodes, with buttons to Add/Replace/Remove/Overwrite/Refresh Channel, and Reset Caution. |
+| `/channels` | `alt: ID, action: list` | **List Channels:** Shows the full channel table for an alt. |
 | `/channels` | `alt: ID, action: add, channel_id: Digits, [name: Label]` | **Add Channel:** Validates and adds a channel ID to the live runner and persists it to GitHub Actions Secrets. |
 | `/channels` | `alt: ID, action: replace, channel_id: OldID, new_channel_id: NewID, [name: Label]` | **Hot-Swap Channel:** Replaces dead/404 channel with a new one; migrates stats and updates repo secrets. |
-| `/channels` | `alt: ID, action: rescan` | **Force Channel Rescan:** Forces the alt to refresh guild caches, check permissions, and re-verify channel slowmodes. |
+| `/channels` | `alt: ID, action: remove, channel_id: ID` | **Remove Channel:** Removes one channel from the alt and re-persists GitHub Secrets. |
+| `/channels` | `alt: ID, action: overwrite, channel_id: <id1,id2,...>` | **Overwrite ALL Channels:** Replaces the entire channel list tied to an alt with the supplied verified IDs, syncs GitHub Secrets, and sends `!setchannels` to the live runner. |
+| `/channels` | `alt: ID, action: refresh` | **Force Channel Refresh:** Forces the alt to refresh guild caches, check permissions, re-verify slowmodes (lowercase `!rescan` transport). |
+| `/autorescan` | `[alt: ID (0 = all alts)]` | **Live Channel Auto-Scan (zero-touch):** Fetches the alt's live Discord channel list, compares it against the persisted registry, auto-adds every newly created channel, removes every channel that no longer exists, logs each add/remove with alt name + timestamp + channel ID, and reboots the sender only when the table actually changed. Runs automatically on control-bot startup and on every reconnect. |
 | `/channels` | `alt: ID, action: reset_caution, [channel_id: 'all' or ID]` | **Clear Strikes & Caution:** Unbans channel from Caution Mode and clears slowmode backoffs. |
 
 ### 💰 Arbitrage Deal Scanner (`/deals`)
@@ -86,14 +94,17 @@ The control plane provides **19 unified, non-duplicated interactive slash comman
 | `/deals` | `[alt: 0 for All]` | **Interactive Arbitrage Hub:** Shows real-time scanner metrics, profit margins, active keywords, with buttons to toggle scanner, set threshold, set keywords, or simulate listing. |
 | `/deals` | `alt: ID, enabled: <on\|off>` | **Toggle Deal Scanner:** Enables/disables deal scanning without affecting ad rotations. |
 | `/deals` | `alt: ID, min_delta: <0..5>` | **Set Profit Margin:** Sets minimum profit edge per 1k units required before triggering a deal alert (default `$0.05`). |
-| `/deals` | `alt: ID, keywords: List` | **Configure Target Item Aliases:** Sets comma-separated item aliases (e.g. `Blade Ball, BB token, BB`) for the deal scanner. |
+| `/deals` | `alt: ID, keywords: List` | **Configure Target Item Aliases:** Sets comma-separated item aliases for the deal scanner (use your own asset names, e.g. `dragon fruit, df, dragonfruit`). The asset is configurable — no item name is hardcoded anywhere in the logic. |
 | `/deals` | `alt: ID, sample_listing: Text` | **Simulate Listing Parser:** Dry-run test-parses an ad message excerpt against deal keywords and active margins. |
 
 ### 👥 Squad Batch Operations (`/squad`)
 | Command | Arguments | Function & Use Case |
 |---|---|---|
 | `/squad` | `[action: overview], [squad_name: Name]` | **Interactive Squad Control Hub:** Dropdown selector to switch squads, with 1-click buttons for Batch Pause, Batch Resume, Batch Price, Batch Policy, and Assign Alt. |
+| `/squad` | `action: list` | **List Squads:** Shows every squad with its current member alts. |
 | `/squad` | `action: view, squad_name: Name` | **Squad Overview:** Composite squad health score, total posts, error tally, and member statuses. |
+| `/squad` | `action: create, squad_name: Name, alts: <1,2,3\|all>` | **Create Squad:** Creates a named squad and assigns every listed alt to it in one command (e.g. `alts:1,2,3,4`). |
+| `/squad` | `action: unassign, alt: ID` | **Unassign Alt:** Removes an alt from its squad without deleting the squad. |
 | `/squad` | `action: assign, alt: ID, squad_name: Name` | **Assign Alt:** Assigns an alt to a named squad (e.g. `Alpha Sellers`). |
 | `/squad` | `action: pause, squad_name: Name` | **Batch Pause:** Pauses public ad posting across all alts in the squad simultaneously. |
 | `/squad` | `action: resume, squad_name: Name` | **Batch Resume:** Resumes public ad posting across all alts in the squad simultaneously. |
@@ -149,12 +160,14 @@ When formulating advice or commands for the operator, the AI **MUST** adhere to 
 | "Unban channel 123456 / clear slowmode on Alt 1" | `/channels alt:1 action:reset_caution channel_id:123456` |
 | "Add a new trade channel 987654321 to Alt 1" | `/channels alt:1 action:add channel_id:987654321 name:trading` |
 | "Rescan permissions on Alt 1" | `/channels alt:1 action:rescan` |
-| "Find Blade Ball arbitrage deals on Alt 1" | `/deals alt:1 keywords:Blade Ball, BB token, BB tokens, BB` |
+| "Find arbitrage deals on my asset on Alt 1" | `/deals alt:1 keywords:dragon fruit, df, dragonfruit` |
 | "Only alert if a deal has at least $0.10 profit edge" | `/deals alt:1 min_delta:0.10` |
 | "Reply to buyer 1029384756 on Alt 1" | `/reply alt:1 user:1029384756 text:Hey! 100k in stock, $2.40/1k. DM me.` |
 | "Pause posting on Alt 1" | `/pause alt:1` |
 | "Stop Alt 1 runner completely" | `/stop alt:1` |
 | "Set stealth anti-ban policy on Alt 1" | `/tune alt:1 policy:stealth` |
+| "Create a squad with Alts 1–3 and launch it" | `/squad action:create squad_name:MyGroup alts:1,2,3` then `/run squad:MyGroup` |
+| "Rescan Alt 1's channels against Discord" | `/autorescan alt:1` |
 
 ---
 
@@ -177,7 +190,7 @@ The deal scanner continuously monitors marketplace channels, parses other users'
 ### Keyword Recommendations
 Always provide whole-word game aliases covering full names, acronyms, and plurals:
 ```
-/deals keywords alt:1 keywords:Blade Ball, BB token, BB tokens, BB, Tokens, Robux, R$, MM2
+/deals alt:1 keywords:dragon fruit, dragonfruit, df, fruits
 ```
 
 ---
@@ -187,7 +200,7 @@ Always provide whole-word game aliases covering full names, acronyms, and plural
 When prospective buyers message any fleet alt, the engine aggregates rapid-fire bursts (3.5s debouncer) and executes a multi-factor regex taxonomy before dispatching to `#dm-inbox`:
 
 ### Extracted Metadata
-- **Game / Asset:** `⚔️ Blade Ball`, `💎 Robux`, `🐾 Pet Sim 99`, `🔪 MM2`, `🍇 Blox Fruits`, `🐶 Adopt Me`, `🔫 Da Hood`
+- **Game / Asset:** detected from the configured `DEFAULT_ITEM_KEYWORDS` and from well-known marketplace aliases (`💎 Robux`, `🐾 Pet Sim 99`, `🔪 MM2`, `🍇 Blox Fruits`, `🐶 Adopt Me`, `🔫 Da Hood`). Nothing is hardcoded — add your own asset to the keyword list and it is classified the same way.
 - **Intent Type:** `🛒 Purchase Intent` (`wtb`, `cop`, `buy`), `📦 Stock Check` (`stock`, `avail`), `🔄 Price Check` (`rate`, `$/1k`), `🛡️ Vouch Request` (`proofs`, `mm`, `legit`), `🔁 Trade Offer` (`swap`, `wtt`), `💬 General Inquiry`
 - **Volume & Budget:** `500k`, `2.5m`, `10M`, `$50 budget`, `100 usd`
 - **Payment Channels:** `💳 PayPal`, `🪙 Crypto/USDT/LTC`, `💵 CashApp`, `🏦 Bank/Card`, `🎁 Trade/Robux`
@@ -232,7 +245,72 @@ Whenever an alt executes a controller command (channel rescan, caution reset, pr
 
 When assisting the operator:
 1. **Be Action-Oriented:** Give the exact slash command ready to copy and paste.
-2. **Prioritize Safety:** Never recommend intervals faster than 3 minutes; always adhere to the 48-hour max runtime rule.
+2. **Prioritize Safety:** Never recommend intervals faster than 3 minutes; always adhere to the 48-hour max runtime rule unless the operator explicitly asked for `/run` **Limitless** mode (which is stopped only with `/shutdown`).
 3. **Be Structured:** Use bullet points, bold keywords, and code blocks for slash commands and configurations.
 4. **Context Aware:** When formulating parameters, cross-reference whether the alt is in `sell` or `buy` mode and adapt pricing and keywords accordingly.
 
+---
+
+## 9. Configurable Market Asset & Limitless Run
+
+### Market asset configuration
+No item name is hardcoded anywhere in the control logic or the sender. The
+market asset is driven entirely by `.env` / GitHub Secrets:
+
+| Variable | Shipped default | Meaning |
+|---|---|---|
+| `DEFAULT_ITEM_NAME` | `item` | Display name used in DM classifier fallback, bootstrap forum tag, and default sell/buy copy placeholders. |
+| `DEFAULT_ITEM_KEYWORDS` | `item,stock,goods,assets` | Whole-word aliases used by DM intent classification. |
+| `DEAL_ITEM_KEYWORDS` | `item,stock,goods,assets` | Scanner aliases. Per-alt `/deals keywords:` overrides this at runtime. |
+
+Set these once in the core repository and each alt repository secret (setup.py accepts them directly). The control bot and sender read the same values, so no source edit is required to target a different game/item.
+
+### Limitless mode (`/run`)
+- Runtime selector includes **`∞ Limitless (until /shutdown)`** (value `0`).
+- The bot shows a **full preview** before dispatch; clicking **Confirm Launch** dispatches.
+- The sender sets `RUNTIME_LIMITLESS=1`, uses an infinite run-end, rolls a 7-day AFK-break window, and only stops via `/shutdown`, `!stop`, or a panic event.
+- `/shutdown` gracefully stops every alt, cancels every workflow, cancels the control bot's own Actions run, and terminates the process. It requires `confirmation: SHUTDOWN`.
+
+### Scripting suite
+`/script action:simulate code:<...>` runs a sandboxed dry-run with unfiltered output/errors.
+`/script action:run code:<...>` executes the same resource-limited sandbox.
+Limits: `SCRIPT_TIMEOUT_SEC=20`, `SCRIPT_MEMORY_MB=256`, `SCRIPT_CPU_SEC=10`, `SCRIPT_MAX_CHARS=20000`, and `SCRIPT_NETWORK_ENABLED=0` by default. Scripts never run inside the control-bot process, so a crash/fork-bomb cannot kill the bot.
+
+### Top 5 common errors / fixes
+| Error | Fix |
+|---|---|
+| No alts configured | `/alt action:add` with a valid alt user token. |
+| Channel IDs return 404 | `/channels alt:1 action:replace` or `/channels alt:1 action:overwrite channel_id:<new ids>`. |
+| Alt shows `⚫ offline` | `/status`, `/alt action:selfcheck alt:1`, then `/alt action:runs alt:1`. The 5-min health monitor probes stale alts automatically. |
+| Workflow never starts | Check `GH_TOKEN` scopes, `ALT_REPOS` mapping, and that `send_ads.yml` exists on `main`; `/canary` probes GitHub + Gist. |
+| Runner stuck / need to stop | `/stop alt:1`, or `/shutdown confirmation:SHUTDOWN` for the whole fleet. |
+
+The complete living bug/risk registry is in **[`BUG_TRACKER.md`](./BUG_TRACKER.md)**.
+
+
+---
+
+## 10. 2026-09-03 Audit & Polishing Update (PMTP Phases 1–3)
+
+- **23** registered slash commands inventoried and documented (was 22; `/autorescan` added).
+- `/run` asks only for a **raw message/question** — no item word, price, or RAP — and applies emoji/alteration
+  modifiers automatically. Squad targets run in sequence with a 200–500 ms random pause.
+- Log format standardized with a UTC timestamp, a severity tag (`[CONTROL]`, `[ALT-ADD] PASS/FAIL`), and a
+  consistent per-alt prefix (`[ALT-1]` … `[ALT-4]`).
+- `/channels <alt> <id1,id2,…>` **overwrites** the table; every add/remove/overwrite/refresh is logged with the
+  alt name, a UTC timestamp, and the affected channel IDs.
+- `/autorescan` (and every control-bot startup/reconnect) diffs live Discord channels against the persisted
+  registry, auto-adds new channels, removes gone ones, and logs the exact change list — zero-touch for the operator.
+- `/script simulate` returns **unfiltered** stdout/stderr/errors with real character counts, a **Sandbox Policy**
+  field, and every non-empty stream attached as a file; `/script run` executes in the same sandbox without a
+  second approval click.
+- No item name is hardcoded: `DEFAULT_ITEM_NAME`, `DEFAULT_ITEM_KEYWORDS`, and `DEAL_ITEM_KEYWORDS` ship as
+  neutral values (`item`, `item,stock,goods,assets`).
+- `FUNCTION_AUDIT_LOG.md` completes the ten-pass audit for all **522** functions (`F-001` … `F-522`) across 13
+  production modules. It is generated, not hand-written:
+  `python tools/function_audit.py` regenerates it and `python tools/function_audit.py --check` is a CI gate.
+  Zero Fail verdicts remain; every residual risk is recorded as a reviewed acceptance with its rationale in
+  `BUG_TRACKER.md` § Phase 3.
+- Verification: `python -m pytest -q tests` → 93 passed; `python self_test_all.py` → `RESULT: PASS`.
+- `BUG_TRACKER.md` updated with Phase 2 tweaks and Phase 3 findings (squad lock, diagnose quota, provision rollback risks documented with workarounds).
+- Phase 2 tweaks: error clarity improved, `/run` speed optimized (redundant 1s sleep removed), dead code checked, UX truncation safe.

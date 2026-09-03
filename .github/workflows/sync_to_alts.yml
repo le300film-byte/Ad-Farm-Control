@@ -23,6 +23,7 @@ on:
     branches: [main]
     paths:
       - "send_ads.py"
+      - "control_bot/persistence.py"
       - ".github/workflows/send_ads.yml"
       - ".github/workflows/sync_to_alts.yml"
       - ".github/workflows/self_check.yml"
@@ -75,7 +76,7 @@ jobs:
           ALT_REPOS = os.environ.get("ALT_REPOS", "").strip()
           OWNER = os.environ.get("GITHUB_OWNER", "").strip()
 
-          FILES = ["send_ads.py", ".github/workflows/send_ads.yml", ".github/workflows/self_check.yml"]
+          FILES = ["send_ads.py", "control_bot/__init__.py", "control_bot/persistence.py", ".github/workflows/send_ads.yml", ".github/workflows/self_check.yml"]
           COMMIT_MSG = MANUAL or SOURCE_MSG or f"sync: push updates from core ({SHA[:8]})"
 
           repos_csv = OVERRIDE if OVERRIDE else ALT_REPOS

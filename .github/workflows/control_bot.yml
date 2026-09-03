@@ -130,15 +130,32 @@ jobs:
           CMD_COOLDOWN_SEC: ${{ secrets.CMD_COOLDOWN_SEC }}
           CONTROL_HTTP_TIMEOUT: ${{ secrets.CONTROL_HTTP_TIMEOUT }}
           LOG_LEVEL: ${{ secrets.LOG_LEVEL }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          CONTINUOUS_MODE: "1"
+          SHUTDOWN_FLAG_FILE: /tmp/adfarm-shutdown.flag
+          HEALTH_CHECK_INTERVAL_SEC: ${{ secrets.HEALTH_CHECK_INTERVAL_SEC || '300' }}
           PYTHONUNBUFFERED: "1"
         working-directory: ${{ github.workspace }}
         run: |
           echo "🤖 Starting V6 control bot chunk ${{ matrix.chunk }} at $(date -u +%H:%M:%SZ)..."
+          CHUNK_MINUTES="${{ needs.plan.outputs.chunk_minutes }}"
+          LOOP_END=$(( $(date +%s) + CHUNK_MINUTES * 60 ))
           set +e
-          timeout --signal=TERM --kill-after=30s "${{ needs.plan.outputs.chunk_minutes }}m" python -m control_bot
-          rc=$?
+          while [ "$(date +%s)" -lt "$LOOP_END" ]; do
+            if [ -f "$SHUTDOWN_FLAG_FILE" ]; then
+              echo "🛑 Shutdown flag present; ending control bot loop."
+              break
+            fi
+            REMAINING_SEC=$(( LOOP_END - $(date +%s) ))
+            echo "🤖 Starting control bot process at $(date -u +%H:%M:%SZ) (${REMAINING_SEC}s remaining)..."
+            timeout --signal=TERM --kill-after=30s "${REMAINING_SEC}s" python -m control_bot
+            rc=$?
+            # timeout returns 124 when the planned chunk completed; treat that
+            # as normal so the next sequential matrix chunk can take over.
+            if [ "$rc" = "124" ]; then break; fi
+            if [ "$rc" = "0" ]; then break; fi
+            echo "⚠️ Control bot exited with code $rc; restarting automatically in 20s..."
+            sleep 20
+          done
           set -e
-          # timeout returns 124 when the planned chunk completed; treat that
-          # as normal so the next sequential matrix chunk can take over.
-          [[ "$rc" == "124" || "$rc" == "0" ]] || exit "$rc"
           sleep 20

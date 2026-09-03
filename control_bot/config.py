@@ -101,6 +101,7 @@ CORE_REPO = _env("CORE_REPO") or os.environ.get("GITHUB_REPOSITORY", "").strip()
 # member of the control-bot server. The bot writes one targeted file per alt;
 # the alt polls it with its already-configured GIST_TOKEN.
 CONTROL_GIST_ID = _env("CONTROL_GIST_ID")
+CHANNEL_STATE_GIST_ID = _env("CHANNEL_STATE_GIST_ID") or CONTROL_GIST_ID
 CONTROL_HTTP_TIMEOUT = _int("CONTROL_HTTP_TIMEOUT", 20)
 
 # Alt -> repo mapping. The bootstrap writes the unambiguous form:
@@ -147,6 +148,59 @@ CONFIGURED_ALT_IDS = tuple(sorted(set(ALT_REPOS) | set(ALT_DISCORD_IDS)))
 DASHBOARD_REFRESH_SEC = _int("DASHBOARD_REFRESH_SEC", 300)
 OFFLINE_AFTER_SEC = _int("OFFLINE_AFTER_SEC", 900)
 DASHBOARD_MSG_ID_FILE = _env("DASHBOARD_MSG_ID_FILE", "dash_msg_id.txt")
+# JSON files are safe defaults for local development and ephemeral CI; set
+# these to a mounted/shared path when the control bot must survive workers.
+CONTROL_STATE_FILE = _env("CONTROL_STATE_FILE", ".adfarm_control_state.json")
+CHANNEL_STATE_FILE = _env("CHANNEL_STATE_FILE", ".adfarm_channel_registry.json")
+
+# ---------- Configurable market item / deal keywords ----------
+# Defaults are intentionally generic. An installation may configure any asset,
+# game, or service through secrets without changing code.
+DEFAULT_ITEM_NAME = _env("DEFAULT_ITEM_NAME", "item")
+DEFAULT_ITEM_KEYWORDS = [
+    x.strip() for x in _env("DEFAULT_ITEM_KEYWORDS", "item,stock,goods,assets").split(",") if x.strip()
+]
+# Accept DEAL_ITEM_KEYWORDS as an explicit per-alt override too.
+DEFAULT_DEAL_KEYWORDS = [
+    x.strip() for x in _env("DEAL_ITEM_KEYWORDS", "item,stock,goods,assets").split(",") if x.strip()
+]
+
+# ---------- Run preview / confirmation ----------
+RUN_PREVIEW_REQUIRED = _env("RUN_PREVIEW_REQUIRED", "1").lower() in {"1", "true", "yes", "on"}
+
+# ---------- Squad / fleet batching ----------
+# A squad run posts through every member in sequence. The per-alt offset keeps
+# two runners from emitting in the same millisecond, which is what triggers
+# Discord's shared rate-limit bucket, while staying invisible to observers.
+SQUAD_POST_SPACING_MIN_MS = _int("SQUAD_POST_SPACING_MIN_MS", 200)
+SQUAD_POST_SPACING_MAX_MS = _int("SQUAD_POST_SPACING_MAX_MS", 500)
+# Control-plane commands (pause/policy/price) use a wider human-range offset
+# because they are not part of a single visible posting burst.
+SQUAD_CONTROL_SPACING_MIN_MS = _int("SQUAD_CONTROL_SPACING_MIN_MS", 250)
+SQUAD_CONTROL_SPACING_MAX_MS = _int("SQUAD_CONTROL_SPACING_MAX_MS", 1250)
+# Maximum number of concurrently registered alts. Discord-facing automation is
+# intentionally capped so a misconfigured fleet cannot scale without review.
+ALT_SLOT_LIMIT = _int("ALT_SLOT_LIMIT", 4)
+MAX_CHANNELS_PER_ALT = _int("MAX_CHANNELS_PER_ALT", 100)
+
+# ---------- Scripting sandbox ----------
+SCRIPT_TIMEOUT_SEC = _int("SCRIPT_TIMEOUT_SEC", 20)
+SCRIPT_MEMORY_MB = _int("SCRIPT_MEMORY_MB", 256)
+SCRIPT_CPU_SEC = _int("SCRIPT_CPU_SEC", 10)
+SCRIPT_MAX_CHARS = _int("SCRIPT_MAX_CHARS", 20000)
+SCRIPT_NETWORK_ENABLED = _env("SCRIPT_NETWORK_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+
+# ---------- Continuous / shutdown ----------
+CONTINUOUS_MODE = _env("CONTINUOUS_MODE", "1").lower() in {"1", "true", "yes", "on"}
+SHUTDOWN_FLAG_FILE = _env("SHUTDOWN_FLAG_FILE", "/tmp/adfarm-shutdown.flag")
+SHUTDOWN_GRACE_SEC = _int("SHUTDOWN_GRACE_SEC", 30)
+
+# ---------- Health monitor ----------
+HEALTH_CHECK_INTERVAL_SEC = _int("HEALTH_CHECK_INTERVAL_SEC", 300)
+HEALTH_RECOVERY_RETRY_SEC = _int("HEALTH_RECOVERY_RETRY_SEC", 60)
+
+# ---------- Log rotation ----------
+LOG_ROTATION_MAX_ENTRIES = _int("LOG_ROTATION_MAX_ENTRIES", 500)
 
 # ---------- Runtime ----------
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")

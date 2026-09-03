@@ -9,7 +9,9 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
+
+from .persistence import JsonStateStore
 
 
 @dataclass
@@ -62,9 +64,15 @@ class AltStateManager:
     """Thread-safe collection of live state for known alts."""
 
     def __init__(self, alt_names: dict[int, str], alt_ids=None,
-                 offline_after_sec: float = 300):
+                 offline_after_sec: float = 300, max_log_entries: int = 500,
+                 persistence_path: str | None = None):
         self._lock = threading.RLock()
         self._offline_after_sec = offline_after_sec
+        self._max_log_entries = max(50, int(max_log_entries or 500))
+        self._persistence_store = (
+            JsonStateStore(persistence_path, {"version": 1, "alts": {}})
+            if persistence_path else None
+        )
         configured = set(alt_ids) if alt_ids is not None else set(alt_names)
         self._alts: dict[int, AltState] = {
             idx: AltState(idx, alt_names.get(idx, f"Alt {idx}"))
@@ -73,6 +81,106 @@ class AltStateManager:
         self._log_buffer: dict[int, list[tuple[float, str, int, str]]] = {
             idx: [] for idx in self._alts
         }
+        self._load_persistent_configuration()
+
+    def _load_persistent_configuration(self) -> None:
+        """Hydrate safe operator configuration without resurrecting unknown alts."""
+        if not self._persistence_store:
+            return
+        data = self._persistence_store.load()
+        raw_alts = data.get("alts") if isinstance(data, dict) else None
+        if not isinstance(raw_alts, dict):
+            return
+        with self._lock:
+            for raw_id, raw in raw_alts.items():
+                try:
+                    alt_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                alt = self._alts.get(alt_id)
+                if not alt or not isinstance(raw, dict):
+                    continue
+                if isinstance(raw.get("name"), str) and raw["name"].strip():
+                    alt.name = raw["name"].strip()[:80]
+                for field_name in ("squad", "policy_template", "message_preview", "ad_type"):
+                    value = raw.get(field_name)
+                    if isinstance(value, str):
+                        setattr(alt, field_name, value[:120])
+                if raw.get("policy_template") not in {"stealth", "aggressive", "peak_hour", "balanced"}:
+                    alt.policy_template = "balanced"
+                if alt.ad_type not in {"sell", "buy"}:
+                    alt.ad_type = ""
+                try:
+                    rate = float(raw.get("rate"))
+                    if math.isfinite(rate) and 0 < rate <= 20:
+                        alt.rate = rate
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                for field_name, valid in (("interval_min", {3, 5}), ("runtime_hours", {0, 6, 12, 18, 24, 48})):
+                    try:
+                        value = int(raw.get(field_name))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if value in valid:
+                        setattr(alt, field_name, value)
+                channels = raw.get("channels")
+                if isinstance(channels, dict):
+                    alt.channels = {
+                        str(cid): dict(record)
+                        for cid, record in list(channels.items())[:100]
+                        if str(cid).isdigit() and isinstance(record, dict)
+                    }
+                    alt.total_channels = len(alt.channels)
+                tags = raw.get("tags")
+                if isinstance(tags, list):
+                    alt.tags = [str(tag).strip()[:30] for tag in tags[:10] if str(tag).strip()]
+                keywords = raw.get("deal_keywords")
+                if isinstance(keywords, list):
+                    alt.deal_keywords = [str(item).strip()[:60] for item in keywords[:20] if str(item).strip()]
+                if isinstance(raw.get("deal_scan_enabled"), bool):
+                    alt.deal_scan_enabled = raw["deal_scan_enabled"]
+                try:
+                    delta = float(raw.get("deal_alert_delta"))
+                    if math.isfinite(delta) and 0 <= delta <= 5:
+                        alt.deal_alert_delta = delta
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
+    def _persistent_snapshot_locked(self) -> dict[str, Any]:
+        """Return the non-secret, restart-safe portion of the current state."""
+        return {
+            "version": 1,
+            "updated_at": time.time(),
+            "alts": {
+                str(alt_id): {
+                    "alt_id": alt.alt_id,
+                    "name": alt.name,
+                    "ad_type": alt.ad_type,
+                    "rate": alt.rate,
+                    "message_preview": alt.message_preview,
+                    "interval_min": alt.interval_min,
+                    "runtime_hours": alt.runtime_hours,
+                    "channels": alt.channels,
+                    "deal_keywords": alt.deal_keywords,
+                    "deal_scan_enabled": alt.deal_scan_enabled,
+                    "deal_alert_delta": alt.deal_alert_delta,
+                    "squad": alt.squad,
+                    "tags": alt.tags,
+                    "policy_template": alt.policy_template,
+                }
+                for alt_id, alt in self._alts.items()
+            },
+        }
+
+    def _persist_locked(self) -> bool:
+        if not self._persistence_store:
+            return True
+        return self._persistence_store.save(self._persistent_snapshot_locked())
+
+    def persist(self) -> bool:
+        """Persist current safe configuration; transient heartbeats are excluded."""
+        with self._lock:
+            return self._persist_locked()
 
     @property
     def alt_ids(self) -> list[int]:
@@ -95,6 +203,10 @@ class AltStateManager:
                 return False
             self._alts[alt_id] = AltState(alt_id, str(name).strip()[:80] or f"Alt {alt_id}")
             self._log_buffer[alt_id] = []
+            if not self._persist_locked():
+                self._alts.pop(alt_id, None)
+                self._log_buffer.pop(alt_id, None)
+                return False
             return True
 
     def update_identity(self, alt_id: int, *, name: str | None = None) -> bool:
@@ -102,8 +214,12 @@ class AltStateManager:
             alt = self._alts.get(alt_id)
             if not alt:
                 return False
+            old_name = alt.name
             if name is not None and str(name).strip():
                 alt.name = str(name).strip()[:80]
+            if not self._persist_locked():
+                alt.name = old_name
+                return False
             return True
 
     def remove_alt(self, alt_id: int) -> bool:
@@ -111,8 +227,12 @@ class AltStateManager:
         with self._lock:
             if alt_id not in self._alts:
                 return False
-            self._alts.pop(alt_id, None)
-            self._log_buffer.pop(alt_id, None)
+            removed = self._alts.pop(alt_id, None)
+            removed_logs = self._log_buffer.pop(alt_id, [])
+            if not self._persist_locked():
+                self._alts[alt_id] = removed
+                self._log_buffer[alt_id] = removed_logs
+                return False
             return True
 
     def is_online(self, alt_id: int) -> bool:
@@ -171,7 +291,7 @@ class AltStateManager:
                     value = self._int_value(payload[field_name], getattr(alt, field_name))
                     if field_name == "interval_min" and value in {3, 5}:
                         alt.interval_min = value
-                    elif field_name == "runtime_hours" and value in {6, 12, 18, 24, 48}:
+                    elif field_name == "runtime_hours" and (value == 0 or value in {6, 12, 18, 24, 48}):
                         alt.runtime_hours = value
             if isinstance(payload.get("policy_template"), str) and payload["policy_template"] in {"stealth", "aggressive", "peak_hour", "balanced"}:
                 alt.policy_template = payload["policy_template"]
@@ -220,6 +340,10 @@ class AltStateManager:
                     str(key)[:40]: self._int_value(value)
                     for key, value in list(payload["log_counts"].items())[:30]
                 }
+            # Heartbeats may carry refreshed channel metadata or runtime
+            # configuration. Persist the safe subset so a reconnect cannot
+            # discard the latest known target table.
+            self._persist_locked()
 
     def mark_offline_stale(self, offline_after_sec: float | None = None) -> None:
         threshold = self._offline_after_sec if offline_after_sec is None else offline_after_sec
@@ -249,6 +373,7 @@ class AltStateManager:
             elif status == "queued":
                 if not alt.online and alt.status in {"offline", "stopped", "error", ""}:
                     alt.status = "queued"
+            self._persist_locked()
 
     def set_dm_ack(self, alt_id: int, text: str) -> None:
         with self._lock:
@@ -277,14 +402,16 @@ class AltStateManager:
             if effective_interval in {3, 5}:
                 alt.interval_min = int(effective_interval)
             effective_runtime = runtime_hours if runtime_hours is not None else runtime
-            if effective_runtime in {6, 12, 18, 24, 48}:
+            if effective_runtime == 0 or effective_runtime in {6, 12, 18, 24, 48}:
                 alt.runtime_hours = int(effective_runtime)
+            self._persist_locked()
 
     def set_deal_keywords(self, alt_id: int, keywords: list[str]) -> None:
         with self._lock:
             alt = self._alts.get(alt_id)
             if alt:
                 alt.deal_keywords = [str(item).strip()[:60] for item in keywords[:20] if str(item).strip()]
+                self._persist_locked()
 
     def set_deal_config(self, alt_id: int, *, enabled=None, delta=None) -> None:
         with self._lock:
@@ -300,6 +427,7 @@ class AltStateManager:
                         alt.deal_alert_delta = value
                 except (TypeError, ValueError, OverflowError):
                     pass
+            self._persist_locked()
 
     def set_error(self, alt_id: int, text: str) -> None:
         with self._lock:
@@ -307,6 +435,22 @@ class AltStateManager:
             if alt:
                 alt.last_error = str(text)[:300]
                 alt.status = "error"
+                self._persist_locked()
+
+    def set_control_status(self, alt_id: int, status: str) -> bool:
+        """Persist a local control-plane status while awaiting the next heartbeat."""
+        allowed = {"active", "paused", "stopped", "starting", "queued", "offline", "error", "caution", "ip_pause", "afk"}
+        clean = str(status or "").strip().lower()
+        if clean not in allowed:
+            return False
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return False
+            alt.status = clean
+            alt.online = clean not in {"offline", "stopped"}
+            self._persist_locked()
+            return True
 
     def record_deal(self, alt_id: int, text: str = "") -> None:
         """Record a deal when a caller has no heartbeat counter available."""
@@ -329,13 +473,19 @@ class AltStateManager:
             cid = str(channel_id).strip()
             if not alt or not cid.isdigit():
                 return
+            old_channels = {key: dict(value) if isinstance(value, dict) else value for key, value in alt.channels.items()}
+            old_total = alt.total_channels
             record = alt.channels.setdefault(cid, {})
             if name:
                 record["name"] = str(name)[:80]
             record.setdefault("sent", 0)
             record.setdefault("errors", 0)
             record.setdefault("last_post", 0)
-            alt.total_channels = max(alt.total_channels, len(alt.channels))
+            record.setdefault("alive", True)
+            alt.total_channels = len(alt.channels)
+            if not self._persist_locked():
+                alt.channels = old_channels
+                alt.total_channels = old_total
 
     def replace_channel(self, alt_id: int, old_id: str, new_id: str, name: str = "") -> None:
         with self._lock:
@@ -343,10 +493,46 @@ class AltStateManager:
             old, new = str(old_id).strip(), str(new_id).strip()
             if not alt or not new.isdigit():
                 return
+            old_channels = {key: dict(value) if isinstance(value, dict) else value for key, value in alt.channels.items()}
+            old_total = alt.total_channels
             record = alt.channels.pop(old, {})
             if name:
                 record["name"] = str(name)[:80]
             alt.channels[new] = record
+            alt.total_channels = len(alt.channels)
+            if not self._persist_locked():
+                alt.channels = old_channels
+                alt.total_channels = old_total
+
+    def replace_channels(self, alt_id: int, channel_ids: list[str], names: dict[str, str] | None = None) -> bool:
+        """Atomically replace one alt's target table and persist it."""
+        with self._lock:
+            alt = self._alts.get(alt_id)
+            if not alt:
+                return False
+            old = alt.channels
+            replacement: dict[str, dict] = {}
+            for raw_id in channel_ids[:100]:
+                cid = str(raw_id).strip()
+                if not cid.isdigit():
+                    continue
+                record = dict(old.get(cid, {})) if isinstance(old.get(cid), dict) else {}
+                if names and names.get(cid):
+                    record["name"] = str(names[cid])[:80]
+                record.setdefault("sent", 0)
+                record.setdefault("errors", 0)
+                record.setdefault("last_post", 0)
+                record.setdefault("alive", True)
+                replacement[cid] = record
+            old_channels = alt.channels
+            old_total = alt.total_channels
+            alt.channels = replacement
+            alt.total_channels = len(replacement)
+            if not self._persist_locked():
+                alt.channels = old_channels
+                alt.total_channels = old_total
+                return False
+            return True
 
     def append_log(self, alt_id: int, text: str, emoji: str = "•",
                    color: int = 0x2F3136, kind: str = "INFO") -> None:
@@ -359,8 +545,10 @@ class AltStateManager:
             body = f"[{category}] {str(text)[:500]}"
             buf = self._log_buffer.setdefault(alt_id, [])
             buf.append((time.time(), emoji, color, body))
-            if len(buf) > 500:
-                del buf[:-500]
+            # Rotate the in-memory log buffer so long-lived limitless runs
+            # never grow without bound. The cap is configurable (default 500).
+            if len(buf) > self._max_log_entries:
+                del buf[:-self._max_log_entries]
 
     def recent_logs(self, alt_id: int, limit: int = 20, kind: str | None = None) -> list[tuple[float, str, int, str]]:
         with self._lock:
@@ -396,6 +584,7 @@ class AltStateManager:
                     ch["alive"] = True
             alt.warnings = [w for w in alt.warnings if "caution" not in str(w).lower() and "strike" not in str(w).lower()]
             alt.last_error = ""
+            self._persist_locked()
             return True
 
     def get_health_index(self, alt_id: int) -> int:
@@ -501,6 +690,7 @@ class AltStateManager:
                 return False
             alt.squad = str(squad or "").strip()[:50]
             self.record_causal_event(alt_id, "squad_assigned", f"Assigned to squad '{alt.squad or 'None'}'")
+            self._persist_locked()
             return True
 
     def set_tags(self, alt_id: int, tags: list[str]) -> bool:
@@ -509,6 +699,7 @@ class AltStateManager:
             if not alt:
                 return False
             alt.tags = [str(t).strip()[:30] for t in tags if str(t).strip()][:10]
+            self._persist_locked()
             return True
 
     def get_squad_members(self, squad: str) -> list[AltState]:
@@ -540,6 +731,7 @@ class AltStateManager:
             elif t_clean == "balanced":
                 alt.interval_min = 5
             self.record_causal_event(alt_id, "policy_applied", f"Applied policy template '{t_clean}'")
+            self._persist_locked()
             return True
 
     def get_hourly_heatmap(self, alt_id: int) -> str:
