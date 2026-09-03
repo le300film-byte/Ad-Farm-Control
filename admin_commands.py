@@ -394,6 +394,51 @@ class AdminCog(commands.Cog):
         )
 
     # /admin activate-template — one-click activation pre-filled from ticket (1.1)
+    # /admin ticket-panel — post the ticket button in #open-ticket
+    @admin_group.command(
+        name="ticket-panel",
+        description="Post the 🎫 Open Ticket button in #open-ticket.",
+    )
+    @app_commands.describe(channel="Target channel (default: OPEN_TICKET_CH_ID)")
+    async def admin_ticket_panel(
+        self, inter: discord.Interaction, channel: Optional[discord.TextChannel] = None
+    ) -> None:
+        if not await check_admin(inter):
+            return
+        import os as _os
+        ch = channel
+        if ch is None:
+            ch_id = _os.environ.get("OPEN_TICKET_CH_ID", "")
+            if ch_id:
+                ch = self.bot.get_channel(int(ch_id))
+                if ch is None:
+                    try:
+                        ch = await self.bot.fetch_channel(int(ch_id))
+                    except Exception:
+                        ch = None
+        if ch is None:
+            await inter.response.send_message(
+                "❌ No target channel. Pass `channel:` or set OPEN_TICKET_CH_ID.",
+                ephemeral=True,
+            )
+            return
+        from control_bot.tickets import TicketPanelView
+        embed = discord.Embed(
+            title="🎫 Need Help? Open a Ticket!",
+            description=(
+                "Click the button below to open a support ticket.\n\n"
+                "**💰 Payment** — subscription, pricing, activation\n"
+                "**🐛 Bug Report** — something is broken\n"
+                "**💡 Suggestion** — feature request or idea\n\n"
+                "A private thread will be created where you can talk directly to the team."
+            ),
+            color=0x5865F2,
+        )
+        await ch.send(embed=embed, view=TicketPanelView())
+        await inter.response.send_message(
+            f"✅ Ticket panel posted in {ch.mention}", ephemeral=True
+        )
+
     @admin_group.command(
         name="activate-template",
         description="Generate a pre-filled /admin activate command from a customer ticket.",

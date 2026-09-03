@@ -186,6 +186,10 @@ async def on_ready():
         print("⚠️  GUILD_ID not set — commands will be registered globally (up to 1h delay).")
         # Global sync
         await bot.tree.sync()
+        
+        # Register persistent ticket panel view
+        from control_bot.tickets import TicketPanelView
+        bot.add_view(TicketPanelView())
     else:
         guild = bot.get_guild(config.GUILD_ID)
         if guild:
@@ -195,6 +199,10 @@ async def on_ready():
         else:
             print(f"⚠️  GUILD_ID={config.GUILD_ID} but bot isn't in that guild; using global sync.")
             await bot.tree.sync()
+            
+            # Register persistent ticket panel view
+            from control_bot.tickets import TicketPanelView
+            bot.add_view(TicketPanelView())
     # Start background tasks once; Discord can emit on_ready again after a
     # reconnect, and starting an already-running loop raises RuntimeError.
     if not refresh_dashboard.is_running():
@@ -250,6 +258,10 @@ async def on_ready():
                     await bot.tree.sync(guild=guild)
             else:
                 await bot.tree.sync()
+                
+            # Register persistent ticket panel view
+            from control_bot.tickets import TicketPanelView
+            bot.add_view(TicketPanelView())
         except Exception as _e:
             print(f"[V8] Post-cog sync warning: {_e}")
 
@@ -3917,6 +3929,18 @@ async def cmd_renew(inter: discord.Interaction) -> None:
                 f"Admin: verify payment and run `/admin extend user:@{inter.user.display_name} days:30`.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+        # Also notify admins in #admin-alerts
+        alert_ch_id = _os.environ.get("ADMIN_ALERTS_CH_ID", "")
+        if alert_ch_id:
+            try:
+                alert_ch = bot.get_channel(int(alert_ch_id)) or await bot.fetch_channel(int(alert_ch_id))
+                await alert_ch.send(
+                    f"🎫 **New ticket:** 🔄 Renewal from `{inter.user.display_name}` (`{uid}`){days}\n"
+                    f"Check <#{ticket_ch}> for details.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception:
+                pass
         await inter.response.send_message(
             "✅ Your renewal ticket was opened. An admin will confirm shortly "
             "(best-effort — no SLA).", ephemeral=True,
@@ -3946,6 +3970,18 @@ async def cmd_pause_billing(inter: discord.Interaction) -> None:
             await ch.send(
                 f"⏸️ **Pause-billing request** — customer `{uid}` (`{inter.user.display_name}`). "
                 "Expected admin action: extend subscription by the paused days.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
+    # Also notify admins in #admin-alerts
+    alert_ch_id = _os.environ.get("ADMIN_ALERTS_CH_ID", "")
+    if alert_ch_id:
+        try:
+            alert_ch = bot.get_channel(int(alert_ch_id)) or await bot.fetch_channel(int(alert_ch_id))
+            await alert_ch.send(
+                f"🎫 **New ticket:** ⏸️ Pause-billing from `{inter.user.display_name}` (`{uid}`)\n"
+                f"Check <#{ticket_ch}> for details.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except Exception:

@@ -86,6 +86,7 @@ def _gh_headers(token: str) -> dict[str, str]:
 def _discord_headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bot {token}",
+        "User-Agent": "DiscordBot (https://github.com/adfarm, 8.0)",
         "Content-Type": "application/json",
     }
 
@@ -359,23 +360,218 @@ def verify_discord_bot(token: str, guild_id: str) -> dict[str, Any]:
 # ─── Phase 3: Create Discord Channels ──────────────────────────────────────
 
 
+def _find_or_create_admin_role(headers: dict, guild_id: str) -> Optional[str]:
+    """Find or create an Admin role with administrator permissions."""
+    # Check if Admin role already exists
+    roles = _req("GET", f"{DISCORD_API}/guilds/{guild_id}/roles", headers)
+    if roles:
+        for role in roles:
+            if role.get("name", "").lower() == "admin":
+                _ok(f"Using existing Admin role")
+                return str(role["id"])
+    
+    # Create Admin role with administrator permission
+    # Administrator permission = 0x8 (bit 3)
+    resp = _req(
+        "POST",
+        f"{DISCORD_API}/guilds/{guild_id}/roles",
+        headers,
+        body={
+            "name": "Admin",
+            "permissions": "8",  # Administrator
+            "color": 15158332,  # Red
+            "hoist": True,  # Display separately in member list
+            "mentionable": True,
+        },
+    )
+    if resp and resp.get("id"):
+        _ok(f"Created Admin role")
+        return str(resp["id"])
+    _warn("Could not create Admin role (bot needs 'Manage Roles' permission)")
+    _warn("Fix: Server Settings → Roles → give bot's role 'Manage Roles' permission")
+    _warn("Then rerun setup.py, or create 'Admin' role manually in Discord")
+    return None
+
+
+def _create_text_channel_with_perms(
+    headers: dict,
+    guild_id: str,
+    name: str,
+    topic: str,
+    admin_role_id: Optional[str] = None,
+    bot_id: Optional[str] = None,
+) -> Optional[str]:
+    """Create a text channel with permission overwrites (admin-only)."""
+    overwrites = []
+    
+    # Deny @everyone from viewing (VIEW_CHANNEL = 0x400)
+    overwrites.append({
+        "id": guild_id,  # @everyone role has same ID as guild
+        "type": 0,  # role
+        "deny": "1024",  # VIEW_CHANNEL
+    })
+    
+    # Allow Admin role to view and manage
+    if admin_role_id:
+        overwrites.append({
+            "id": admin_role_id,
+            "type": 0,  # role
+            "allow": "1024",  # VIEW_CHANNEL
+        })
+    
+    # Allow bot to view and manage
+    if bot_id:
+        overwrites.append({
+            "id": bot_id,
+            "type": 1,  # member
+            "allow": "1024",  # VIEW_CHANNEL
+        })
+    
+    resp = _req(
+        "POST",
+        f"{DISCORD_API}/guilds/{guild_id}/channels",
+        headers,
+        body={
+            "name": name,
+            "type": 0,
+            "topic": topic,
+            "permission_overwrites": overwrites,
+        },
+    )
+    if resp and resp.get("id"):
+        return str(resp["id"])
+    return None
+
+
+def _create_readonly_channel(
+    headers: dict,
+    guild_id: str,
+    name: str,
+    topic: str,
+    admin_role_id: Optional[str] = None,
+    bot_id: Optional[str] = None,
+) -> Optional[str]:
+    """Create a channel that @everyone can SEE but NOT type in.
+    
+    Customers read the policy card here but submit tickets via slash commands.
+    Only admins and the bot can send messages.
+    """
+    overwrites = []
+    
+    # @everyone: can VIEW but NOT send messages
+    # VIEW_CHANNEL = 1024 (0x400), SEND_MESSAGES = 2048 (0x800)
+    overwrites.append({
+        "id": guild_id,
+        "type": 0,
+        "allow": "1024",   # VIEW_CHANNEL
+        "deny": "2048",    # SEND_MESSAGES
+    })
+    
+    # Admin role: full access
+    if admin_role_id:
+        overwrites.append({
+            "id": admin_role_id,
+            "type": 0,
+            "allow": "3072",  # VIEW_CHANNEL + SEND_MESSAGES
+        })
+    
+    # Bot: full access
+    if bot_id:
+        overwrites.append({
+            "id": bot_id,
+            "type": 1,
+            "allow": "3072",  # VIEW_CHANNEL + SEND_MESSAGES
+        })
+    
+    resp = _req(
+        "POST",
+        f"{DISCORD_API}/guilds/{guild_id}/channels",
+        headers,
+        body={
+            "name": name,
+            "type": 0,
+            "topic": topic,
+            "permission_overwrites": overwrites,
+        },
+    )
+    if resp and resp.get("id"):
+        return str(resp["id"])
+    return None
+
+
 def create_discord_structure(
     bot_token: str, guild_id: str, owner_ids: str
 ) -> dict[str, str]:
-    """Create all required channels and the Customer Hub category."""
+    """Create all required channels and the Customer Hub category with proper permissions."""
     headers = _discord_headers(bot_token)
     channels: dict[str, str] = {}
 
-    # Staff channels to create
-    staff_channels = {
+    # Find or create Admin role
+    admin_role_id = _find_or_create_admin_role(headers, guild_id)
+    
+    # Get bot's role/member ID for permission overwrites
+    bot_info = _req("GET", f"{DISCORD_API}/users/@me", headers)
+    bot_id = bot_info.get("id") if bot_info else None
+    
+    # Auto-assign Admin role to all owner IDs
+    if admin_role_id and owner_ids:
+        for uid in owner_ids.split(","):
+            uid = uid.strip()
+            if not uid:
+                continue
+            try:
+                # Get current member roles
+                member = _req("GET", f"{DISCORD_API}/guilds/{guild_id}/members/{uid}", headers)
+                if member:
+                    current_roles = member.get("roles", [])
+                    if admin_role_id not in current_roles:
+                        current_roles.append(admin_role_id)
+                        _req(
+                            "PATCH",
+                            f"{DISCORD_API}/guilds/{guild_id}/members/{uid}",
+                            headers,
+                            body={"roles": current_roles},
+                            ok_statuses=(200, 204),
+                        )
+                        _ok(f"Assigned Admin role to {uid}")
+                    else:
+                        _ok(f"{uid} already has Admin role")
+                else:
+                    _warn(f"Could not find member {uid} in server (are they in the server?)")
+            except Exception as exc:
+                _warn(f"Could not assign Admin role to {uid}: {exc}")
+
+    # Admin-only channels (hidden from @everyone, visible to Admin role + bot)
+    admin_channels = {
         "admin-alerts": "🚨 Critical system alerts (bot down, token expired, etc.)",
         "admin-chat": "💬 Founder coordination and daily discussion",
         "audit-logs": "📋 All admin actions are logged here",
-        "open-ticket": "🎫 Customer onboarding tickets + pinned policy card",
+    }
+
+    # Public channels (visible to everyone, fully open)
+    public_channels = {
         "announcements": "📢 Public announcements and commitment channel",
     }
 
-    for name, topic in staff_channels.items():
+    # Create admin channels with restricted permissions
+    for name, topic in admin_channels.items():
+        existing = _find_channel_by_name(headers, guild_id, name)
+        if existing:
+            channels[name.replace("-", "_") + "_ch_id"] = existing
+            _ok(f"#{name} already exists")
+        else:
+            ch = _create_text_channel_with_perms(
+                headers, guild_id, name, topic,
+                admin_role_id=admin_role_id, bot_id=bot_id
+            )
+            if ch:
+                channels[name.replace("-", "_") + "_ch_id"] = ch
+                _ok(f"Created #{name} (admin-only)")
+            else:
+                _warn(f"Could not create #{name}")
+
+    # Create public channels (no restrictions)
+    for name, topic in public_channels.items():
         existing = _find_channel_by_name(headers, guild_id, name)
         if existing:
             channels[name.replace("-", "_") + "_ch_id"] = existing
@@ -388,7 +584,25 @@ def create_discord_structure(
             else:
                 _warn(f"Could not create #{name}")
 
-    # Create Customer Hub category
+    # Create #open-ticket with READ-ONLY for @everyone
+    # Customers can SEE the policy card but can't TYPE — they use slash commands instead
+    existing = _find_channel_by_name(headers, guild_id, "open-ticket")
+    if existing:
+        channels["open_ticket_ch_id"] = existing
+        _ok("#open-ticket already exists")
+    else:
+        ch = _create_readonly_channel(
+            headers, guild_id, "open-ticket",
+            "🎫 Customer onboarding tickets + pinned policy card (read-only, use /renew or /pause-billing)",
+            admin_role_id=admin_role_id, bot_id=bot_id
+        )
+        if ch:
+            channels["open_ticket_ch_id"] = ch
+            _ok("Created #open-ticket (read-only for customers)")
+        else:
+            _warn("Could not create #open-ticket")
+
+    # Create Customer Hub category (hidden from @everyone)
     cat_id = _find_or_create_category(headers, guild_id, "🏢 Customer Hub")
     if cat_id:
         channels["customer_hub_id"] = cat_id
@@ -468,7 +682,7 @@ def create_backup_gist(gh_token: str, core_repo: str) -> Optional[str]:
             "README.md": {
                 "content": "# AdFarm V8 Backup\n\nThis gist is automatically managed by the control bot.\nDo not edit manually.\n"
             },
-            "customers.db": {"content": ""},
+            "customers.db": {"content": "(empty - will be populated by bot)"},
             "REVISION": {"content": "0"},
             "LOCK": {"content": "{}"},
         },
@@ -486,9 +700,14 @@ def create_backup_gist(gh_token: str, core_repo: str) -> Optional[str]:
 
 
 def set_github_secrets(
-    gh_token: str, core_repo: str, inputs: dict[str, str],
-    channels: dict[str, str], gist_id: Optional[str],
-    gh_user: dict[str, str], force: bool = False,
+    gh_token: str,
+    core_repo: str,
+    inputs: dict[str, str],
+    channels: dict[str, str],
+    gist_id: Optional[str],
+    gh_user: dict[str, Any],
+    workers: list[dict[str, str]] = None,
+    force: bool = False,
 ) -> None:
     """Set all required repository secrets."""
 
@@ -498,7 +717,7 @@ def set_github_secrets(
         "GH_ADMIN_TOKEN": gh_token,
         "OWNER_IDS": inputs["owner_ids"],
         "GUILD_ID": inputs["guild_id"],
-        "GITHUB_OWNER": gh_user["login"],
+        "REPO_OWNER": gh_user["login"],
         "CORE_REPO": core_repo,
     }
 
@@ -518,15 +737,10 @@ def set_github_secrets(
 
     # Add worker accounts
     if workers:
-        # Format: user1:token1,user2:token2,user3:token3
         worker_tokens = ",".join(f"{w['user']}:{w['token']}" for w in workers)
         secrets["WORKER_TOKENS"] = worker_tokens
-        
-        # Also store as separate lists
         secrets["WORKER_GITHUB_OWNERS"] = ",".join(w["user"] for w in workers)
         secrets["WORKER_TOKENS_LIST"] = ",".join(w["token"] for w in workers)
-        
-        # Individual secrets for each worker
         for i, w in enumerate(workers, 1):
             secrets[f"WORKER_{i}_USER"] = w["user"]
             secrets[f"WORKER_{i}_TOKEN"] = w["token"]
@@ -610,15 +824,13 @@ def pin_policy_card(
     headers = _discord_headers(bot_token)
 
     policy_text = (
-        "**📜 AdFarm V8 — Pre-Payment Policy Card**\n\n"
-        "1. **No refunds** once the farm is provisioned.\n"
-        "2. **Time credit on bans:** full credit if banned within 48h, pro-rated after.\n"
-        "3. **Alt survival is not guaranteed.**\n"
-        "4. **Main accounts are never supported.**\n"
-        "5. **Crypto payments are final** (BEP-20 USDT/BUSD).\n"
-        "6. **Data stored:** Discord ID, username, repos, dates.\n"
-        "7. **No SLA** — best-effort support.\n\n"
-        "Click ✅ below to acknowledge before any payment address is shared."
+        "**📜 AdFarm V8 — Pre-Payment Confirmation**\n\n"
+        "1. **Crypto payments only** — BEP-20 (USDT/BUSD).\n"
+        "2. **Data stored:** Discord ID, username, repos, dates.\n"
+        "3. **Account setup:** main accounts are not supported.\n"
+        "4. **Support:** best-effort, we aim to respond quickly.\n\n"
+        "Click ✅ below to confirm you understand the above and would like to proceed.\n"
+        "We'll share payment details right after."
     )
 
     resp = _req(

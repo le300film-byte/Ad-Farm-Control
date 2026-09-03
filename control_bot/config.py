@@ -95,7 +95,7 @@ CMD_COOLDOWN_SEC = _int("CMD_COOLDOWN_SEC", 5)
 # ---------- GitHub ----------
 # One shared token from `gh auth token` is used for dispatch, sync, and Gists.
 GITHUB_TOKEN = _env("GH_TOKEN") or _env("GITHUB_PAT")
-GITHUB_OWNER = _env("GITHUB_OWNER")
+GITHUB_OWNER = _env("REPO_OWNER") or _env("GITHUB_OWNER")
 CORE_REPO = _env("CORE_REPO") or os.environ.get("GITHUB_REPOSITORY", "").strip()
 # Shared private Gist used as a control queue when an alt is not a mutual
 # member of the control-bot server. The bot writes one targeted file per alt;
