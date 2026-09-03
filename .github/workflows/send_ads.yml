@@ -10,7 +10,7 @@ run-name: >-
                   github.event.inputs.buy_rate || '2.2',
                   github.event.inputs.buy_rate_rap || '1.8')))
   }}
-  | ${{ github.event.inputs.interval_min }}min × ${{ github.event.inputs.runtime_limitless == '1' && '∞ limitless' || format('{0}h', github.event.inputs.total_hours) }}
+  | ${{ github.event.inputs.interval_min }}min × ${{ github.event.inputs.total_hours }}h
   ${{ github.event.inputs.attach_image == 'yes' && '| 📷img (after warmup)' || '' }}
   ${{ (github.event.inputs.channel_1 || github.event.inputs.channel_2) && '| 🎯 1-2 channels' || '' }}
 

@@ -1,0 +1,67 @@
+# V8 CONTROL BOT — STAGING (Phase 2.10)
+# Mirrors control_bot.yml but:
+#   * manual dispatch only (no schedule/push trigger),
+#   * separate concurrency group (never cancels production),
+#   * STAGING_MODE=1: reads the SAME Gist/state but never dispatches real
+#     customer workflows and never mutates production repo secrets.
+# Use it to verify a control-bot change against a single test customer before
+# pushing it to main (which restarts production).
+
+name: "🧪 V8 Control Bot Staging"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: control-bot-staging
+  cancel-in-progress: true
+
+jobs:
+  staging-check:
+    name: "Staging smoke · chunk ${{ matrix.chunk }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        chunk: [1, 2]
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet -r control_bot/requirements.txt
+          pip install --quiet PyNaCl 2>/dev/null || true
+
+      - name: Staging smoke (self-test + import checks; NO real dispatch)
+        env:
+          BOT_TOKEN:                ${{ secrets.BOT_TOKEN }}
+          GUILD_ID:                 ${{ secrets.GUILD_ID }}
+          OWNER_IDS:                ${{ secrets.OWNER_IDS || secrets.OWNER_ID }}
+          GH_ADMIN_TOKEN:           ${{ secrets.GH_ADMIN_TOKEN }}
+          GITHUB_OWNER:             ${{ secrets.ALT_GITHUB_OWNER }}
+          CONTROL_GIST_ID:          ${{ secrets.CONTROL_GIST_ID }}
+          ALT_REPOS:                ${{ secrets.ALT_REPOS }}
+          ALT_DISCORD_IDS:          ${{ secrets.ALT_DISCORD_IDS }}
+          ALT_NAMES:                ${{ secrets.ALT_NAMES }}
+          GITHUB_RUN_ID:            ${{ github.run_id }}
+          STAGING_MODE:             "1"
+          PYTHONUNBUFFERED:         "1"
+          CUSTOMERS_DB:             customers-staging.db
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          echo "🧪 Staging smoke — import + self-test only."
+          python -c "import customer_manager, timer_engine, github_dispatch, discord_forum; print('imports OK')"
+          python -m pytest tests/test_v8_round1_functional.py tests/test_v8_round4_timer.py -q
+          echo "✅ Staging checks passed. Production was NOT touched."

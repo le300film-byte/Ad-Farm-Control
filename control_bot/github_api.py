@@ -7,8 +7,10 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +22,27 @@ from . import config
 # Control-server HTTP timeout (seconds). Matches WEBHOOK_TIMEOUT=20 on the
 # self-bot side (V6). Override via CONTROL_HTTP_TIMEOUT if needed.
 _HTTP_TIMEOUT = config.CONTROL_HTTP_TIMEOUT
+
+# ── Gist queue monitoring counters (TODO 2.2) ───────────────────────────────
+_gist_calls: deque[tuple[float, int, float]] = deque(maxlen=10000)  # (ts, status, ms)
+_gist_stats_lock = threading.Lock()
+
+
+def _gist_record(status: int, started: float) -> None:
+    with _gist_stats_lock:
+        _gist_calls.append((time.time(), int(status), (time.perf_counter() - started) * 1000))
+
+
+def gist_usage_stats() -> dict[str, int | float]:
+    """Aggregate Gist API usage: requests/hour, 429 count, average latency."""
+    now = time.time()
+    with _gist_stats_lock:
+        recent = [c for c in _gist_calls if now - c[0] <= 3600]
+    return {
+        "requests_last_hour": len(recent),
+        "429_count": sum(1 for _ts, status, _ms in recent if status == 429),
+        "avg_response_ms": round(sum(c[2] for c in recent) / len(recent), 1) if recent else 0.0,
+    }
 
 
 GH = "https://api.github.com"
@@ -35,12 +58,15 @@ def fetch_gist(gist_id: str) -> dict:
     if not gist_id:
         return {}
     url = f"{GH}/gists/{gist_id}"
+    started = time.perf_counter()
     try:
         r = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        _gist_record(r.status_code, started)
         if r.status_code == 200:
             return r.json()
         return {}
     except Exception:
+        _gist_record(0, started)
         return {}
 
 
@@ -63,6 +89,7 @@ def save_channel_registry_snapshot(alt_id: int, snapshot: dict) -> tuple[bool, s
         return False, "CHANNEL_STATE_GIST_ID/CONTROL_GIST_ID is not configured."
     if not isinstance(snapshot, dict):
         return False, "Channel registry snapshot must be an object."
+    started = time.perf_counter()
     try:
         response = requests.patch(
             f"{GH}/gists/{config.CHANNEL_STATE_GIST_ID}",
@@ -70,7 +97,9 @@ def save_channel_registry_snapshot(alt_id: int, snapshot: dict) -> tuple[bool, s
             json={"files": {f"channel_state_{int(alt_id)}.json": {"content": json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))}}},
             timeout=_HTTP_TIMEOUT,
         )
+        _gist_record(response.status_code, started)
     except Exception as exc:
+        _gist_record(0, started)
         return False, f"Channel registry Gist network error: {type(exc).__name__}: {exc}"
     if response.status_code == 200:
         return True, "Channel registry snapshot saved."
@@ -101,7 +130,9 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
     # one-shot command replaces the target file.
     payload = {}
     try:
+        _gstart = time.perf_counter()
         existing = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        _gist_record(existing.status_code, _gstart)
         if existing.status_code == 200:
             files = existing.json().get("files") or {}
             prior = files.get(_gist_filename(alt_id), {})
@@ -182,6 +213,7 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
                 payload["deal_alert_delta"] = value
         except (TypeError, ValueError, OverflowError):
             pass
+    started = time.perf_counter()
     try:
         response = requests.patch(
             url,
@@ -189,7 +221,9 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
             json={"files": {_gist_filename(alt_id): {"content": json.dumps(payload, ensure_ascii=False)}}},
             timeout=_HTTP_TIMEOUT,
         )
+        _gist_record(response.status_code, started)
     except Exception as exc:
+        _gist_record(0, started)
         return False, f"Control Gist network error: {type(exc).__name__}: {exc}"
     if response.status_code == 200:
         return True, payload["command_id"]
@@ -289,13 +323,6 @@ def delete_repository_secret(repo: str, name: str) -> tuple[bool, str]:
         pass
     # Fallback to gh CLI (note: gh secret delete does not take --yes)
     return _run_gh_secret(["secret", "delete", name, "--repo", slug])
-
-
-def set_repository_variable(repo: str, name: str, value: str) -> tuple[bool, str]:
-    """Set a non-secret repository variable (for example ALT_ID / ALT_NAME)."""
-    if not repo or not name or value is None:
-        return False, "Repository, variable name, and value are required."
-    return _run_gh_secret(["variable", "set", name, "--repo", _repo_slug(repo)], value)
 
 
 def delete_repository(repo: str) -> tuple[bool, str]:
@@ -480,33 +507,18 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = False) -> tupl
     return False, f"Could not create repository `{slug}` on GitHub."
 
 
-def provision_alt_repository_files_and_secrets(
-    repo: str,
-    user_token: str,
-    channel_ids: str = "",
-    *,
-    alt_id: int | None = None,
-    alt_name: str = "",
-) -> tuple[bool, str]:
-    """Upload canonical workflows and sender script, and populate required secrets.
-
-    The secret/variable set deliberately mirrors ``setup.py`` so an alt added
-    from Discord is indistinguishable from one added by the bootstrap: identity
-    variables, all four webhooks, the Gist control plane, the trust lists, and
-    the scanner aliases are all provisioned before the self-check workflow is
-    uploaded last.
-    """
+def provision_alt_repository_files_and_secrets(repo: str, user_token: str, channel_ids: str = "") -> tuple[bool, str]:
+    """Upload canonical workflows and sender script, and populate required secrets."""
     slug = _repo_slug(repo)
     ok_repo, msg = create_alt_repository(slug)
     if not ok_repo:
         return False, msg
 
-    # Files to sync from local workspace or core repo. self_check.yml is
-    # uploaded again at the end so its push trigger only fires against a fully
-    # configured repository.
+    # Files to sync from local workspace or core repo
     files_to_sync = [
         "send_ads.py",
         ".github/workflows/send_ads.yml",
+        ".github/workflows/self_check.yml",
     ]
     repo_root = Path(__file__).resolve().parent.parent
     for rel_path in files_to_sync:
@@ -545,7 +557,6 @@ def provision_alt_repository_files_and_secrets(
         except Exception:
             pass
 
-    owner_ids = ",".join(str(x) for x in sorted(config.OWNER_IDS))
     # Clone common secrets from environment or config
     common_secrets = [
         ("DM_WEBHOOK_URL", os.environ.get("DM_WEBHOOK_URL") or config._raw("DM_WEBHOOK_URL")),
@@ -555,45 +566,14 @@ def provision_alt_repository_files_and_secrets(
         ("GIST_ID", os.environ.get("GIST_ID") or config._raw("GIST_ID")),
         ("GIST_TOKEN", os.environ.get("GIST_TOKEN") or config._raw("GIST_TOKEN") or config.GITHUB_TOKEN),
         ("CONTROL_GIST_ID", config.CONTROL_GIST_ID or os.environ.get("CONTROL_GIST_ID") or ""),
-        ("CONTROLLER_USER_IDS", owner_ids),
-        # Panic and discovery-confirmation trust lists default to the owner set,
-        # exactly like setup.py. Without them the sender refuses remote panic
-        # and refuses channel auto-recovery confirmation.
-        ("PANIC_TRUSTED_IDS", os.environ.get("PANIC_TRUSTED_IDS") or config._raw("PANIC_TRUSTED_IDS") or owner_ids),
-        ("CONFIRM_USER_IDS", os.environ.get("CONFIRM_USER_IDS") or config._raw("CONFIRM_USER_IDS") or owner_ids),
-        ("DEAL_ITEM_KEYWORDS", os.environ.get("DEAL_ITEM_KEYWORDS")
-            or config._raw("DEAL_ITEM_KEYWORDS")
-            or ",".join(config.DEFAULT_DEAL_KEYWORDS)),
+        ("CONTROLLER_USER_IDS", ",".join(str(x) for x in config.OWNER_IDS)),
         ("CHANNEL_IDS", resolved_channels),
     ]
-    if os.environ.get("TUNING_JSON") or config._raw("TUNING_JSON"):
-        common_secrets.append(("TUNING_JSON", os.environ.get("TUNING_JSON") or config._raw("TUNING_JSON")))
     for sec_name, sec_val in common_secrets:
         if sec_val:
             set_repository_secret(slug, sec_name, str(sec_val))
 
-    # CHANNEL_IDS and CHANNEL_NAMES are mutually optional. Clear a stale
-    # CHANNEL_NAMES secret so an IDs-only fleet is not silently overridden.
-    channel_names = os.environ.get("CHANNEL_NAMES") or config._raw("CHANNEL_NAMES")
-    if channel_names:
-        set_repository_secret(slug, "CHANNEL_NAMES", channel_names)
-    else:
-        delete_repository_secret(slug, "CHANNEL_NAMES")
-
-    # Identity variables mirror setup.py: the sender's ALT_ID/ALT_NAME drive
-    # per-alt Gist files, log attribution, and heartbeat routing.
-    if alt_id is not None:
-        set_repository_variable(slug, "ALT_ID", str(int(alt_id)))
-    if alt_name:
-        set_repository_variable(slug, "ALT_NAME", str(alt_name)[:80])
-
-    # Upload last so the workflow's push trigger sees a fully configured repo.
-    self_check = repo_root / ".github/workflows/self_check.yml"
-    if self_check.is_file():
-        upload_repository_file(slug, ".github/workflows/self_check.yml", self_check.read_bytes(),
-                              message="bootstrap: install self_check workflow")
-
-    return True, f"Repository `{slug}` auto-provisioned successfully with canonical files, secrets, and identity variables."
+    return True, f"Repository `{slug}` auto-provisioned successfully with canonical files and secrets."
 
 
 def upload_repository_file(repo: str, file_path: str, content_bytes: bytes, message: str = "Update file from control bot") -> tuple[bool, str]:

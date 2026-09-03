@@ -13,6 +13,10 @@ venv/
 .adfarm_control_state.json
 .adfarm_channel_registry.json
 control_bot/dash_msg_id.txt
+customers.db
+customers.db-wal
+customers.db-shm
+*.backup
 
 # Local/private history and generated source archives
 historical_urls.txt

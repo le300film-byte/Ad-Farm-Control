@@ -230,7 +230,6 @@ class ChannelRegistryStore:
         configured_ids: Iterable[Any] | None = None,
         target_names: Iterable[str] | None = None,
         now: float | None = None,
-        persist: bool = True,
     ) -> dict[str, Any]:
         """Compare live Discord inventory to the saved inventory and persist it.
 
@@ -351,9 +350,7 @@ class ChannelRegistryStore:
                 + [str(item) for item in old_target_names if item]
             ))[:100]
             data["alts"][key] = entry
-            # ``persist=False`` computes the full diff for a report without
-            # writing it, so an operator can inspect drift before applying it.
-            persisted = self.store.save(data) if persist else True
+            persisted = self.store.save(data)
 
         return {
             "ok": persisted,

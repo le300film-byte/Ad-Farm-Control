@@ -8,6 +8,7 @@ from unittest import mock
 import setup as bootstrap_module
 
 
+@unittest.skip("V8: setup.py fully rebuilt as a one-time server installer. V8-specific setup tests are in test_v8_round1_functional.py")
 class SetupValidationTests(unittest.TestCase):
     def test_noninteractive_setup_accepts_multiple_owners_and_names_only_channels(self):
         values = {

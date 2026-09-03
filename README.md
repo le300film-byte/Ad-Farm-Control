@@ -1,89 +1,149 @@
-# Discord Ad Sender — V6
+# Discord Ad Sender — V8 (Enterprise Multi-Customer Service)
 
-This repository contains the canonical V6 sender and official control-bot
-source for a GitHub Actions deployment. It supports one to four configured
-alts, each isolated in its own private repository and workflow.
+> **V8 (2026-09-03):** Full enterprise upgrade with multi-customer management,
+> subscription timers, VIP tier, admin panel, and 24/7 continuous bot runtime.
+> **One-command setup with 3-worker architecture.**
+
+This repository contains the canonical V8 sender and official control-bot
+source for a GitHub Actions deployment. V8 transforms the bot from a single-operator
+tool into a full enterprise service supporting multiple customers, each with their own
+private forum channels, GitHub repos, subscription timers, and VIP features.
+
+## 🆕 V8 Quick Start (One Command)
+
+### Prerequisites (one-time, 5 min):
+1. Install [GitHub CLI](https://cli.github.com): `brew install gh` (macOS) / `sudo apt install gh` (Ubuntu)
+2. Authenticate on your **main** account: `gh auth login && gh auth refresh -s repo,workflow,gist`
+3. Create **3 fresh GitHub accounts** for workers at [github.com/signup](https://github.com/signup) (these host customer alt repos — gives isolation if one gets flagged)
+4. Create a Discord bot at [discord.com/developers](https://discord.com/developers/applications) — enable Message Content Intent, invite to your server
+
+### Setup (one command):
+```bash
+python3 setup.py
+```
+The script asks for:
+- **4 Discord/billing inputs:** Bot Token, User ID, Server ID, Wallet Address
+- **3 worker accounts:** Username + token for each (the script opens the token creation page for you in your browser)
+
+Everything else is automated — channels, secrets, Gist backup, database, policy card.
+
+### Architecture:
+```
+Main account (gh auth)  →  core repo + control bot + Gist backup
+Worker 1 (@username)    →  customer alt repos (round-robin)
+Worker 2 (@username)    →  customer alt repos (round-robin)
+Worker 3 (@username)    →  customer alt repos (round-robin)
+```
+
+### Launch:
+```bash
+git add . && git commit -m '🚀 V8 setup' && git push origin main
+```
+
+### Onboard a customer:
+```
+/admin activate @User days:30 alts:2
+```
+
+📖 See [`SETUP_CONTROL.md`](./SETUP_CONTROL.md) for the full guide.
+
+---
+
+## V8 Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    V8 CONTROL BOT (24/7)                     │
+│  Runs on: MAIN GitHub account                                │
+│  • /admin panel (owner-only hidden commands)                 │
+│  • Customer commands: /setup /run /stop /pause /resume etc.  │
+│  • VIP commands: /squad /script (VIP customers only)         │
+│  • Timer engine: hourly subscription scan + auto-shutdown    │
+│  • SQLite: customers.db (Gist write-through backup)          │
+└─────────────────────────┬────────────────────────────────────┘
+                          │  dispatches to worker accounts
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  Worker 1    │ │  Worker 2    │ │  Worker 3    │
+│  alt repos   │ │  alt repos   │ │  alt repos   │
+│  send_ads.py │ │  send_ads.py │ │  send_ads.py │
+│  (Actions)   │ │  (Actions)   │ │  (Actions)   │
+└──────────────┘ └──────────────┘ └──────────────┘
+          │
+          ▼
+┌─────────────────────┐         ┌─────────────────────┐
+│   Customer A Forum  │         │   Customer B Forum  │
+│   #control          │         │   #control          │
+│   #dashboard        │         │   #dashboard        │
+│   #farm-logs        │         │   #farm-logs        │
+│   #dm-inbox (VIP)   │         │   #deals            │
+│   #deals            │         └─────────────────────┘
+└─────────────────────┘
+```
+
+## V8 Modules
+
+| File | Purpose |
+|------|---------|
+| `customer_manager.py` | SQLite CRUD, expiry helpers, VIP management |
+| `security.py` | Global `@require_access` permission decorator |
+| `github_dispatch.py` | Multi-worker repo provisioning + workflow dispatch |
+| `discord_forum.py` | Customer forum channel + thread creation |
+| `timer_engine.py` | Hourly subscription scan, reminders, auto-shutdown |
+| `admin_commands.py` | `/admin` slash command group (hidden) |
+| `gist_backup.py` | Gist write-through backup + restore-on-startup |
+| `setup.py` | **One-command installer** (gh CLI auth + 3 workers) |
+
+## V8 Command Reference
+
+### Admin Commands (OWNER_IDS only)
+| Command | Function |
+|---------|----------|
+| `/admin list` | Show all customers, days remaining |
+| `/admin activate @User days alts vip` | Onboard a customer |
+| `/admin extend @User days` | Extend subscription |
+| `/admin deactivate @User` | Shut down and lock |
+| `/admin shutdown confirm:ALL` | Emergency kill-switch (2-admin multi-sig) |
+| `/admin repo-sync` | Push latest sender to all repos |
+| `/admin logs @User` | View customer log thread |
+| `/admin pin-policy` | Pin ToS in #open-ticket |
+| `/admin payment-address @User` | Share wallet (policy-gated) |
+| `/admin verify-tokens` | Audit worker tokens |
+| `/admin expiry-alerts` | Dry-run reminder path |
+| `/admin activate-template @User` | Pre-filled activation command |
+
+### Customer Commands (active subscription required)
+`/setup`, `/run`, `/stop`, `/pause`, `/resume`, `/alt`, `/tune`, `/channels`,
+`/deals`, `/squad`, `/status`, `/reply`, `/refresh`, `/dashboard`, `/help`,
+`/shutdown`, `/renew`, `/pause-billing`, `/proofs`
+
+### VIP Commands (VIP tier required)
+`/squad`, `/script simulate`, `/script run`, `#dm-inbox` visibility
+
+---
 
 > **Safety:** This is user-account automation, not an official Discord bot
 > feature. Use only accounts and servers you control. Never use it for
-> harassment, fraud, spam, or unsolicited bulk messaging, and follow Discord's
-> rules and the law in your jurisdiction.
+> harassment, fraud, spam, or unsolicited bulk messaging.
 
 ## Start here
 
-- **Multi-alt deployment:** run [`setup.py`](./setup.py), then review
-  [`SETUP_CONTROL.md`](./SETUP_CONTROL.md). The interactive bootstrap automatically
-  guides you through all configuration options (`--quick`, `--force`, `--forums`,
-  `--upgrade-forums`, `--abort-on-failure`) with plain-English explanations.
-- **Single-alt deployment:** see [`SETUP_GUIDE.md`](./SETUP_GUIDE.md).
-- **AI Co-Pilot & Operator Skill:** see [`SKILL.md`](./SKILL.md) for prompt injection and complete command/keyword reference.
-- **Architectural roadmap & innovations:** see [`ROADMAP.md`](./ROADMAP.md).
-- **Customer-ready bug & risk registry:** see [`BUG_TRACKER.md`](./BUG_TRACKER.md).
-
-## V6 Architecture & Core Features
-
-- `send_ads.py` is the fail-closed sender. It verifies egress routes before
-  Discord warmup, supports 3/5-minute intervals, and caps every runtime at 48 hours.
-- **Unified Interactive Hub Architecture:** Streamlined into 23 non-duplicated,
-  interactive top-level slash commands (`/run`, `/getstarted`, `/stop`, `/pause`,
-  `/resume`, `/alt`, `/tune`, `/channels`, `/autorescan`, `/deals`, `/squad`,
-  `/status`, `/reply`, `/analytics`, `/diagnose`, `/canary`, `/topology`,
-  `/sync`, `/refresh`, `/dashboard`, `/script`, `/shutdown`, `/help`). Running
-  base commands without parameters opens interactive rich views with 1-click
-  action buttons, selectors, and modals, while still supporting direct one-shot
-  CLI arguments for power operators.
-- **Zero-Touch Channel Auto-Scan (`/autorescan`):** On first connect each alt's
-  Discord server names and channel IDs are persisted to `channel_state_{n}.json`.
-  Every reconnect or manual `/autorescan` fetches the live channel list, compares
-  it to the persisted table, auto-adds new channels, removes gone channels, and
-  logs the exact diff — the operator never reconfigures channels by hand.
-- **`/run` Preview + Limitless Mode:** `/run` shows a full configuration preview
-  and requires **Confirm Launch** before dispatch. Runtime now includes
-  **`∞ Limitless`**, which sends `RUNTIME_LIMITLESS=1` so a sender keeps running
-  indefinitely until `/shutdown` gracefully stops all alts and workflows.
-- **Configurable Market Asset:** the market asset is driven entirely by
-  `DEFAULT_ITEM_NAME` / `DEFAULT_ITEM_KEYWORDS` / `DEAL_ITEM_KEYWORDS`, so no
-  source edit is needed to target a different item. No item name is hardcoded
-  in the control logic.
-- **Scripting Suite & Sandbox:** `/script action:simulate` (unfiltered
-  dry-run) and `/script action:run` (sandboxed execution) with resource caps,
-  timeout, and network-off by default.
-- **Living Bug Tracker:** see [`BUG_TRACKER.md`](./BUG_TRACKER.md) for the full
-  legacy bug, predicted risk, and validation-round history.
-- **Visual Fleet Analytics & Speed Matrix (`/analytics`):**
-  Renders live ASCII progress gauges (`[▰▰▰▰▰▰▰▰▱▱]`), delivery reliability percentages,
-  slowmode utilization, and inter-channel interval timelines.
-- **Refined Directional Arbitrage Deal Scanner (`/deals`):**
-  - **Supplier Arbitrage (`🟢 SUPPLIER ALERT`):** Detects other users selling under-market (`price <= buy_benchmark - delta`) and calculates discount profit margins.
-  - **Premium Buyer Arbitrage (`🔵 ARBITRAGE SALE`):** Detects buyers offering high bids (`price >= sell_benchmark + delta`) and calculates net profit margins.
-  - **Noise Filter:** Rejects lowball buyer bids and overpriced sellers.
-- **Fleet Squad Batch Management (`/squad`):** Group alts into named pools (e.g. `Alpha Sellers`) and execute batch controls (batch pause, resume, policy, price) with aggregated health metrics.
-- **Interactive Setup Configuration:** Running `python setup.py` interactively prompts for every CLI flag (`--quick`, `--force`, `--forums`, `--upgrade-forums`, `--abort-on-failure`) with explanations.
-- **AFK Break Visibility:** Alts log visible status notices to `#farm-logs` when entering and returning from natural 10–30 min AFK breaks, and continuously poll control Gists every 15s.
-- **Fuzzy & Emoji-Resistant Channel Discovery:** Strips unicode symbols and decorative formatting to match channels like `「💵」・trade-market` or `trading﹒☆˚₊࿔`.
-- **Cascading Circuit Breakers & Chat Velocity:** Isolated per-channel failure tracking and dynamic posting delay auto-scaling based on server chat velocity.
+- **Setup:** run [`python3 setup.py`](./setup.py) then [`SETUP_CONTROL.md`](./SETUP_CONTROL.md)
+- **Customer guide:** [`SETUP_GUIDE.md`](./SETUP_GUIDE.md)
+- **AI Co-Pilot:** [`SKILL.md`](./SKILL.md)
+- **Roadmap:** [`ROADMAP.md`](./ROADMAP.md)
 
 ## Files
 
 | Path | Runs where | Purpose |
 |---|---|---|
-| `send_ads.py` | Alt repositories (Actions) | Canonical V6 sender, heartbeat, typed logging, safe verification, and directional deal scanner. |
-| `.github/workflows/send_ads.yml` | Alt repositories | Chained six-hour sender chunks, Cloudflare WARP routing, keyword channel resolution, and V6 inputs. |
-| `.github/workflows/self_check.yml` | Alt repositories | Pre-flight validation of tokens, channels, webhooks, Gists, WARP egress, and test suites. |
-| `.github/workflows/control_bot.yml` | Core repository | Owner-gated control bot chained continuously for 24/7 operations; supports 6–48h runs. |
-| `.github/workflows/bootstrap.yml` | Core repository | Masked cloud alternative to the local bootstrap script, including multi-owner setup. |
-| `.github/workflows/sync_to_alts.yml` | Core repository | Copies canonical V6 sender and workflows to configured alt repositories. |
-| `control_bot/` | Core repository | Unified interactive slash commands, private run UI, live state, typed logs, visual analytics, dashboard, and GitHub dispatch. |
-| `setup.py` | Core repository | Interactive bootstrap with explanations for all safety flags, Discord/GitHub resource provisioning. |
+| `send_ads.py` | Worker alt repos (Actions) | Canonical sender, heartbeat, deal scanner. |
+| `.github/workflows/send_ads.yml` | Worker alt repos | Chained six-hour sender chunks, WARP routing. |
+| `.github/workflows/self_check.yml` | Worker alt repos | Pre-flight validation. |
+| `.github/workflows/control_bot.yml` | Main repo | 24/7 control bot with 8-chunk watchdog. |
+| `.github/workflows/sync_to_alts.yml` | Main repo | Copies sender + workflows to all alt repos. |
+| `control_bot/` | Main repo | Slash commands, live state, dashboard. |
+| `setup.py` | Main repo | **One-command installer (main + 3 workers).** |
 
-## Required safety configuration
-
-- Keep `OWNER_IDS` populated with one or more trusted Discord IDs.
-- Keep user tokens, bot tokens, GitHub tokens, webhook URLs, and Gist tokens
-  out of chat, commits, screenshots, and ordinary workflow inputs.
-- Keep `PROXY_CHECK` fail-closed. Do not disable it to bypass an egress failure.
-- A message is considered deleted only after an exact-message verification
-  returns HTTP 404. Transient network failures do not create caution strikes.
-
-See [`SETUP_CONTROL.md`](./SETUP_CONTROL.md) for multi-alt operation and
-[`SETUP_GUIDE.md`](./SETUP_GUIDE.md) for environment details.
+See [`SETUP_CONTROL.md`](./SETUP_CONTROL.md) for full setup and operations.

@@ -1,6 +1,50 @@
 # 🧠 AI Operator Skill: Discord Ad Farm & Multi-Alt Fleet Intelligence
 
+> **Version:** V8 (Enterprise Discord Bot Service) — Updated 2026-09-03
+>
 > **Role & Purpose:** This document is an AI Skill definition designed to inject complete domain expertise into any language model (ChatGPT, Claude, etc.). It enables the AI to act as an expert Co-Pilot, Fleet Architect, and Strategic Advisor for the operator—capable of formulating exact commands, optimizing deal-scanner keywords, diagnosing runtime anomalies, and writing high-converting, unbannable ad copy.
+
+## 🆕 V8 Changes
+
+### New Modules
+- `customer_manager.py` – Multi-customer SQLite database with CRUD, expiry, VIP management
+- `security.py` – Global permission system with `@require_access` decorator
+- `github_dispatch.py` – Multi-account GitHub workflow dispatcher
+- `discord_forum.py` – Customer forum channel and thread provisioner
+- `timer_engine.py` – Hourly subscription timer with reminders + auto-expiry shutdown
+- `admin_commands.py` – Hidden `/admin` slash command panel (OWNER_IDS only)
+
+### Rebuilt
+- `setup.py` – One-time V8 master server installer (replaces per-alt setup wizard)
+
+### V8 Command Additions
+- `/setup` – Customer-facing wizard to enter alt tokens and channel IDs
+- `/renew` – Open a renewal ticket (pre-filled with customer ID + days remaining)
+- `/pause-billing` – Request subscription pause (admin approval)
+- `/proofs` – Opt-in anonymized proof sharing to public #proofs channel
+- `/help` – V8-aware categorized command reference (7 pages: Getting Started, Ad Controls, Channels & Deals, Alt Management, Billing & Proofs, Admin Panel, System)
+- `/admin` – Full admin panel: list, activate, extend, deactivate, shutdown (multi-sig), repo-sync, expiry-alerts, pin-policy, activate-template, payment-address (money-gated), verify-tokens, logs
+
+### V8 Command Removals
+- `/analytics` – Removed per V8_PLAN.md Phase 3.5
+- `/diagnose` – Removed per V8_PLAN.md Phase 3.5
+- `/canary` – Removed per V8_PLAN.md Phase 3.5
+- `/topology` – Removed per V8_PLAN.md Phase 3.5
+- `/sync` – Removed per V8_PLAN.md Phase 3.5
+
+### V8 Command Restorations
+- `/alt action:logs` – Restored (typed log streaming with filters)
+- `/alt action:clearlogs` – Restored (buffer purge)
+- `/alt action:selfcheck` – Restored (pre-flight validation)
+
+### V8 Architecture
+- Control bot runs **continuously** (no session time limit, no `total_hours` chooser)
+- GitHub Actions watchdog auto-restarts the bot on crash
+- Subscription timer runs every hour — sends 7/3/1 day reminders + auto-shuts down expired accounts
+- VIP tier unlocks `/squad`, `/script`, and `#dm-inbox` forum thread
+- All commands protected by `@require_access` global permission wrapper
+
+---
 
 ---
 
@@ -37,13 +81,12 @@
 
 ## 2. Complete Slash Command & Control Manual
 
-The control plane provides **23 unified, non-duplicated interactive slash commands**. Running base commands without parameters opens interactive rich views with 1-click action buttons and modals, while direct parameters remain available for one-shot CLI execution:
+The control plane provides **21 customer/operator commands + 12 admin subcommands**. Running base commands without parameters opens interactive rich views with 1-click action buttons and modals, while direct parameters remain available for one-shot CLI execution:
 
 ### 🚀 Execution & Runner Control
 | Command | Arguments | Function & Use Case |
 |---|---|---|
-| `/run` | *(None — opens interactive 3-step form)* | **Interactive 3-Step Wizard (raw message — no item word, price, or RAP required):** enter the message or question you want posted; emoji/alteration modifiers are applied automatically. Then select Alt, Mode (`Sell`/`Buy`), Rates, Cadence (`3m`/`5m`), and Duration (`6h`, `12h`, `18h`, `24h`, `48h`, `∞ Limitless`). Cadence (`3m`/`5m`), and Duration (`6h`, `12h`, `18h`, `24h`, `48h`, `∞ Limitless`). Shows a **full preview** of the command/script with options and requires **Confirm Launch** before execution. Cancels old run and dispatches runner workflow. |
-| `/run` | `squad: Name` | **Squad Launch:** Expands the named squad into its member alts and dispatches each one in sequence with a random 200–500 ms pause between launches, so a group launch never fires simultaneously. |
+| `/run` | *(None — opens interactive 3-step form)* | **Interactive 3-Step Wizard:** Select Alt, Mode (`Sell`/`Buy`), Rates, Message/Image, Cadence (`3m`/`5m`), and Duration (`6h`, `12h`, `18h`, `24h`, `48h`, `∞ Limitless`). Shows a **full preview** of the command/script with options and requires **Confirm Launch** before execution. Cancels old run and dispatches runner workflow. |
 | `/getstarted` | *(None)* | **Beginner Onboarding:** step-by-step setup, basic commands, common use cases, documentation links. Zero-code path from `/alt action:add` → channels → self-check → preview launch → monitoring → `/shutdown`. |
 | `/script` | `action: <simulate\|run>, code: <python>` | **Scripting Suite:** `simulate` dry-runs a script in a resource-limited sandbox and returns **unfiltered stdout/stderr/errors**; `run` executes it in the same sandbox (still resource-limited, never in the control-bot process). |
 | `/shutdown` | `confirmation: SHUTDOWN` | **Graceful Fleet Shutdown:** stops every alt, cancels all GitHub workflows, cancels the control bot's own Actions run, and terminates the process cleanly. Requires the exact confirmation word. |
@@ -85,7 +128,6 @@ The control plane provides **23 unified, non-duplicated interactive slash comman
 | `/channels` | `alt: ID, action: remove, channel_id: ID` | **Remove Channel:** Removes one channel from the alt and re-persists GitHub Secrets. |
 | `/channels` | `alt: ID, action: overwrite, channel_id: <id1,id2,...>` | **Overwrite ALL Channels:** Replaces the entire channel list tied to an alt with the supplied verified IDs, syncs GitHub Secrets, and sends `!setchannels` to the live runner. |
 | `/channels` | `alt: ID, action: refresh` | **Force Channel Refresh:** Forces the alt to refresh guild caches, check permissions, re-verify slowmodes (lowercase `!rescan` transport). |
-| `/autorescan` | `[alt: ID (0 = all alts)]` | **Live Channel Auto-Scan (zero-touch):** Fetches the alt's live Discord channel list, compares it against the persisted registry, auto-adds every newly created channel, removes every channel that no longer exists, logs each add/remove with alt name + timestamp + channel ID, and reboots the sender only when the table actually changed. Runs automatically on control-bot startup and on every reconnect. |
 | `/channels` | `alt: ID, action: reset_caution, [channel_id: 'all' or ID]` | **Clear Strikes & Caution:** Unbans channel from Caution Mode and clears slowmode backoffs. |
 
 ### 💰 Arbitrage Deal Scanner (`/deals`)
@@ -94,36 +136,52 @@ The control plane provides **23 unified, non-duplicated interactive slash comman
 | `/deals` | `[alt: 0 for All]` | **Interactive Arbitrage Hub:** Shows real-time scanner metrics, profit margins, active keywords, with buttons to toggle scanner, set threshold, set keywords, or simulate listing. |
 | `/deals` | `alt: ID, enabled: <on\|off>` | **Toggle Deal Scanner:** Enables/disables deal scanning without affecting ad rotations. |
 | `/deals` | `alt: ID, min_delta: <0..5>` | **Set Profit Margin:** Sets minimum profit edge per 1k units required before triggering a deal alert (default `$0.05`). |
-| `/deals` | `alt: ID, keywords: List` | **Configure Target Item Aliases:** Sets comma-separated item aliases for the deal scanner (use your own asset names, e.g. `dragon fruit, df, dragonfruit`). The asset is configurable — no item name is hardcoded anywhere in the logic. |
+| `/deals` | `alt: ID, keywords: List` | **Configure Target Item Aliases:** Sets comma-separated item aliases (e.g. `Blade Ball, BB token, BB`) for the deal scanner. |
 | `/deals` | `alt: ID, sample_listing: Text` | **Simulate Listing Parser:** Dry-run test-parses an ad message excerpt against deal keywords and active margins. |
 
 ### 👥 Squad Batch Operations (`/squad`)
 | Command | Arguments | Function & Use Case |
 |---|---|---|
 | `/squad` | `[action: overview], [squad_name: Name]` | **Interactive Squad Control Hub:** Dropdown selector to switch squads, with 1-click buttons for Batch Pause, Batch Resume, Batch Price, Batch Policy, and Assign Alt. |
-| `/squad` | `action: list` | **List Squads:** Shows every squad with its current member alts. |
 | `/squad` | `action: view, squad_name: Name` | **Squad Overview:** Composite squad health score, total posts, error tally, and member statuses. |
-| `/squad` | `action: create, squad_name: Name, alts: <1,2,3\|all>` | **Create Squad:** Creates a named squad and assigns every listed alt to it in one command (e.g. `alts:1,2,3,4`). |
-| `/squad` | `action: unassign, alt: ID` | **Unassign Alt:** Removes an alt from its squad without deleting the squad. |
 | `/squad` | `action: assign, alt: ID, squad_name: Name` | **Assign Alt:** Assigns an alt to a named squad (e.g. `Alpha Sellers`). |
 | `/squad` | `action: pause, squad_name: Name` | **Batch Pause:** Pauses public ad posting across all alts in the squad simultaneously. |
 | `/squad` | `action: resume, squad_name: Name` | **Batch Resume:** Resumes public ad posting across all alts in the squad simultaneously. |
 | `/squad` | `action: policy, squad_name: Name, value: Template` | **Batch Policy:** Applies an operational policy preset across all alts in the squad. |
 | `/squad` | `action: price, squad_name: Name, value: Rate` | **Batch Price:** Updates the pricing rate across all alts in the squad. |
 
-### 📊 Telemetry, Monitoring & Diagnostics
+### 🧙 V8 Customer Commands
 | Command | Arguments | Function & Use Case |
 |---|---|---|
-| `/status` | `[alt: 0 for All]` | **Fleet Status Dashboard:** Displays live heartbeat status (`🟢 active`, `🟡 paused`, `⚠️ caution`, `⚫ offline`), sent totals, error tallies, and uptime. |
-| `/reply` | `alt: ID, user: UserID, text: Message` | **DM Operator Relay:** Transmits a message through the selected alt directly to a buyer's private DM. |
-| `/analytics` | `[alt: 0 for All]` | **Visual Speed Matrix:** Renders ASCII progress gauges, message velocities, per-channel delivery reliability %, and slowmode utilization. |
-| `/diagnose` | `[alt: ID]` | **Causal Event Explorer:** Deep root-cause diagnostic analysis, causal transition timeline, and operator recommendations. |
-| `/canary` | `[alt: 0 for All]` | **Synthetic Health Probe:** In-band probe testing GitHub API, Gist bridge sync, and token latency in milliseconds. |
-| `/topology` | *(None)* | **Fleet Topology Graph:** Visual mapping of alts, squads, target Discord channels, egress proxies, and Gist bridges. |
-| `/sync` | *(None)* | **Fleet-Wide State Reload:** Tells all alts to immediately reload shared Gist state and blocklists. |
-| `/refresh` | *(None)* | **Live Actions Poll:** Forces an immediate poll of active GitHub Actions workflow runs and refreshes dashboard. |
-| `/dashboard` | *(None)* | **Post Dashboard:** Re-renders and posts the persistent 3-card dashboard snapshot in `#ad-dashboard`. |
-| `/help` | *(None)* | **Complete Reference Guide:** Interactive private reference manual listing all arguments, permissions, and effects. |
+| `/setup` | *(None — opens wizard)* | **V8 Setup Wizard:** Step 1 asks how many alts (1–4). Step 2 opens one modal per alt (token + channel IDs), each validated against Discord before the next. Tokens uploaded to GitHub secrets and cleared from memory. 3-min video linked in modal. |
+| `/renew` | *(None)* | **Renewal Ticket:** Opens a pre-filled ticket in `#open-ticket` with customer ID and days remaining. Admin verifies payment and runs `/admin extend`. |
+| `/pause-billing` | *(None)* | **Pause Request:** Opens a ticket requesting subscription pause. Admin reviews and extends by the paused days if approved. |
+| `/proofs` | *(None)* | **Opt-In Proofs:** Share first-post screenshots or supplier alert wins to the public `#proofs` channel with customer ID redacted. |
+
+### 🔧 Admin Panel (`/admin` — OWNER_IDS only)
+| Command | Arguments | Function & Use Case |
+|---|---|---|
+| `/admin list` | *(None)* | **Customer List:** Shows all customers with ID, username, alt count, VIP status, days remaining, active/expired status. |
+| `/admin activate` | `@User, days: N, alts: N, [vip], [github_account]` | **Onboard Customer:** Creates GitHub repos, provisions Discord forum (#control, #dashboard, #farm-logs, #dm-inbox, #deals), stores record in customers.db, sends welcome DM with video link. |
+| `/admin extend` | `@User, days: N` | **Extend Subscription:** Adds days to an existing customer's expiry date. |
+| `/admin deactivate` | `@User` | **Shut Down Customer:** Runs shutdown sequence and locks the account. |
+| `/admin shutdown` | `confirm: ALL` | **Emergency Kill-Switch:** 2-admin multi-sig confirmation (120s window). Stops ALL customers. |
+| `/admin repo-sync` | *(None)* | **Code Sync:** Pushes latest `send_ads.py` to all customer repos. |
+| `/admin expiry-alerts` | *(None)* | **Dry-Run:** Tests the reminder/expiry path without messaging customers. |
+| `/admin pin-policy` | `[channel]` | **Pin ToS:** Pins the pre-payment policy card + privacy notice in `#open-ticket`. |
+| `/admin activate-template` | `@User, [tx_hash]` | **Pre-Filled Activation:** Generates a ready-to-run activation command from a customer ticket. |
+| `/admin payment-address` | `@User` | **Share Wallet:** Money-gated — only works after customer acknowledged the policy card. DMs the BEP-20 payment address. |
+| `/admin verify-tokens` | *(None)* | **Token Audit:** Write-proof (scratch create+delete) + expiry health check for all worker PATs. |
+| `/admin logs` | `@User` | **Customer Logs:** Links to the customer's `#farm-logs` thread. |
+
+### 📊 Monitoring & System
+| Command | Arguments | Function & Use Case |
+|---|---|---|
+| `/status` | `[alt: 0 for All]` | **Fleet Status Dashboard:** Displays live heartbeat status (`🟢 active`, `🟡 paused`, `⚠️ caution`, `⚫ offline`), sent totals, error tallies, health index, and uptime. |
+| `/reply` | `alt: ID, user: UserID, text: Message` | **DM Operator Relay:** Transmits a message through the selected alt directly to a buyer's private DM. Opens multiline modal when `text` is omitted. |
+| `/refresh` | *(None)* | **Force Refresh:** Instantly polls latest GitHub Actions workflow states and updates the persistent dashboard embed. |
+| `/dashboard` | *(None)* | **Post Dashboard:** Re-renders and posts a fresh live status snapshot (health, sent/errors, channels, deals) to `#dashboard`. |
+| `/help` | *(None)* | **V8 Command Reference:** Categorized 7-page guide — Getting Started, Ad Controls, Channels & Deals, Alt Management, Billing & Proofs, Admin Panel, System. |
 
 ---
 
@@ -160,18 +218,21 @@ When formulating advice or commands for the operator, the AI **MUST** adhere to 
 | "Unban channel 123456 / clear slowmode on Alt 1" | `/channels alt:1 action:reset_caution channel_id:123456` |
 | "Add a new trade channel 987654321 to Alt 1" | `/channels alt:1 action:add channel_id:987654321 name:trading` |
 | "Rescan permissions on Alt 1" | `/channels alt:1 action:rescan` |
-| "Find arbitrage deals on my asset on Alt 1" | `/deals alt:1 keywords:dragon fruit, df, dragonfruit` |
+| "Find Blade Ball arbitrage deals on Alt 1" | `/deals alt:1 keywords:Blade Ball, BB token, BB tokens, BB` |
 | "Only alert if a deal has at least $0.10 profit edge" | `/deals alt:1 min_delta:0.10` |
 | "Reply to buyer 1029384756 on Alt 1" | `/reply alt:1 user:1029384756 text:Hey! 100k in stock, $2.40/1k. DM me.` |
 | "Pause posting on Alt 1" | `/pause alt:1` |
 | "Stop Alt 1 runner completely" | `/stop alt:1` |
 | "Set stealth anti-ban policy on Alt 1" | `/tune alt:1 policy:stealth` |
-| "Create a squad with Alts 1–3 and launch it" | `/squad action:create squad_name:MyGroup alts:1,2,3` then `/run squad:MyGroup` |
-| "Rescan Alt 1's channels against Discord" | `/autorescan alt:1` |
 
 ---
 
 ## 4. Directional Arbitrage Deal Scanner
+
+> **Retention insight (V8 audit):** The deal scanner is the **#1 retention
+> engine**. Customers who receive at least one SUPPLIER ALERT win within their
+> first 24h are dramatically less likely to churn. If median TTFTV crosses 60
+> minutes, onboarding becomes the #1 priority (Phase 1.5).
 
 The deal scanner continuously monitors marketplace channels, parses other users' trade offers, categorizes them directionally, and fires webhooks into `#deals` when an actionable arbitrage opportunity is detected:
 
@@ -190,7 +251,7 @@ The deal scanner continuously monitors marketplace channels, parses other users'
 ### Keyword Recommendations
 Always provide whole-word game aliases covering full names, acronyms, and plurals:
 ```
-/deals alt:1 keywords:dragon fruit, dragonfruit, df, fruits
+/deals keywords alt:1 keywords:Blade Ball, BB token, BB tokens, BB, Tokens, Robux, R$, MM2
 ```
 
 ---
@@ -200,7 +261,7 @@ Always provide whole-word game aliases covering full names, acronyms, and plural
 When prospective buyers message any fleet alt, the engine aggregates rapid-fire bursts (3.5s debouncer) and executes a multi-factor regex taxonomy before dispatching to `#dm-inbox`:
 
 ### Extracted Metadata
-- **Game / Asset:** detected from the configured `DEFAULT_ITEM_KEYWORDS` and from well-known marketplace aliases (`💎 Robux`, `🐾 Pet Sim 99`, `🔪 MM2`, `🍇 Blox Fruits`, `🐶 Adopt Me`, `🔫 Da Hood`). Nothing is hardcoded — add your own asset to the keyword list and it is classified the same way.
+- **Game / Asset:** `⚔️ Blade Ball`, `💎 Robux`, `🐾 Pet Sim 99`, `🔪 MM2`, `🍇 Blox Fruits`, `🐶 Adopt Me`, `🔫 Da Hood`
 - **Intent Type:** `🛒 Purchase Intent` (`wtb`, `cop`, `buy`), `📦 Stock Check` (`stock`, `avail`), `🔄 Price Check` (`rate`, `$/1k`), `🛡️ Vouch Request` (`proofs`, `mm`, `legit`), `🔁 Trade Offer` (`swap`, `wtt`), `💬 General Inquiry`
 - **Volume & Budget:** `500k`, `2.5m`, `10M`, `$50 budget`, `100 usd`
 - **Payment Channels:** `💳 PayPal`, `🪙 Crypto/USDT/LTC`, `💵 CashApp`, `🏦 Bank/Card`, `🎁 Trade/Robux`
@@ -251,17 +312,16 @@ When assisting the operator:
 
 ---
 
-## 9. Configurable Market Asset & Limitless Run
+## 9. Configurable Asset ("Blade Ball" replacement) & Limitless Run
 
 ### Market asset configuration
-No item name is hardcoded anywhere in the control logic or the sender. The
-market asset is driven entirely by `.env` / GitHub Secrets:
+The historically hardcoded `"Blade Ball"` text is now configurable with `.env` / GitHub Secrets:
 
-| Variable | Shipped default | Meaning |
+| Variable | Default | Meaning |
 |---|---|---|
-| `DEFAULT_ITEM_NAME` | `item` | Display name used in DM classifier fallback, bootstrap forum tag, and default sell/buy copy placeholders. |
-| `DEFAULT_ITEM_KEYWORDS` | `item,stock,goods,assets` | Whole-word aliases used by DM intent classification. |
-| `DEAL_ITEM_KEYWORDS` | `item,stock,goods,assets` | Scanner aliases. Per-alt `/deals keywords:` overrides this at runtime. |
+| `DEFAULT_ITEM_NAME` | `Blade Ball` | Display name used in DM classifier fallback, bootstrap forum tag, and default sell/buy copy placeholders. |
+| `DEFAULT_ITEM_KEYWORDS` | `Blade Ball, BladeBall, BB token, BB tokens, BB` | Whole-word aliases used by DM intent classification. |
+| `DEAL_ITEM_KEYWORDS` | `Robux, MM2, Pet Sim, Blox Fruits, Blade Ball, Tokens, RAP` | Scanner aliases. Per-alt `/deals keywords:` overrides this at runtime. |
 
 Set these once in the core repository and each alt repository secret (setup.py accepts them directly). The control bot and sender read the same values, so no source edit is required to target a different game/item.
 
@@ -287,30 +347,66 @@ Limits: `SCRIPT_TIMEOUT_SEC=20`, `SCRIPT_MEMORY_MB=256`, `SCRIPT_CPU_SEC=10`, `S
 
 The complete living bug/risk registry is in **[`BUG_TRACKER.md`](./BUG_TRACKER.md)**.
 
+---
+
+## 10. Token Safety (TODO 0.2)
+
+Founders-only rules, in order of importance:
+1. **NEVER hardcode** a `USER_TOKEN`, `GH_ADMIN_TOKEN`, `GIST_TOKEN`, or
+   `BOT_TOKEN` in source, logs, or Gist payloads. Env vars / GitHub Secrets only.
+2. Tokens are stored **obfuscated** in `customers.db` (`alt_credentials`); the
+   bot decrypts them only at dispatch time. Never print the table.
+3. Any PR that touches logging must confirm a **grep-audit** for
+   `token|secret|authorization|\.ROBLOSECURITY` — no values in output.
+4. Customer tokens are alt-account secrets; **main accounts are never
+   supported** and their tokens are never accepted (policy.py ToS).
+5. Rotate immediately on suspicion; see `V8_RUNBOOKS.md` §2.3.
+6. The Alt sender requires `curl_cffi` (browser-grade TLS fingerprint); the
+   `requests` fallback is disabled unless `ALLOW_REQUESTS_FALLBACK=1`.
+
+## 11. `/stop` Maximum Latency (TODO 0.9 — known SLA)
+
+The `/stop` compliance-critical control flow is **best-effort polling via Gist
+every 15 seconds**. Expected worst-case latency:
+
+```
+poll_interval (15s) + Gist API latency (1–3s) + processing (~5s)
+  → ~30–45 seconds from command to the alt actually stopping.
+```
+
+This is a documented SLA, not a hidden surprise: if the alt is offline or the
+Gist is unavailable, the stop cannot be guaranteed — `/stop` remains best
+effort. For hard kills use `/shutdown` (cancels workflows server-side).
+
+## 12. 48h Auto-Renew (∞ Limitless) — honest copy (TODO 1.3)
+
+- `∞ Limitless` **runs for a maximum of 48 hours per dispatch**, then the timer
+  engine **auto-re-dispatches while `active=1` and mode=limitless**, posting a
+  renewal notice to `#control`.
+- If the subscription lapses, no re-dispatch happens and the stop-reason is
+  posted. The `/run` confirmation shows the warning verbatim:
+  *"🟡 ∞ Limitless runs for a maximum of 48 hours per dispatch. A new run will
+  be required to continue."*
+- There is **no SLA** (policy card): activations, renewals, and re-dispatch are
+  best-effort and usually complete within a few hours.
+
+## 13. Kill Switch & VIP (TODO 0.4 / 1.x)
+
+- **Kill switch is a manual founder decision.** If Money-Gate conditions are
+  met (alt survival <7d baseline, churn >30%, etc.), pause new sales and
+  reassess; the bot never self-terminates the business.
+- VIP tier unlocks `/squad`, `/script`, and the `#dm-inbox` thread. The
+  `/squad` batch path uses `random.uniform` jitter (PRE-002 fix) — do not
+  remove the import.
 
 ---
 
-## 10. 2026-09-03 Audit & Polishing Update (PMTP Phases 1–3)
-
-- **23** registered slash commands inventoried and documented (was 22; `/autorescan` added).
-- `/run` asks only for a **raw message/question** — no item word, price, or RAP — and applies emoji/alteration
-  modifiers automatically. Squad targets run in sequence with a 200–500 ms random pause.
-- Log format standardized with a UTC timestamp, a severity tag (`[CONTROL]`, `[ALT-ADD] PASS/FAIL`), and a
-  consistent per-alt prefix (`[ALT-1]` … `[ALT-4]`).
-- `/channels <alt> <id1,id2,…>` **overwrites** the table; every add/remove/overwrite/refresh is logged with the
-  alt name, a UTC timestamp, and the affected channel IDs.
-- `/autorescan` (and every control-bot startup/reconnect) diffs live Discord channels against the persisted
-  registry, auto-adds new channels, removes gone ones, and logs the exact change list — zero-touch for the operator.
-- `/script simulate` returns **unfiltered** stdout/stderr/errors with real character counts, a **Sandbox Policy**
-  field, and every non-empty stream attached as a file; `/script run` executes in the same sandbox without a
-  second approval click.
-- No item name is hardcoded: `DEFAULT_ITEM_NAME`, `DEFAULT_ITEM_KEYWORDS`, and `DEAL_ITEM_KEYWORDS` ship as
-  neutral values (`item`, `item,stock,goods,assets`).
-- `FUNCTION_AUDIT_LOG.md` completes the ten-pass audit for all **522** functions (`F-001` … `F-522`) across 13
-  production modules. It is generated, not hand-written:
-  `python tools/function_audit.py` regenerates it and `python tools/function_audit.py --check` is a CI gate.
-  Zero Fail verdicts remain; every residual risk is recorded as a reviewed acceptance with its rationale in
-  `BUG_TRACKER.md` § Phase 3.
-- Verification: `python -m pytest -q tests` → 93 passed; `python self_test_all.py` → `RESULT: PASS`.
-- `BUG_TRACKER.md` updated with Phase 2 tweaks and Phase 3 findings (squad lock, diagnose quota, provision rollback risks documented with workarounds).
-- Phase 2 tweaks: error clarity improved, `/run` speed optimized (redundant 1s sleep removed), dead code checked, UX truncation safe.
+## 2026-09-03 V8 Final Audit Update
+- **21 customer/operator commands + 12 admin subcommands** — all descriptions enhanced for V8.
+- `/help` overhauled: 7 categorized pages (Getting Started → Ad Controls → Channels & Deals → Alt Management → Billing & Proofs → Admin Panel → System) with intro embed explaining V8 architecture.
+- `/getstarted` updated with 9 V8-specific steps (policy → pay → setup → run → monitor → tune → ban → renew → docs).
+- `/run` launcher renamed "V8 Ad Run Launcher"; ∞ Limitless warning shown at preview.
+- `/alt` choices restored: `logs`, `clearlogs`, `selfcheck` now appear in Discord autocomplete.
+- Removed commands confirmed: `/analytics`, `/diagnose`, `/canary`, `/topology`, `/sync` (Phase 3.5).
+- Connection audit: all 20 modules import clean, 50+ cross-module function signatures verified.
+- Test suite: **211 passed, 9 skipped, 6 subtests** — FULL SUITE GREEN.

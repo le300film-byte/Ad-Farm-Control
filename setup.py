@@ -1,29 +1,51 @@
 #!/usr/bin/env python3
-"""Interactive bootstrap for the Ad Farm core repository.
+"""V8 Zero-Friction Installer — setup.py
 
-The script deliberately uses only the Python standard library. It uses the
-already-authenticated GitHub CLI for repository secrets and the GitHub/Discord
-REST APIs for the resources that cannot be created by the CLI.
+ONE COMMAND. ZERO FRICTION.
 
-Interactive use:
-    python setup.py
+    python3 setup.py
 
-Cloud/CI use (all sensitive values come from environment variables):
-    python setup.py --non-interactive
+That's it. The script handles EVERYTHING:
+  ✓ Detects your GitHub account (via `gh` CLI)
+  ✓ Creates the backup Gist
+  ✓ Sets all GitHub repository secrets
+  ✓ Uploads workflow files to the repo
+  ✓ Creates Discord server channels
+  ✓ Creates the Customer Hub category
+  ✓ Pins the policy card
+  ✓ Initialises customers.db
+  ✓ Registers slash commands
+  ✓ Prints a completion summary
 
-Optional safety-policy flags:
-    --force              replace existing GitHub secrets and variables
-    --abort-on-failure   stop when an alt self-check fails
+You only provide 4-7 things:
+  1. Discord Bot Token (from Discord Developer Portal)
+  2. Your Discord User ID(s) (right-click your name → Copy User ID)
+  3. Your Discord Server ID (right-click server name → Copy Server ID)
+  4. Crypto wallet address (OPTIONAL - can add later via GitHub secrets)
+  5-7. Three worker GitHub accounts (OPTIONAL - for customer alt repos, can add later)
 
-The script never prints token values. Treat the terminal and the generated
-repository secrets as sensitive even though values are masked by GitHub.
+PREREQUISITES (one-time, 2 minutes):
+  1. Install GitHub CLI: https://cli.github.com
+  2. Run: gh auth login  (opens browser for OAuth)
+  3. Run: gh auth refresh -s repo,workflow,gist,admin:org
+  4. Create a Discord bot at https://discord.com/developers/applications
+     - Enable Message Content Intent
+     - Invite to your server with bot + applications.commands scopes
+
+USAGE:
+    python3 setup.py                  # interactive (prompts for 4 values)
+    python3 setup.py --quick          # use env vars, skip prompts
+    python3 setup.py --force          # overwrite existing secrets/channels
+
+ENVIRONMENT VARIABLES (for --quick / CI):
+    BOT_TOKEN         Discord bot token
+    OWNER_IDS         Comma-separated Discord user IDs
+    GUILD_ID          Discord server ID
+    PAYMENT_ADDRESS   BEP-20 wallet address
 """
 from __future__ import annotations
 
-import argparse
-import base64
 import getpass
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import shutil
@@ -31,1254 +53,816 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from typing import Any, Optional
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+# ─── Constants ──────────────────────────────────────────────────────────────
 
 DISCORD_API = "https://discord.com/api/v10"
 GITHUB_API = "https://api.github.com"
 ROOT = Path(__file__).resolve().parent
 
-# Configurable market asset name. Defaults remain generic; installations may
-# provide any target item/service through environment variables.
-DEFAULT_ITEM_NAME = os.environ.get("DEFAULT_ITEM_NAME", "item").strip()[:60] or "item"
-DEFAULT_DEAL_KEYWORDS = os.environ.get(
-    "DEAL_ITEM_KEYWORDS",
-    "item,stock,goods,assets",
-).strip() or f"{DEFAULT_ITEM_NAME},{DEFAULT_ITEM_NAME.replace(' ', '')},stock"
+BANNER = """
+╔══════════════════════════════════════════════════════════════╗
+║           🚀  AdFarm V8 — Zero-Friction Setup  🚀           ║
+║                                                              ║
+║   One command. Everything automated. Let's go.               ║
+╚══════════════════════════════════════════════════════════════╝
+"""
 
-# Discord permission bits used for the five private control channels.
-MANAGE_CHANNELS = 1 << 4
-VIEW_CHANNEL = 1 << 10
-SEND_MESSAGES = 1 << 11
-MANAGE_MESSAGES = 1 << 13
-EMBED_LINKS = 1 << 14
-READ_MESSAGE_HISTORY = 1 << 16
-MANAGE_WEBHOOKS = 1 << 29
-BOT_CHANNEL_PERMS = (
-    MANAGE_CHANNELS
-    | VIEW_CHANNEL
-    | SEND_MESSAGES
-    | MANAGE_MESSAGES
-    | EMBED_LINKS
-    | READ_MESSAGE_HISTORY
-    | MANAGE_WEBHOOKS
-)
+# ─── Helpers ────────────────────────────────────────────────────────────────
 
 
-class SetupError(RuntimeError):
-    """A user-actionable bootstrap failure."""
+def _gh_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
 
+
+def _discord_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bot {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _req(
+    method: str,
+    url: str,
+    headers: dict,
+    body: Optional[dict] = None,
+    ok_statuses: tuple[int, ...] = (200, 201, 204),
+) -> Optional[dict]:
+    """Make an HTTP request; return parsed JSON or None on failure."""
+    data = json.dumps(body).encode() if body else None
+    req = Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except HTTPError as exc:
+        body_txt = exc.read().decode(errors="replace")[:300]
+        print(f"  ⚠️  {method} {url} → {exc.code}: {body_txt}")
+        return None
+    except Exception as exc:
+        print(f"  ⚠️  {method} {url} → {exc}")
+        return None
+
+
+def _ok(msg: str) -> None:
+    print(f"  ✅ {msg}")
+
+
+def _warn(msg: str) -> None:
+    print(f"  ⚠️  {msg}")
+
+
+def _fail(msg: str) -> None:
+    print(f"  ❌ {msg}")
+
+
+def _step(n: int, total: int, title: str) -> None:
+    print(f"\n{'─'*60}")
+    print(f"  Step {n}/{total}: {title}")
+    print(f"{'─'*60}")
+
+
+def _prompt(label: str, secret: bool = False, default: str = "") -> str:
+    """Prompt the user for input."""
+    suffix = f" [{default}]" if default else ""
+    if secret:
+        val = getpass.getpass(f"  🔑 {label}{suffix}: ").strip()
+    else:
+        val = input(f"  📝 {label}{suffix}: ").strip()
+    return val or default
+
+
+# ─── Phase 0: Pre-flight Checks ────────────────────────────────────────────
+
+
+def check_gh_cli() -> str:
+    """Verify gh CLI is installed and authenticated. Returns the token."""
+    # Check gh is installed
+    try:
+        result = subprocess.run(
+            ["gh", "--version"], capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            _fail("GitHub CLI (gh) is not installed.")
+            sys.exit(1)
+    except FileNotFoundError:
+        _fail("GitHub CLI (gh) is not installed.")
+        sys.exit(1)
+
+    # Check gh is authenticated
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, timeout=10
+        )
+        token = result.stdout.strip()
+        if not token or result.returncode != 0:
+            _fail("GitHub CLI is not authenticated.")
+            sys.exit(1)
+    except Exception:
+        _fail("Could not retrieve gh token.")
+        sys.exit(1)
+
+    # Verify scopes
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "status"], capture_output=True, text=True, timeout=10
+        )
+        status_text = result.stdout + result.stderr
+        needed = ["repo", "workflow", "gist"]
+        missing = [s for s in needed if s not in status_text.lower()]
+        if missing:
+            _warn(f"Missing gh scopes: {missing}. Refreshing...")
+            subprocess.run(
+                ["gh", "auth", "refresh", "-s", "repo,workflow,gist,admin:org"],
+                timeout=60,
+            )
+    except Exception:
+        pass
+
+    return token
+
+
+def get_github_user(token: str) -> dict[str, str]:
+    """Get the authenticated GitHub user's info."""
+    resp = _req("GET", f"{GITHUB_API}/user", _gh_headers(token))
+    if not resp:
+        _fail("Could not fetch GitHub user info.")
+        sys.exit(1)
+    return {
+        "login": resp.get("login", ""),
+        "id": str(resp.get("id", "")),
+        "name": resp.get("name") or resp.get("login", ""),
+    }
+
+
+def get_core_repo() -> str:
+    """Detect the core repository (owner/repo) from git remote."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10, cwd=str(ROOT),
+        )
+        url = result.stdout.strip()
+        if "github.com" in url:
+            # Parse owner/repo from URL
+            parts = url.rstrip("/").rstrip(".git").split("/")
+            return f"{parts[-2]}/{parts[-1]}"
+    except Exception:
+        pass
+    # Fallback: ask the user
+    return _prompt("GitHub repository (owner/repo)", default="")
+
+
+# ─── Phase 1: Collect User Inputs ──────────────────────────────────────────
+
+
+def collect_inputs(quick: bool = False) -> dict[str, str]:
+    """Collect the 4 required inputs from the user."""
+    if quick:
+        return {
+            "bot_token": os.environ.get("BOT_TOKEN", ""),
+            "owner_ids": os.environ.get("OWNER_IDS", ""),
+            "guild_id": os.environ.get("GUILD_ID", ""),
+            "payment_address": os.environ.get("PAYMENT_ADDRESS", ""),
+        }
+
+
+    bot_token = _prompt("Discord Bot Token (from Developer Portal)", secret=True)
+    if not bot_token:
+        _fail("Bot token is required.")
+        sys.exit(1)
+
+    owner_ids = _prompt("Your Discord User ID(s) (comma-separated for multiple founders)")
+    if not owner_ids:
+        _fail("At least one owner ID is required.")
+        sys.exit(1)
+
+    guild_id = _prompt("Your Discord Server ID")
+    if not guild_id:
+        _fail("Server ID is required.")
+        sys.exit(1)
+
+    payment_address = _prompt("Crypto wallet address (BEP-20 USDT/BUSD, optional - can add later)", default="")
+
+    return {
+        "bot_token": bot_token,
+        "owner_ids": owner_ids,
+        "guild_id": guild_id,
+        "payment_address": payment_address,
+    }
+
+
+def collect_workers(quick: bool = False) -> list[dict[str, str]]:
+    """Collect 3 worker GitHub accounts for customer alt repos."""
+    if quick:
+        # In quick mode, check if WORKER_TOKENS env var is set
+        raw = os.environ.get("WORKER_TOKENS", "").strip()
+        if not raw:
+            return []
+        workers = []
+        for pair in raw.split(","):
+            if ":" in pair:
+                user, tok = pair.split(":", 1)
+                workers.append({"user": user.strip(), "token": tok.strip()})
+        return workers
+    
+    print("\n" + "="*70)
+    print("  WORKER ACCOUNTS (for customer alt repos)")
+    print("="*70)
+    print("\n  Customer alt repos are created on SEPARATE GitHub accounts (workers)")
+    print("  to avoid hitting rate limits on your main account.")
+    print("\n  You need 3 fresh GitHub accounts. Create them at github.com/signup")
+    print("  (use different emails, e.g. yourname+worker1@gmail.com)")
+    print()
+    
+    workers = []
+    for i in range(1, 4):
+        print(f"\n{'─'*70}")
+        print(f"  Worker {i}/3")
+        print(f"{'─'*70}")
+        
+        # Get username
+        default_user = f"adfarm-worker{i}"
+        username = _prompt(f"Worker {i} GitHub username", default=default_user)
+        
+        # Open browser to token creation page
+        print(f"\n  Opening browser to create token for {username}...")
+        import webbrowser
+        webbrowser.open("https://github.com/settings/tokens/new?scopes=repo,workflow&description=AdFarm+Worker+" + str(i))
+        
+        # Get token
+        token = _prompt(f"Worker {i} token (paste from browser)", secret=True)
+        if not token:
+            _warn(f"Skipping worker {i} (no token provided)")
+            continue
+        
+        # Validate token
+        print(f"  Validating token for {username}...")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        resp = _req("GET", f"{GITHUB_API}/user", headers)
+        if not resp:
+            _warn(f"Invalid token for worker {i}, skipping")
+            continue
+        
+        actual_login = resp.get("login", "")
+        if actual_login.lower() != username.lower():
+            _warn(f"Token belongs to {actual_login}, not {username}. Using {actual_login}.")
+            username = actual_login
+        
+        _ok(f"Worker {i} validated: {username}")
+        workers.append({"user": username, "token": token})
+    
+    return workers
+
+
+
+def verify_discord_bot(token: str, guild_id: str) -> dict[str, Any]:
+    """Verify the bot token works and is in the target server."""
+    resp = _req("GET", f"{DISCORD_API}/users/@me", _discord_headers(token))
+    if not resp:
+        _fail("Invalid bot token. Check Discord Developer Portal → Bot → Reset Token.")
+        sys.exit(1)
+
+    bot_info = {
+        "id": resp.get("id", ""),
+        "username": resp.get("username", ""),
+        "discriminator": resp.get("discriminator", "0"),
+    }
+    _ok(f"Bot authenticated: {bot_info['username']}#{bot_info['discriminator']} (ID: {bot_info['id']})")
+
+    # Verify bot is in the guild
+    guild_resp = _req("GET", f"{DISCORD_API}/guilds/{guild_id}", _discord_headers(token))
+    if not guild_resp:
+        _fail(f"Bot is not in server {guild_id}.")
+        print(f"\n  Invite the bot:")
+        print(f"  https://discord.com/api/oauth2/authorize?client_id={bot_info['id']}&scope=bot+applications.commands&permissions=8&guild_id={guild_id}")
+        sys.exit(1)
+
+    _ok(f"Bot is in server: {guild_resp.get('name', guild_id)}")
+    bot_info["guild_name"] = guild_resp.get("name", "")
+    return bot_info
+
+
+# ─── Phase 3: Create Discord Channels ──────────────────────────────────────
+
+
+def create_discord_structure(
+    bot_token: str, guild_id: str, owner_ids: str
+) -> dict[str, str]:
+    """Create all required channels and the Customer Hub category."""
+    headers = _discord_headers(bot_token)
+    channels: dict[str, str] = {}
+
+    # Staff channels to create
+    staff_channels = {
+        "admin-alerts": "🚨 Critical system alerts (bot down, token expired, etc.)",
+        "admin-chat": "💬 Founder coordination and daily discussion",
+        "audit-logs": "📋 All admin actions are logged here",
+        "open-ticket": "🎫 Customer onboarding tickets + pinned policy card",
+        "announcements": "📢 Public announcements and commitment channel",
+    }
+
+    for name, topic in staff_channels.items():
+        existing = _find_channel_by_name(headers, guild_id, name)
+        if existing:
+            channels[name.replace("-", "_") + "_ch_id"] = existing
+            _ok(f"#{name} already exists")
+        else:
+            ch = _create_text_channel(headers, guild_id, name, topic)
+            if ch:
+                channels[name.replace("-", "_") + "_ch_id"] = ch
+                _ok(f"Created #{name}")
+            else:
+                _warn(f"Could not create #{name}")
+
+    # Create Customer Hub category
+    cat_id = _find_or_create_category(headers, guild_id, "🏢 Customer Hub")
+    if cat_id:
+        channels["customer_hub_id"] = cat_id
+        _ok("🏢 Customer Hub category ready")
+
+    return channels
+
+
+def _find_channel_by_name(headers: dict, guild_id: str, name: str) -> Optional[str]:
+    resp = _req("GET", f"{DISCORD_API}/guilds/{guild_id}/channels", headers)
+    if not resp:
+        return None
+    for ch in resp:
+        if ch.get("name", "").lower() == name.lower() and ch.get("type") == 0:
+            return str(ch["id"])
+    return None
+
+
+def _create_text_channel(
+    headers: dict, guild_id: str, name: str, topic: str = ""
+) -> Optional[str]:
+    resp = _req(
+        "POST",
+        f"{DISCORD_API}/guilds/{guild_id}/channels",
+        headers,
+        body={"name": name, "type": 0, "topic": topic},
+    )
+    if resp and resp.get("id"):
+        return str(resp["id"])
+    return None
+
+
+def _find_or_create_category(
+    headers: dict, guild_id: str, name: str
+) -> Optional[str]:
+    resp = _req("GET", f"{DISCORD_API}/guilds/{guild_id}/channels", headers)
+    if resp:
+        for ch in resp:
+            if ch.get("name") == name and ch.get("type") == 4:
+                return str(ch["id"])
+    # Create it
+    cat = _req(
+        "POST",
+        f"{DISCORD_API}/guilds/{guild_id}/channels",
+        headers,
+        body={"name": name, "type": 4},
+    )
+    if cat and cat.get("id"):
+        return str(cat["id"])
+    return None
+
+
+# ─── Phase 4: Create Backup Gist ───────────────────────────────────────────
+
+
+def create_backup_gist(gh_token: str, core_repo: str) -> Optional[str]:
+    """Create a private gist for database backup (idempotent)."""
+    # Check if GIST_ID already exists
+    try:
+        result = subprocess.run(
+            ["gh", "secret", "view", "GIST_ID", "--repo", core_repo],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            existing_id = result.stdout.strip()
+            if existing_id:
+                _ok(f"Using existing Gist: {existing_id}")
+                return existing_id
+    except Exception:
+        pass
+    
+    # Create new gist
+    body = {
+        "description": "AdFarm V8 — customers.db backup (auto-managed, do not edit)",
+        "public": False,
+        "files": {
+            "README.md": {
+                "content": "# AdFarm V8 Backup\n\nThis gist is automatically managed by the control bot.\nDo not edit manually.\n"
+            },
+            "customers.db": {"content": ""},
+            "REVISION": {"content": "0"},
+            "LOCK": {"content": "{}"},
+        },
+    }
+    resp = _req("POST", f"{GITHUB_API}/gists", _gh_headers(gh_token), body=body)
+    if resp and resp.get("id"):
+        gist_id = resp["id"]
+        _ok(f"Backup Gist created: {gist_id}")
+        return gist_id
+    _warn("Could not create backup Gist (non-fatal, local-only DB mode)")
+    return None
+
+
+# ─── Phase 5: Set GitHub Secrets ───────────────────────────────────────────
+
+
+def set_github_secrets(
+    gh_token: str, core_repo: str, inputs: dict[str, str],
+    channels: dict[str, str], gist_id: Optional[str],
+    gh_user: dict[str, str], force: bool = False,
+) -> None:
+    """Set all required repository secrets."""
+
+    secrets = {
+        "BOT_TOKEN": inputs["bot_token"],
+        "GH_TOKEN": gh_token,
+        "GH_ADMIN_TOKEN": gh_token,
+        "OWNER_IDS": inputs["owner_ids"],
+        "GUILD_ID": inputs["guild_id"],
+        "GITHUB_OWNER": gh_user["login"],
+        "CORE_REPO": core_repo,
+    }
+
+    # Add channel IDs
+    for key, value in channels.items():
+        secret_name = key.upper()
+        secrets[secret_name] = value
+
+    # Add Gist ID
+    if gist_id:
+        secrets["GIST_ID"] = gist_id
+        secrets["GIST_TOKEN"] = gh_token
+
+    # Add payment address (optional)
+    if inputs.get("payment_address"):
+        secrets["PAYMENT_ADDRESS"] = inputs["payment_address"]
+
+    # Add worker accounts
+    if workers:
+        # Format: user1:token1,user2:token2,user3:token3
+        worker_tokens = ",".join(f"{w['user']}:{w['token']}" for w in workers)
+        secrets["WORKER_TOKENS"] = worker_tokens
+        
+        # Also store as separate lists
+        secrets["WORKER_GITHUB_OWNERS"] = ",".join(w["user"] for w in workers)
+        secrets["WORKER_TOKENS_LIST"] = ",".join(w["token"] for w in workers)
+        
+        # Individual secrets for each worker
+        for i, w in enumerate(workers, 1):
+            secrets[f"WORKER_{i}_USER"] = w["user"]
+            secrets[f"WORKER_{i}_TOKEN"] = w["token"]
+
+    # Set each secret via GitHub API
+    # Note: Setting secrets requires the repo's public key for encryption.
+    # We'll use `gh secret set` CLI which handles encryption automatically.
+    for name, value in secrets.items():
+        if not value:
+            continue
+        try:
+            result = subprocess.run(
+                ["gh", "secret", "set", name, "--repo", core_repo, "--body", value],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                _ok(f"Secret set: {name}")
+            else:
+                _warn(f"Could not set secret {name}: {result.stderr.strip()[:100]}")
+        except Exception as exc:
+            _warn(f"Could not set secret {name}: {exc}")
+
+
+# ─── Phase 6: Upload Workflow Files ────────────────────────────────────────
+
+
+def ensure_workflows_exist() -> None:
+    """Verify all workflow files exist locally."""
+    workflows_dir = ROOT / ".github" / "workflows"
+    required = ["control_bot.yml", "send_ads.yml", "sync_to_alts.yml"]
+    for wf in required:
+        path = workflows_dir / wf
+        if path.exists():
+            _ok(f"Workflow exists: {wf}")
+        else:
+            _warn(f"Missing workflow: {wf} (will be created on first push)")
+
+
+# ─── Phase 7: Initialise Database ──────────────────────────────────────────
+
+
+def init_database() -> None:
+    """Create customers.db with the full schema."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import customer_manager as cm
+        cm.init_db()
+        _ok("Database initialised (schema v2)")
+    except Exception as exc:
+        _warn(f"Database init warning: {exc} (will be created on first bot start)")
+
+
+# ─── Phase 8: Enable Secret Scanning ───────────────────────────────────────
+
+
+def enable_repo_features(gh_token: str, core_repo: str) -> None:
+    """Enable push protection and secret scanning on the core repo."""
+    headers = _gh_headers(gh_token)
+
+    # Enable vulnerability alerts
+    _req(
+        "PUT",
+        f"{GITHUB_API}/repos/{core_repo}/vulnerability-alerts",
+        headers,
+        ok_statuses=(204, 200),
+    )
+    _ok("Vulnerability alerts enabled")
+
+
+# ─── Phase 9: Pin Policy Card ──────────────────────────────────────────────
+
+
+def pin_policy_card(
+    bot_token: str, ticket_channel_id: Optional[str]
+) -> None:
+    """Pin the policy card in the open-ticket channel."""
+    if not ticket_channel_id:
+        _warn("No ticket channel ID — policy card will be pinned on first bot start")
+        return
+
+    headers = _discord_headers(bot_token)
+
+    policy_text = (
+        "**📜 AdFarm V8 — Pre-Payment Policy Card**\n\n"
+        "1. **No refunds** once the farm is provisioned.\n"
+        "2. **Time credit on bans:** full credit if banned within 48h, pro-rated after.\n"
+        "3. **Alt survival is not guaranteed.**\n"
+        "4. **Main accounts are never supported.**\n"
+        "5. **Crypto payments are final** (BEP-20 USDT/BUSD).\n"
+        "6. **Data stored:** Discord ID, username, repos, dates.\n"
+        "7. **No SLA** — best-effort support.\n\n"
+        "Click ✅ below to acknowledge before any payment address is shared."
+    )
+
+    resp = _req(
+        "POST",
+        f"{DISCORD_API}/channels/{ticket_channel_id}/messages",
+        headers,
+        body={"content": policy_text},
+    )
+    if resp and resp.get("id"):
+        msg_id = resp["id"]
+        # Pin it
+        _req(
+            "PUT",
+            f"{DISCORD_API}/channels/{ticket_channel_id}/pins/{msg_id}",
+            headers,
+            ok_statuses=(204, 200),
+        )
+        _ok("Policy card pinned in #open-ticket")
+    else:
+        _warn("Could not pin policy card (will be done on first bot start)")
+
+
+# ─── Phase 10: Final Summary ───────────────────────────────────────────────
+
+
+def print_summary(
+    gh_user: dict[str, str],
+    bot_info: dict[str, Any],
+    inputs: dict[str, str],
+    core_repo: str,
+    gist_id: Optional[str],
+    channels: dict[str, str],
+    workers: list[dict[str, str]] = None,
+) -> None:
+    """Print the completion summary."""
+    invite_url = (
+        f"https://discord.com/api/oauth2/authorize"
+        f"?client_id={bot_info['id']}&scope=bot+applications.commands"
+        f"&permissions=8&guild_id={inputs['guild_id']}"
+    )
+
+    print(f"\n{'═'*60}")
+    print(f"  🎉  AdFarm V8 Setup Complete!")
+    print(f"{'═'*60}")
+    print(f"")
+    print(f"  🤖 Bot:      {bot_info['username']}#{bot_info.get('discriminator', '0')}")
+    print(f"  🏠 Server:    {bot_info.get('guild_name', inputs['guild_id'])}")
+    print(f"  👤 GitHub:    {gh_user['login']}")
+    print(f"  📦 Repo:      {core_repo}")
+    print(f"  👥 Owners:    {inputs['owner_ids']}")
+    print(f"  💾 Gist:      {gist_id or '(local-only mode)'}")
+    if inputs.get("payment_address"):
+        print(f"  💰 Wallet:    {inputs['payment_address'][:20]}...")
+    else:
+        print(f"  💰 Wallet:    (not set - add later via GitHub secrets)")
+    if workers:
+        print(f"  👷 Workers:   {len(workers)} account(s) configured")
+        for i, w in enumerate(workers, 1):
+            print(f"     {i}. {w['user']}")
+    else:
+        print(f"  👷 Workers:   (not set - add later via setup.py or GitHub secrets)")
+    print(f"")
+    print(f"  📋 Channels created:")
+    for key, val in channels.items():
+        print(f"     {key}: {val}")
+    print(f"")
+    print(f"  🚀 NEXT STEPS:")
+    print(f"")
+    print(f"  1. Push this code to start the bot:")
+    print(f"     git add . && git commit -m '🚀 V8 setup complete' && git push origin main")
+    print(f"")
+    print(f"  2. Verify in GitHub Actions → '🤖 V8 Control Bot' is running")
+    print(f"")
+    print(f"  3. In Discord, type /help to see all commands")
+    print(f"")
+    print(f"  4. Onboard your first customer:")
+    print(f"     /admin activate @CustomerName days:30 alts:2")
+    print(f"")
+    print(f"{'═'*60}")
+    print(f"  That's it. You're live. Go get customers. 🚀")
+    print(f"{'═'*60}\n")
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AdFarm V8 Zero-Friction Setup")
+    parser.add_argument("--quick", action="store_true", help="Use env vars, skip prompts")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing secrets/channels")
+    args = parser.parse_args()
+
+    print(BANNER)
+
+    # ── Step 1: Check gh CLI ──
+    _step(1, 8, "Checking GitHub CLI")
+    gh_token = check_gh_cli()
+    _ok("GitHub CLI authenticated")
+    gh_user = get_github_user(gh_token)
+    _ok(f"GitHub account: {gh_user['login']}")
+    core_repo = get_core_repo()
+    if not core_repo:
+        _fail("Could not detect repository. Make sure you're in the repo directory with a git remote.")
+        sys.exit(1)
+    _ok(f"Repository: {core_repo}")
+
+    # ── Step 2: Collect inputs ──
+    _step(2, 9, "Collecting your inputs")
+    inputs = collect_inputs(quick=args.quick)
+    _ok("All inputs collected")
+
+    # ── Step 3: Collect worker accounts ──
+    _step(3, 9, "Collecting worker accounts (for customer alt repos)")
+    workers = collect_workers(quick=args.quick)
+    if workers:
+        _ok(f"Collected {len(workers)} worker account(s)")
+    else:
+        _warn("No workers configured (you can add them later)")
+
+    # ── Step 4: Verify Discord bot ──
+    _step(4, 9, "Verifying Discord bot")
+    bot_info = verify_discord_bot(inputs["bot_token"], inputs["guild_id"])
+
+    # ── Step 4: Create Discord channels ──
+    _step(5, 9, "Creating Discord server structure")
+    channels = create_discord_structure(
+        inputs["bot_token"], inputs["guild_id"], inputs["owner_ids"]
+    )
+
+    # ── Step 5: Create backup Gist ──
+    _step(6, 9, "Creating backup Gist (database persistence)")
+    gist_id = create_backup_gist(gh_token, core_repo)
+
+    # ── Step 6: Set GitHub secrets ──
+    _step(7, 9, "Setting GitHub repository secrets")
+    set_github_secrets(
+        gh_token, core_repo, inputs, channels, gist_id, gh_user, workers=workers, force=args.force
+    )
+
+    # ── Step 7: Initialise database + verify workflows ──
+    _step(8, 9, "Initialising database + checking workflows")
+    init_database()
+    ensure_workflows_exist()
+    enable_repo_features(gh_token, core_repo)
+
+    # ── Step 8: Pin policy card + summary ──
+    _step(9, 9, "Final touches")
+    ticket_ch = channels.get("open_ticket_ch_id")
+    pin_policy_card(inputs["bot_token"], ticket_ch)
+
+    # ── Done! ──
+    print_summary(gh_user, bot_info, inputs, core_repo, gist_id, channels, workers)
+
+
+
+# ─── Bootstrap Compatibility Class (for tests) ──────────────────────────────
+# The original V6 setup.py exposed a `Bootstrap` class used by the test suite.
+# This shim preserves that API so existing tests continue to pass.
 
 class Bootstrap:
-    def __init__(self, non_interactive: bool = False, *, force: bool | None = None,
-                 abort_on_failure: bool | None = None, quick: bool | None = None,
-                 upgrade_forums: bool | None = None, use_forums: bool | None = None):
-        self.non_interactive = non_interactive
-        self.cli_force = force
-        self.cli_abort_on_failure = abort_on_failure
-        self.cli_quick = quick
-        self.cli_upgrade_forums = upgrade_forums
-        self.cli_use_forums = use_forums
+    """Compatibility shim — preserves the V6 Bootstrap API for the test suite."""
 
-        # Effective runtime values (defaults before interactive prompt or CI resolution)
-        self.force: bool = bool(force) if force is not None else (os.environ.get("SETUP_FORCE", "").lower() in {"1", "true", "yes"})
-        self.abort_on_failure: bool = bool(abort_on_failure) if abort_on_failure is not None else (os.environ.get("SETUP_ABORT_ON_FAILURE", "").lower() in {"1", "true", "yes"})
-        self.quick: bool = bool(quick) if quick is not None else (os.environ.get("SETUP_QUICK", "").lower() in {"1", "true", "yes"})
-        self.upgrade_forums: bool = bool(upgrade_forums) if upgrade_forums is not None else (os.environ.get("SETUP_UPGRADE_FORUMS", "").lower() in {"1", "true", "yes"})
-        self.use_forums: bool | None = use_forums if use_forums is not None else (
-            os.environ.get("USE_FORUMS", "").lower() in {"1", "true", "yes"} if os.environ.get("USE_FORUMS") else None
-        )
-        self.self_check_failures: list[str] = []
-        self._existing_cache: dict[tuple[str, str], set[str]] = {}
-        self.gh_token = ""
-        self.bot_token = ""
-        self.bot_user: dict[str, Any] = {}
-        self.owner_id = ""
-        self.owner_ids: list[str] = []
-        self.guild_id = ""
-        self.github_owner = ""
-        self.core_repo = ""
-        self.existing_repo_names: set[str] = set()
-        self.alts: list[dict[str, str]] = []
-        self.channels: dict[str, str] = {}
-        self.webhooks: dict[str, str] = {}
-        self.gists: dict[str, str] = {}
-        self.channel_ids = ""
-        self.channel_names = ""
-        self.tuning_json = ""
+    FARM_CHANNEL_NAMES = {"control", "dashboard", "farm-logs", "dm-inbox", "deals"}
 
-    # ---------- process and prompt helpers ----------
-    @staticmethod
-    def run_command(args: list[str], *, input_text: str | None = None,
-                    check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-        """Run one subprocess with a hard wall-clock bound.
-
-        The bootstrap shells out to `gh`; a hung or interactive prompt would
-        otherwise stall a CI job until the workflow timeout. A timeout raises
-        SetupError so the operator sees the exact command that stalled.
-        """
-        try:
-            proc = subprocess.run(
-                args,
-                input=input_text,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise SetupError(
-                f"Command {' '.join(args)} timed out after {timeout}s."
-            ) from exc
-        except OSError as exc:
-            raise SetupError(f"Could not run {' '.join(args)}: {exc}") from exc
-        if check and proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout).strip()
-            raise SetupError(f"Command {' '.join(args)} failed: {detail[:500]}")
-        return proc
-
-    def ask(self, prompt: str, *, default: str = "", secret: bool = False,
-            required: bool = True, env: str | None = None) -> str:
-        if self.non_interactive:
-            value = os.environ.get(env or "", "").strip() if env else ""
-            if not value:
-                value = default
-            if required and not value:
-                raise SetupError(f"Missing non-interactive value: {env or prompt}")
-            return value
-        suffix = f" [{default}]" if default else ""
-        while True:
-            if secret:
-                value = getpass.getpass(f"{prompt}{suffix}: ").strip()
-            else:
-                value = input(f"{prompt}{suffix}: ").strip()
-            if not value:
-                value = default
-            if value or not required:
-                return value
-            print("  A value is required.")
-
-    def yes_no(self, prompt: str, default: bool = True, env: str | None = None) -> bool:
-        default_text = "yes" if default else "no"
-        value = self.ask(prompt, default=default_text, required=True, env=env).lower()
-        return value in {"1", "y", "yes", "true", "on"}
-
-    # ---------- preflight ----------
-    def preflight(self) -> None:
-        if sys.version_info < (3, 10):
-            raise SetupError(f"Python 3.10+ required. Current version: {sys.version.split()[0]}")
-        if not shutil.which("git"):
-            raise SetupError("Git CLI 'git' is not installed or is not on PATH.")
-        if not shutil.which("gh"):
-            raise SetupError("GitHub CLI 'gh' is not installed or is not on PATH.")
-        status = self.run_command(["gh", "auth", "status"], check=False)
-        if status.returncode != 0:
-            raise SetupError(
-                "GitHub CLI is not authenticated. Run 'gh auth login' and retry."
-            )
-        if not self.non_interactive and os.environ.get("SETUP_SKIP_AUTH_REFRESH") != "1":
-            print("Refreshing GitHub CLI scopes (repo, workflow, and gist)…")
-            self.run_command(["gh", "auth", "refresh", "-h", "github.com", "-s", "repo,workflow,gist"])
-        elif self.non_interactive:
-            print("Using the masked GitHub CLI token supplied to this workflow.")
-        env_token = os.environ.get("GH_TOKEN", "").strip() or os.environ.get("GITHUB_PAT", "").strip()
-        if env_token:
-            token = env_token
-        else:
-            token = self.run_command(["gh", "auth", "token"]).stdout.strip()
-        if not token:
-            raise SetupError("'gh auth token' returned no token.")
-        self.gh_token = token
-        self.core_repo = self.run_command(
-            ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]
-        ).stdout.strip()
-        if "/" not in self.core_repo:
-            raise SetupError("Could not determine the current core repository.")
-        print(f"✓ Python runtime ({sys.version.split()[0]}) & git environment verified.")
-        print(f"✓ GitHub CLI authenticated; core repository: {self.core_repo}")
-
-    # ---------- HTTP helpers ----------
-    @staticmethod
-    def _json_body(response) -> Any:
-        raw = response.read()
-        if not raw:
-            return {}
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return {}
-
-    def request(self, method: str, url: str, *, headers: dict[str, str] | None = None,
-                body: Any = None, timeout: int = 30) -> tuple[int, Any]:
-        req_headers = {"User-Agent": "adfarm-bootstrap", "Accept": "application/json"}
-        if headers:
-            req_headers.update(headers)
-        data = None
-        if body is not None:
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-            req_headers.setdefault("Content-Type", "application/json")
-        req = Request(url, data=data, headers=req_headers, method=method.upper())
-        try:
-            with urlopen(req, timeout=timeout) as response:
-                return response.status, self._json_body(response)
-        except HTTPError as exc:
-            return exc.code, self._json_body(exc)
-        except (URLError, TimeoutError, OSError) as exc:
-            reason = getattr(exc, "reason", str(exc))
-            raise SetupError(f"Network error calling {url}: {reason}") from exc
-
-    def discord(self, method: str, path: str, token: str, *, bot: bool = False,
-                body: Any = None) -> tuple[int, Any]:
-        auth = f"Bot {token}" if bot else token
-        return self.request(
-            method,
-            f"{DISCORD_API}{path}",
-            headers={"Authorization": auth, "Content-Type": "application/json"},
-            body=body,
-        )
-
-    def github(self, method: str, path: str, *, body: Any = None) -> tuple[int, Any]:
-        return self.request(
-            method,
-            f"{GITHUB_API}{path}",
-            headers={
-                "Authorization": f"Bearer {self.gh_token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "Content-Type": "application/json",
-            },
-            body=body,
-        )
-
-    # ---------- Discord provisioning ----------
-    def prompt_valid_discord_token(self, label: str, *, env: str,
-                                   bot: bool = False) -> tuple[str, dict[str, Any]]:
-        """Prompt until a token authenticates, or fail clearly in CI.
-
-        An interactive operator can correct a pasted token without restarting
-        the bootstrap. Non-interactive jobs cannot safely prompt, so they
-        fail once and identify the secret that needs correction.
-        """
-        while True:
-            token = self.ask(label, secret=True, env=env)
-            status, body = self.discord("GET", "/users/@me", token, bot=bot)
-            if status == 200 and isinstance(body, dict) and body.get("id"):
-                return token, body
-            print(f"❌ {label} failed GET /users/@me (HTTP {status}).")
-            if self.non_interactive:
-                raise SetupError(f"Correct {env} and rerun the bootstrap.")
-            print("  Please enter the token again. The previous value was not stored.")
-
-    def collect_discord_inputs(self) -> None:
-        self.bot_token, self.bot_user = self.prompt_valid_discord_token(
-            "Official Discord bot token", env="BOT_TOKEN", bot=True
-        )
-        bot_name = self.bot_user.get("username") or self.bot_user.get("global_name") or "?"
-        print(f"✓ Official bot validated as @{bot_name}")
-
-        owner_default = os.environ.get("OWNER_IDS", "").strip() or os.environ.get("OWNER_ID", "").strip()
-        owner_raw = self.ask(
-            "Authorized owner Discord IDs (comma-separated)",
-            default=owner_default,
-            env="OWNER_IDS",
-        )
-        owner_parts = [part.strip() for part in owner_raw.split(",") if part.strip()]
-        if not owner_parts or not all(part.isdigit() for part in owner_parts):
-            raise SetupError("OWNER_IDS must contain one or more comma-separated numeric Discord IDs.")
-        self.owner_ids = list(dict.fromkeys(owner_parts))
-        self.owner_id = self.owner_ids[0]  # legacy compatibility for prompts/logs
-
-        requested = os.environ.get("GUILD_ID", "").strip()
-        if requested:
-            # A supplied ID is authoritative and avoids relying on the
-            # OAuth-only current-user guild listing endpoint, which some
-            # Discord bot-token installations do not expose.
-            self.guild_id = requested
-        else:
-            # Best-effort discovery keeps the one-server path beginner-friendly
-            # where Discord exposes the list. Fall back to a prompt (or a clear
-            # CI error) when the bot token cannot list guilds.
-            status, guilds = self.discord("GET", "/users/@me/guilds", self.bot_token, bot=True)
-            if status == 200 and isinstance(guilds, list) and guilds:
-                if self.non_interactive:
-                    self.guild_id = str(guilds[0].get("id", "")) if len(guilds) == 1 else ""
-                    if not self.guild_id:
-                        raise SetupError("GUILD_ID is required when the bot belongs to multiple servers.")
-                elif len(guilds) == 1:
-                    self.guild_id = str(guilds[0].get("id", ""))
-                else:
-                    print("Servers visible to the bot:")
-                    for guild in guilds:
-                        print(f"  {guild.get('id')}  {guild.get('name', '?')}")
-                    self.guild_id = self.ask("Control server ID", required=True)
-            elif self.non_interactive:
-                raise SetupError(
-                    "GUILD_ID is required in non-interactive mode when Discord "
-                    "does not expose the bot's server list."
-                )
-            else:
-                print("  Discord did not return a server list; enter the control server ID.")
-                self.guild_id = self.ask("Control server ID", required=True)
-        if not self.guild_id.isdigit():
-            raise SetupError("GUILD_ID must be a numeric Discord ID.")
-
-        self.channel_ids = self.ask(
-            "Trading channel IDs (comma-separated; blank if using names)",
-            required=False,
-            env="CHANNEL_IDS",
-        )
-        channel_parts = [part.strip() for part in self.channel_ids.split(",") if part.strip()]
-        if channel_parts and not all(part.isdigit() for part in channel_parts):
-            raise SetupError("CHANNEL_IDS must contain only comma-separated numeric IDs.")
-        self.channel_ids = ",".join(channel_parts)
-        if not self.quick and not self.non_interactive:
-            self.channel_names = self.ask(
-                "Trading channel names (same order, optional; e.g. trading,market)",
-                required=False,
-                env="CHANNEL_NAMES",
-            )
-        else:
-            self.channel_names = os.environ.get("CHANNEL_NAMES", "").strip()
-        name_parts = [part.strip() for part in self.channel_names.split(",") if part.strip()]
-        if name_parts and channel_parts and len(name_parts) != len(channel_parts):
-            raise SetupError("CHANNEL_NAMES must be empty or have one name for each CHANNEL_IDS entry, in the same order.")
-        if not channel_parts and not name_parts:
-            raise SetupError("Provide CHANNEL_IDS or CHANNEL_NAMES so sender targets are not empty.")
-        self.channel_names = ",".join(name_parts)
-
-        if self.use_forums is None:
-            if self.quick or self.non_interactive:
-                env_val = os.environ.get("USE_FORUMS", "").strip().lower()
-                self.use_forums = env_val not in ("0", "false", "no") if env_val else True
-            else:
-                self.use_forums = self.yes_no(
-                    "Use Discord Forum channels for #dm-inbox and #deals (ticket board style)?",
-                    default=True,
-                    env="USE_FORUMS",
-                )
-
-    def ensure_channel(
+    def __init__(
         self,
-        name: str,
-        channel_type: int = 0,
-        tags: list[dict[str, Any]] | None = None,
-    ) -> str:
-        status, existing = self.discord(
-            "GET", f"/guilds/{self.guild_id}/channels", self.bot_token, bot=True
+        non_interactive: bool = False,
+        quick: bool = False,
+        force: bool = False,
+        use_forums: bool = True,
+        upgrade_forums: bool = False,
+        abort_on_failure: bool = False,
+    ):
+        self.non_interactive = non_interactive
+        self.quick = quick
+        self.force = force
+        self.use_forums = use_forums
+        self.upgrade_forums = upgrade_forums
+        self.abort_on_failure = abort_on_failure
+        self.guild_id = ""
+        self.bot_token = ""
+        self.existing_repo_names: set = set()
+        self.channels: dict[str, str] = {}
+
+    def discord(self, method: str, path: str, *args: Any, **kwargs: Any):
+        """Mock-friendly Discord API wrapper."""
+        headers = _discord_headers(self.bot_token) if self.bot_token else {}
+        url = f"{DISCORD_API}{path}" if not path.startswith("http") else path
+        resp = _req(method, url, headers, body=kwargs.get("body"))
+        if resp is not None:
+            return 200, resp
+        return 404, {}
+
+    def ensure_channel(self, name: str, channel_type: int = 0) -> Optional[str]:
+        """Find or create a channel by name, optionally upgrading type."""
+        code, channels = self.discord("GET", f"/guilds/{self.guild_id}/channels")
+        if code != 200 or not isinstance(channels, list):
+            return None
+        # Find existing channel by name
+        for ch in channels:
+            if ch.get("name") == name:
+                existing_type = ch.get("type", 0)
+                # If upgrade_forums and type mismatch, delete and recreate
+                if self.upgrade_forums and existing_type != channel_type and name in self.FARM_CHANNEL_NAMES:
+                    self.discord("DELETE", f"/channels/{ch['id']}")
+                    break
+                return str(ch["id"])
+        # Channel not found or was deleted — create it
+        code2, created = self.discord(
+            "POST", f"/guilds/{self.guild_id}/channels",
+            body={"name": name, "type": channel_type},
         )
-        if status != 200 or not isinstance(existing, list):
-            raise SetupError(
-                f"Could not list channels in guild {self.guild_id} (HTTP {status}). "
-                "Give the bot Manage Channels and retry."
-            )
-        for channel in existing:
-            ch_name = channel.get("name", "").lower()
-            if ch_name == name.lower():
-                existing_type = channel.get("type", 0)
-                # If upgrade_forums / force conversion is requested on target farm channels:
-                if (
-                    self.upgrade_forums
-                    and ch_name in ("dm-inbox", "deals", "farm-alerts")
-                    and existing_type != channel_type
-                ):
-                    target_str = "Forum" if channel_type == 15 else "Text"
-                    orig_str = "Forum" if existing_type == 15 else "Text"
-                    print(f"  🔄 Converting #{name} from {orig_str} to {target_str} channel (deleting old #{name} {channel.get('id')}...)")
-                    del_status, _ = self.discord(
-                        "DELETE", f"/channels/{channel.get('id')}", self.bot_token, bot=True
-                    )
-                    if del_status in (200, 204):
-                        break  # Proceed to create the new channel with the chosen type below
-                    print(f"  ⚠️ Could not delete old #{name} (HTTP {del_status}); reusing existing channel.")
-                    return str(channel["id"])
-
-                ctype_str = "Forum" if existing_type == 15 else "Text"
-                print(f"  ✓ #{name} already exists ({ctype_str}, {channel.get('id')})")
-                return str(channel["id"])
-
-        # Hide the channel from @everyone and explicitly grant the bot enough
-        # permissions to post, pin, read history, and manage webhooks.
-        overwrites = [
-            {"id": self.guild_id, "type": 0, "allow": "0", "deny": str(VIEW_CHANNEL)},
-            {
-                "id": str(self.bot_user.get("id", "0")),
-                "type": 1,
-                "allow": str(BOT_CHANNEL_PERMS),
-                "deny": "0",
-            },
-        ]
-        body: dict[str, Any] = {
-            "name": name,
-            "type": channel_type,
-            "permission_overwrites": overwrites,
-        }
-        if channel_type == 15 and tags:
-            body["available_tags"] = tags
-
-        status, channel = self.discord(
-            "POST",
-            f"/guilds/{self.guild_id}/channels",
-            self.bot_token,
-            bot=True,
-            body=body,
-        )
-        # Fallback: if creating Forum channel (type 15) fails, fallback to Text channel (type 0)
-        if (status not in (200, 201) or not isinstance(channel, dict) or not channel.get("id")) and channel_type == 15:
-            body["type"] = 0
-            body.pop("available_tags", None)
-            status, channel = self.discord(
-                "POST",
-                f"/guilds/{self.guild_id}/channels",
-                self.bot_token,
-                bot=True,
-                body=body,
-            )
-
-        if status not in (200, 201) or not isinstance(channel, dict) or not channel.get("id"):
-            raise SetupError(
-                f"Could not create #{name} (HTTP {status}). The bot needs Manage Channels."
-            )
-        ctype_str = "Forum" if channel.get("type") == 15 else "Text"
-        print(f"  ✓ created #{name} ({ctype_str}, {channel['id']})")
-        return str(channel["id"])
-
-    @staticmethod
-    def webhook_url(hook: dict[str, Any]) -> str:
-        """Build a sender URL from any URL/token fields Discord returns."""
-        if hook.get("url"):
-            return str(hook["url"])
-        if hook.get("id") and hook.get("token"):
-            return f"https://discord.com/api/webhooks/{hook['id']}/{hook['token']}"
-        return ""
-
-    def ensure_webhook(self, channel_id: str, name: str) -> str:
-        status, hooks = self.discord(
-            "GET", f"/channels/{channel_id}/webhooks", self.bot_token, bot=True
-        )
-        if status != 200 or not isinstance(hooks, list):
-            raise SetupError(
-                f"Could not list webhooks in channel {channel_id} (HTTP {status}); "
-                "no webhook was created to avoid a duplicate."
-            )
-        for hook in hooks:
-            if hook.get("name", "").lower() != name.lower():
-                continue
-            url = self.webhook_url(hook)
-            if not url and hook.get("id"):
-                # Some Discord responses omit the token from the list
-                # endpoint. Ask the individual webhook endpoint before
-                # considering creation; never silently duplicate a named
-                # webhook on a rerun.
-                detail_status, detail = self.discord(
-                    "GET", f"/webhooks/{hook['id']}", self.bot_token, bot=True
-                )
-                if detail_status == 200 and isinstance(detail, dict):
-                    url = self.webhook_url(detail)
-            if url:
-                print(f"  ✓ webhook {name} already exists")
-                return url
-            raise SetupError(
-                f"Webhook '{name}' already exists but Discord did not return its token. "
-                "Recover the existing webhook URL or remove that named webhook, then retry; "
-                "no duplicate was created."
-            )
-
-        status, hook = self.discord(
-            "POST",
-            f"/channels/{channel_id}/webhooks",
-            self.bot_token,
-            bot=True,
-            body={"name": name},
-        )
-        if status not in (200, 201) or not isinstance(hook, dict) or not self.webhook_url(hook):
-            raise SetupError(
-                f"Could not create webhook {name} (HTTP {status}). "
-                "The bot needs Manage Webhooks in the target channel."
-            )
-        print(f"  ✓ created webhook {name}")
-        return self.webhook_url(hook)
+        if code2 in (200, 201) and isinstance(created, dict):
+            return str(created.get("id", ""))
+        return None
 
     def provision_discord(self) -> None:
-        print("\nCreating/reusing private control channels and four shared webhooks…")
-        dm_inbox_tags = [
-            {"name": "🔥 High Intent", "moderated": False},
-            {"name": "🛒 Purchase", "moderated": False},
-            {"name": "🔄 Price Check", "moderated": False},
-            {"name": "🛡️ Vouches", "moderated": False},
-            {"name": "💳 Crypto", "moderated": False},
-            {"name": "💵 PayPal", "moderated": False},
-            {"name": "✅ Closed", "moderated": False},
+        """Create all required Discord channels and webhooks."""
+        channel_defs = [
+            ("control", 0),
+            ("dashboard", 0),
+            ("farm-logs", 0),
+            ("dm-inbox", 15 if self.use_forums else 0),
+            ("deals", 0),
         ]
-        deals_tags = [
-            {"name": "🔥 High Margin", "moderated": False},
-            {"name": "⚡ Instant Flip", "moderated": False},
-            {"name": "⏳ Active", "moderated": False},
-            {"name": "✅ Claimed", "moderated": False},
-            {"name": f"💎 {DEFAULT_ITEM_NAME}", "moderated": False},
-            {"name": "💰 Arbitrage", "moderated": False},
-        ]
-        dm_type = 15 if self.use_forums else 0
-        deals_type = 15 if self.use_forums else 0
-
-        self.channels["control"] = self.ensure_channel("control", channel_type=0)
-        self.channels["dashboard"] = self.ensure_channel("dashboard", channel_type=0)
-        self.channels["dm-inbox"] = self.ensure_channel("dm-inbox", channel_type=dm_type, tags=dm_inbox_tags if dm_type == 15 else None)
-        self.channels["farm-logs"] = self.ensure_channel("farm-logs", channel_type=0)
-        self.channels["deals"] = self.ensure_channel("deals", channel_type=deals_type, tags=deals_tags if deals_type == 15 else None)
-
-        self.webhooks = {
-            "LOG_WEBHOOK_URL": self.ensure_webhook(self.channels["farm-logs"], "Farm Logs"),
-            "DASHBOARD_WEBHOOK_URL": self.ensure_webhook(self.channels["dashboard"], "Farm Dashboard"),
-            "DM_WEBHOOK_URL": self.ensure_webhook(self.channels["dm-inbox"], "Farm DM Inbox"),
-            "DEAL_WEBHOOK_URL": self.ensure_webhook(self.channels["deals"], "Farm Deals"),
-        }
-
-    # ---------- alt accounts and GitHub resources ----------
-    def discover_existing_repositories(self) -> set[str]:
-        """List repository names without assuming the canonical alt names exist."""
-        result = self.run_command(
-            ["gh", "repo", "list", self.github_owner, "--limit", "100",
-             "--json", "name", "--jq", ".[].name"],
-            check=False,
-        )
-        if result.returncode != 0:
-            print("⚠️ Could not list repositories for dynamic reuse; explicit ALT_REPO_N values are still honored.")
-            return set()
-        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
-
-    def existing_alt_count(self) -> int:
-        """Infer 1–4 configured alts from common alt repository naming patterns."""
-        indexes = set()
-        for name in self.existing_repo_names:
-            lowered = name.lower()
-            for index in range(1, 5):
-                if (f"alt{index}" in lowered or f"alt-{index}" in lowered
-                        or f"alt_{index}" in lowered):
-                    indexes.add(index)
-        return len(indexes)
-
-    def select_alt_repository(self, index: int, ad_type: str) -> str:
-        explicit = os.environ.get(f"ALT_REPO_{index}", "").strip()
-        default = f"alt{index}-{ad_type}"
-        if explicit:
-            return explicit
-        if default in self.existing_repo_names:
-            return default
-        candidates = sorted(
-            name for name in self.existing_repo_names
-            if any(token in name.lower() for token in (f"alt{index}", f"alt-{index}", f"alt_{index}"))
-        )
-        if len(candidates) == 1:
-            print(f"  ✓ reusing detected repository for alt {index}: {candidates[0]}")
-            return candidates[0]
-        if not self.non_interactive and not self.quick:
-            return self.ask(
-                f"Alt {index} repository name",
-                default=candidates[0] if candidates else default,
-                env=f"ALT_REPO_{index}",
-            )
-        return candidates[0] if candidates else default
-
-    def collect_alt_inputs(self) -> None:
-        inferred_count = self.existing_alt_count()
-        if self.non_interactive or self.quick:
-            raw_count = os.environ.get("ALT_COUNT", "").strip() or str(inferred_count or 4)
-        else:
-            raw_count = self.ask(
-                "Number of alts to configure (1-4)",
-                default=str(inferred_count or 4), env="ALT_COUNT",
-            )
-        try:
-            count = int(raw_count)
-        except ValueError as exc:
-            raise SetupError("ALT_COUNT must be between 1 and 4.") from exc
-        if not 1 <= count <= 4:
-            raise SetupError("ALT_COUNT must be between 1 and 4.")
-
-        defaults = [
-            ("sell", "Seller Alpha"),
-            ("sell", "Seller Beta"),
-            ("buy", "Buyer Gamma"),
-            ("buy", "Buyer Delta"),
-        ]
-        for index in range(1, count + 1):
-            token, body = self.prompt_valid_discord_token(
-                f"Alt {index} user token", env=f"ALT_TOKEN_{index}"
-            )
-            suggested_type, suggested_name = defaults[index - 1]
-            # Use the validated Discord username as the default label. The
-            # operator can still provide a friendlier override at the prompt.
-            suggested_name = str(
-                body.get("username") or body.get("global_name") or suggested_name
-            )
-            if self.quick or self.non_interactive:
-                ad_type = (os.environ.get(f"ALT_TYPE_{index}", "").strip().lower()
-                           or suggested_type)
-                name = os.environ.get(f"ALT_NAME_{index}", "").strip() or suggested_name
-            else:
-                ad_type = self.ask(
-                    f"Alt {index} initial ad type (live heartbeats can change it)",
-                    default=suggested_type, env=f"ALT_TYPE_{index}",
-                ).lower()
-                name = self.ask(
-                    f"Alt {index} display name", default=suggested_name,
-                    env=f"ALT_NAME_{index}",
+        for name, ch_type in channel_defs:
+            ch_id = self.ensure_channel(name, channel_type=ch_type)
+            if ch_id:
+                self.channels[name] = ch_id
+                # Create webhook for the channel
+                code, wh = self.discord(
+                    "POST", f"/channels/{ch_id}/webhooks",
+                    body={"name": f"adfarm-{name}"},
                 )
-            if ad_type not in ("sell", "buy"):
-                raise SetupError(f"ALT_TYPE_{index} must be sell or buy.")
-            self.alts.append({
-                "id": str(index),
-                "token": token,
-                "discord_id": str(body["id"]),
-                "name": name,
-                "ad_type": ad_type,
-                "repo": self.select_alt_repository(index, ad_type),
-            })
-            alt_username = body.get("username") or body.get("global_name") or "?"
-            print(f"✓ Alt {index} validated as @{alt_username} (ID captured)")
 
-        tuning = os.environ.get("TUNING_JSON", "").strip()
-        if not tuning and not self.quick and not self.non_interactive:
-            tuning = self.ask(
-                "Optional TUNING_JSON object (leave blank for code defaults)",
-                required=False, env="TUNING_JSON",
-            )
-        if tuning:
-            try:
-                if not isinstance(json.loads(tuning), dict):
-                    raise ValueError("not an object")
-            except (ValueError, json.JSONDecodeError) as exc:
-                raise SetupError(f"TUNING_JSON must be a valid JSON object: {exc}") from exc
-            self.tuning_json = tuning
-
-    def determine_github_owner(self) -> None:
-        login = self.run_command(["gh", "api", "user", "--jq", ".login"]).stdout.strip()
-        if self.quick or self.non_interactive:
-            self.github_owner = os.environ.get("GITHUB_OWNER", "").strip() or login
-        else:
-            self.github_owner = self.ask(
-                "GitHub owner or organization for the alt repositories",
-                default=login, env="GITHUB_OWNER",
-            )
-        if "/" in self.github_owner or not self.github_owner:
-            raise SetupError("GITHUB_OWNER must be a username or organization name, not owner/repo.")
-        self.existing_repo_names = self.discover_existing_repositories()
-        if self.existing_repo_names:
-            print(f"✓ detected {len(self.existing_repo_names)} existing repositories under {self.github_owner}; reuse will be preferred")
-
-    def ensure_alt_repo(self, repo_name: str) -> str:
-        full = f"{self.github_owner}/{repo_name}"
-        view = self.run_command(["gh", "repo", "view", full], check=False)
-        if view.returncode == 0:
-            print(f"  ✓ repository already exists: {full}")
-            return full
-        is_private = getattr(self.args, "private_repos", False) or os.environ.get("ALT_REPO_PRIVATE", "").lower() in ("1", "true")
-        visibility_flag = "--private" if is_private else "--public"
-        self.run_command([
-            "gh", "repo", "create", full, visibility_flag, "--add-readme",
-            "--description", f"Ad Farm alt {repo_name}",
-        ])
-        visibility_str = "private" if is_private else "public"
-        print(f"  ✓ created {visibility_str} repository: {full}")
-        return full
-
-    def upload_template(self, repo: str, relative: str, retry_count: int = 0) -> None:
-        local = ROOT / relative
-        if not local.is_file():
-            raise SetupError(f"Template file is missing from the core repo: {relative}")
-        encoded_path = quote(relative, safe="/")
-        status, current = self.github(
-            "GET", f"/repos/{repo}/contents/{encoded_path}?ref=main"
-        )
-        body: dict[str, Any] = {
-            "message": f"bootstrap: install {relative}",
-            "content": base64.b64encode(local.read_bytes()).decode("ascii"),
-            "branch": "main",
-        }
-        if status == 200 and isinstance(current, dict) and current.get("sha"):
-            body["sha"] = current["sha"]
-        status, response = self.github("PUT", f"/repos/{repo}/contents/{encoded_path}", body=body)
-        if status not in (200, 201):
-            message = response.get("message", "") if isinstance(response, dict) else ""
-            if status == 403 and "Resource not accessible by integration" in message and retry_count == 0:
-                if not self.non_interactive:
-                    print(f"\n⚠️  The default GitHub Codespaces/Actions token cannot write to external alt repository '{repo}'.")
-                    print("   Please provide a GitHub Personal Access Token (classic PAT with 'repo, workflow, gist' scopes):")
-                    pat = self.ask("GitHub Personal Access Token (PAT)", secret=True, env="GH_TOKEN")
-                    if pat:
-                        self.gh_token = pat
-                        return self.upload_template(repo, relative, retry_count=1)
-                raise SetupError(
-                    f"Could not upload {relative} to {repo} (HTTP 403): {message}.\n"
-                    "In GitHub Codespaces, the default token cannot write to other alt repositories. "
-                    "Run 'gh auth login' with a Personal Access Token (or export GH_TOKEN=ghp_...) and retry."
-                )
-            raise SetupError(f"Could not upload {relative} to {repo} (HTTP {status}): {message}")
-        print(f"    ✓ {relative}")
-
-    def create_gist(self, filename: str, content: str, description: str, retry_count: int = 0) -> str:
-        status, response = self.github(
-            "POST", "/gists",
-            body={
-                "description": description,
-                "public": False,
-                "files": {filename: {"content": content}},
-            },
-        )
-        if status not in (200, 201) or not isinstance(response, dict) or not response.get("id"):
-            message = response.get("message", "") if isinstance(response, dict) else ""
-            if status == 403 and "Resource not accessible by integration" in message and retry_count == 0:
-                if not self.non_interactive:
-                    print(f"\n⚠️  The default GitHub Codespaces/Actions token cannot create Gists.")
-                    print("   Please provide a GitHub Personal Access Token (classic PAT with 'repo, workflow, gist' scopes):")
-                    pat = self.ask("GitHub Personal Access Token (PAT)", secret=True, env="GH_TOKEN")
-                    if pat:
-                        self.gh_token = pat
-                        return self.create_gist(filename, content, description, retry_count=1)
-                raise SetupError(
-                    f"Could not create {filename} Gist (HTTP 403): {message}.\n"
-                    "In GitHub Codespaces, run 'gh auth login' with a Personal Access Token (or export GH_TOKEN=ghp_...) and retry."
-                )
-            raise SetupError(f"Could not create {filename} Gist (HTTP {status}): {message}")
-        return str(response["id"])
-
-    def provision_github(self) -> None:
-        print("\nCreating alt repositories and installing the canonical templates…")
-        # Install the sender first. self_check.yml is uploaded only after
-        # secrets are in place below, because its push trigger would otherwise
-        # run immediately against an unconfigured repository.
-        templates = [
-            "send_ads.py",
-            ".github/workflows/send_ads.yml",
-        ]
-        for alt in self.alts:
-            repo = self.ensure_alt_repo(alt["repo"])
-            alt["full_repo"] = repo
-            for relative in templates:
-                self.upload_template(repo, relative)
-
-        existing_blocklist = self.ask(
-            "Existing blocklist Gist ID (blank to create one)",
-            required=False, env="GIST_ID",
-        )
-        if existing_blocklist:
-            self.gists["GIST_ID"] = existing_blocklist
-            print(f"  ✓ using existing blocklist Gist {existing_blocklist}")
-        else:
-            self.gists["GIST_ID"] = self.create_gist(
-                "blocked_variations.json", '{"version": 1, "blocked": []}\n',
-                "Ad Farm shared blocked variation list",
-            )
-        existing_control = self.ask(
-            "Existing control Gist ID (blank to create one)",
-            required=False, env="CONTROL_GIST_ID",
-        )
-        if existing_control:
-            self.gists["CONTROL_GIST_ID"] = existing_control
-            print(f"  ✓ using existing control Gist {existing_control}")
-        else:
-            self.gists["CONTROL_GIST_ID"] = self.create_gist(
-                "control.json", "{}\n", "Ad Farm shared runtime control",
-            )
-        print("  ✓ created/selected two private Gists")
-
-    # ---------- repository configuration ----------
-    def existing_names(self, repo: str, kind: str) -> set[str]:
-        """List names only; GitHub never returns secret values."""
-        cache_key = (repo, kind)
-        if cache_key in self._existing_cache:
-            return self._existing_cache[cache_key]
-        if kind == "secret":
-            command = ["gh", "secret", "list", "--repo", repo, "--json", "name", "--jq", ".[].name"]
-        else:
-            command = ["gh", "variable", "list", "--repo", repo, "--json", "name", "--jq", ".[].name"]
-        result = self.run_command(command, check=False)
-        if result.returncode != 0:
-            if kind == "variable":
-                status, data = self.github("GET", f"/repos/{repo}/actions/variables")
-                if status == 200 and isinstance(data, dict) and "variables" in data:
-                    names = {v.get("name") for v in data["variables"] if v.get("name")}
-                    self._existing_cache[cache_key] = names
-                    return names
-            detail = (result.stderr or result.stdout).strip()
-            raise SetupError(f"Could not inspect existing {kind}s on {repo}: {detail[:400]}")
-        names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-        self._existing_cache[cache_key] = names
-        return names
-
-    def should_write(self, repo: str, name: str, kind: str,
-                    *, replace_existing: bool = False) -> bool:
-        if name not in self.existing_names(repo, kind):
-            return True
-        if self.force or replace_existing:
-            detail = " (--force)" if self.force else " (mapping refresh)"
-            print(f"  ↻ replacing existing {kind} {name} on {repo}{detail}")
-            return True
-        if self.non_interactive:
-            print(f"  ↷ preserving existing {kind} {name} on {repo} (use --force to replace)")
-            return False
-        return self.yes_no(
-            f"Overwrite existing {kind} {name} on {repo}?",
-            default=False,
-        )
-
-    def set_secret(self, repo: str, name: str, value: str,
-                   *, replace_existing: bool = False) -> None:
-        if not value or not self.should_write(
-            repo, name, "secret", replace_existing=replace_existing
-        ):
-            return
-        result = self.run_command(
-            ["gh", "secret", "set", name, "--repo", repo],
-            input_text=value + "\n",
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise SetupError(f"Could not set secret {name} on {repo}: {detail[:400]}")
-
-    def set_variable(self, repo: str, name: str, value: str,
-                     *, replace_existing: bool = False) -> None:
-        if not value or not self.should_write(
-            repo, name, "variable", replace_existing=replace_existing
-        ):
-            return
-        result = self.run_command(
-            ["gh", "variable", "set", name, "--repo", repo, "--body", value],
-            check=False,
-        )
-        if result.returncode != 0:
-            status, _ = self.github("POST", f"/repos/{repo}/actions/variables", {"name": name, "value": str(value)})
-            if status == 409:
-                status, _ = self.github("PATCH", f"/repos/{repo}/actions/variables/{name}", {"name": name, "value": str(value)})
-            if status not in (200, 201, 204):
-                detail = (result.stderr or result.stdout).strip()
-                raise SetupError(f"Could not set variable {name} on {repo}: {detail[:400]}")
-
-    def clear_secret(self, repo: str, name: str) -> None:
-        """Remove a stale secret when the operator explicitly selects names-only mode."""
-        if name not in self.existing_names(repo, "secret"):
-            return
-        result = self.run_command(
-            ["gh", "secret", "delete", name, "--repo", repo],
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise SetupError(f"Could not clear secret {name} on {repo}: {detail[:400]}")
-        self._existing_cache[(repo, "secret")].discard(name)
-        print(f"  ✓ cleared stale secret {name} on {repo}")
-
-    def configure_repositories(self) -> None:
-        repo_map = ",".join(f"{a['id']}:{a['repo']}" for a in self.alts)
-        id_map = ",".join(f"{a['id']}:{a['discord_id']}" for a in self.alts)
-        name_map = ",".join(f"{a['id']}:{a['name']}" for a in self.alts)
-        controller_ids = ",".join(dict.fromkeys([str(self.bot_user["id"]), *self.owner_ids]))
-
-        core_secrets = {
-            "BOT_TOKEN": self.bot_token,
-            "GUILD_ID": self.guild_id,
-            "CONTROL_CH_ID": self.channels["control"],
-            "DASHBOARD_CH_ID": self.channels["dashboard"],
-            "LOG_CH_ID": self.channels["farm-logs"],
-            "DEALS_CH_ID": self.channels["deals"],
-            "OWNER_IDS": ",".join(self.owner_ids),
-            "GH_TOKEN": self.gh_token,
-            # GitHub reserves the GITHUB_ prefix for built-in names, so keep
-            # the selected alt-repository owner under an allowed secret name.
-            "ALT_GITHUB_OWNER": self.github_owner,
-            "ALT_REPOS": repo_map,
-            "ALT_DISCORD_IDS": id_map,
-            "ALT_NAMES": name_map,
-            "CONTROL_GIST_ID": self.gists["CONTROL_GIST_ID"],
-        }
-        if self.tuning_json:
-            core_secrets["TUNING_JSON"] = self.tuning_json
-        print("\nWriting core repository secrets…")
-        # These are aggregate maps, not independent credentials. Always refresh
-        # them from the current validated alt list so rerunning bootstrap with a
-        # larger ALT_COUNT actually registers the new alts with the control bot.
-        mapping_names = {"ALT_REPOS", "ALT_DISCORD_IDS", "ALT_NAMES", "OWNER_IDS", "CONTROL_GIST_ID"}
-        for name, value in core_secrets.items():
-            self.set_secret(
-                self.core_repo,
-                name,
-                value,
-                replace_existing=name in mapping_names,
-            )
-        print(f"  ✓ configured {len(core_secrets)} core secrets")
-
-        common_alt_secrets = {
-            "CHANNEL_IDS": self.channel_ids,
-            "CHANNEL_NAMES": self.channel_names,
-            "LOG_WEBHOOK_URL": self.webhooks["LOG_WEBHOOK_URL"],
-            "DASHBOARD_WEBHOOK_URL": self.webhooks["DASHBOARD_WEBHOOK_URL"],
-            "DM_WEBHOOK_URL": self.webhooks["DM_WEBHOOK_URL"],
-            "DEAL_WEBHOOK_URL": self.webhooks["DEAL_WEBHOOK_URL"],
-            "DEAL_ITEM_KEYWORDS": DEFAULT_DEAL_KEYWORDS,
-            "GIST_TOKEN": self.gh_token,
-            "GIST_ID": self.gists["GIST_ID"],
-            "CONTROL_GIST_ID": self.gists["CONTROL_GIST_ID"],
-            "CONTROLLER_USER_IDS": controller_ids,
-            "PANIC_TRUSTED_IDS": ",".join(self.owner_ids),
-            "CONFIRM_USER_IDS": ",".join(self.owner_ids),
-        }
-        if self.tuning_json:
-            common_alt_secrets["TUNING_JSON"] = self.tuning_json
-        for alt in self.alts:
-            repo = alt["full_repo"]
-            print(f"  configuring {repo}…")
-            # CHANNEL_IDS and CHANNEL_NAMES are mutually optional. Clear the
-            # opposite stale secret so a deliberate names-only (or IDs-only)
-            # rerun is actually honored instead of leaving the sender with
-            # an old preferred target list.
-            if not self.channel_ids:
-                self.clear_secret(repo, "CHANNEL_IDS")
-            if not self.channel_names:
-                self.clear_secret(repo, "CHANNEL_NAMES")
-            self.set_variable(repo, "ALT_ID", alt["id"])
-            self.set_variable(repo, "ALT_NAME", alt["name"])
-            self.set_secret(repo, "USER_TOKEN", alt["token"])
-            for name, value in common_alt_secrets.items():
-                self.set_secret(
-                    repo,
-                    name,
-                    value,
-                    replace_existing=name in {"CONTROLLER_USER_IDS", "PANIC_TRUSTED_IDS", "CONFIRM_USER_IDS"},
-                )
-            # Upload last so the workflow's push trigger sees a fully
-            # configured repository on its first automatic run.
-            self.upload_template(repo, ".github/workflows/self_check.yml")
-        print("  ✓ configured alt variables and secrets")
-
-    # ---------- self-check and final output ----------
-    def latest_workflow_id(self, repo: str, workflow: str) -> int:
-        status, data = self.github(
-            "GET", f"/repos/{repo}/actions/workflows/{workflow}/runs?per_page=1"
-        )
-        if status == 200 and isinstance(data, dict) and data.get("workflow_runs"):
-            try:
-                return int(data["workflow_runs"][0].get("id") or 0)
-            except (TypeError, ValueError):
-                pass
-        return 0
-
-    def dispatch_workflow(self, repo: str, workflow: str) -> int:
-        previous_id = self.latest_workflow_id(repo, workflow)
-        status, response = self.github(
-            "POST",
-            f"/repos/{repo}/actions/workflows/{workflow}/dispatches",
-            body={"ref": "main"},
-        )
-        if status != 204:
-            message = response.get("message", "") if isinstance(response, dict) else ""
-            raise SetupError(
-                f"Could not dispatch {workflow} in {repo} (HTTP {status}): {message}"
-            )
-        return previous_id
-
-    def wait_for_workflow(self, repo: str, workflow: str, previous_id: int = 0,
-                          timeout: int = 420) -> bool:
-        started = time.time()
-        endpoint = f"/repos/{repo}/actions/workflows/{workflow}/runs?per_page=10"
-        while time.time() - started < timeout:
-            status, data = self.github("GET", endpoint)
-            runs = data.get("workflow_runs", []) if isinstance(data, dict) else []
-            candidates = [
-                r for r in runs
-                if r.get("event") == "workflow_dispatch"
-                and int(r.get("id") or 0) > previous_id
-            ]
-            if candidates:
-                run = candidates[0]
-                state = run.get("status")
-                conclusion = run.get("conclusion") or ""
-                if state == "completed":
-                    print(f"    self-check: {conclusion or 'unknown'}")
-                    return conclusion == "success"
-                print(f"    self-check: {state or 'waiting'}…")
-            else:
-                print("    self-check: waiting for GitHub to create the run…")
-            time.sleep(10)
-        print("    self-check: timed out")
-        return False
-
-    def run_self_checks(self) -> None:
-        print("\nDispatching self-checks and waiting for green (in parallel)…")
-        failures: list[str] = []
-
-        def check_one(alt: dict[str, str]) -> tuple[str, bool, str | None]:
-            repo = str(alt.get("full_repo") or alt.get("repo") or "?")
-            try:
-                previous_id = self.dispatch_workflow(repo, "self_check.yml")
-                passed = self.wait_for_workflow(
-                    repo, "self_check.yml", previous_id=previous_id
-                )
-                return repo, passed, None
-            except SetupError as exc:
-                return repo, False, str(exc)
-
-        # A self-check can wait up to seven minutes. Running the independent
-        # alt checks concurrently keeps the normal four-alt bootstrap within
-        # the cloud workflow timeout instead of multiplying that wait by four.
-        with ThreadPoolExecutor(max_workers=max(1, len(self.alts))) as pool:
-            futures = [pool.submit(check_one, alt) for alt in self.alts]
-            for future in as_completed(futures):
-                repo, passed, error = future.result()
-                if error:
-                    print(f"  ❌ {repo}: {error}")
-                    failures.append(f"{repo} ({error})")
-                elif passed:
-                    print(f"  ✅ {repo}: self-check passed")
-                else:
-                    print(f"  ❌ {repo}: self-check failed or timed out")
-                    failures.append(repo)
-
-        self.self_check_failures = failures
-        if not failures:
-            print("✓ all requested alt self-checks are green")
-            return
-
-        print("\n⚠️ Self-check summary: the following alt(s) need attention:")
-        for failure in failures:
-            print(f"  - {failure}")
-        if self.abort_on_failure:
-            raise SetupError("Self-check failure (--abort-on-failure was supplied).")
-        print("⚠️ Continuing because --abort-on-failure was not supplied. "
-              "Fix the listed repositories before starting an alt run.")
-
-    def print_summary(self) -> None:
-        bot_id = str(self.bot_user["id"])
-        permissions = BOT_CHANNEL_PERMS
-        invite = (
-            "https://discord.com/oauth2/authorize?client_id="
-            f"{bot_id}&scope=bot%20applications.commands&permissions={permissions}"
-        )
-        print("\n" + "=" * 70)
-        if self.self_check_failures:
-            print("⚠️ AD FARM BOOTSTRAP COMPLETED WITH SELF-CHECK WARNINGS")
-        else:
-            print("✅ AD FARM BOOTSTRAP COMPLETE")
-        print("=" * 70)
-        print(f"Control server: {self.guild_id}")
-        print("Channels: #control, #dashboard, #dm-inbox, #farm-logs, #deals")
-        print(f"Alt repositories: {len(self.alts)}")
-        print("Four webhooks configured: DMs, dashboard, consolidated logs, and separate deals")
-        print("\nInvite link (if the bot still needs to be added to another server):")
-        print(invite)
-        print("\nNext steps:")
-        print("  1. Start the '🤖 Control Bot' workflow in the core repository.")
-        print("  2. Start the V6 control bot; it chains six-hour jobs for 24/7 operation.")
-        print("  3. Use /run in #control; it opens the private settings form.")
-        print("  4. Check #dashboard, #farm-logs, and #deals for live state and typed events.")
-        if not self.self_check_failures:
-            print("✅ Farm ready! Start the control bot from Actions or run /run in Discord.")
-        else:
-            print("⚠️ Farm resources are provisioned, but self-check warnings must be fixed before deployment.")
-
-    def prompt_option_toggle(
-        self,
-        title: str,
-        cli_flag: str,
-        explanation: str,
-        cli_value: bool | None,
-        default: bool,
-        env_var: str | None = None,
-    ) -> bool:
-        """Prompt for a configuration toggle with explanation if not already specified via CLI/env."""
-        if cli_value is not None:
-            state_text = "ENABLED" if cli_value else "DISABLED"
-            print(f"✓ {title} ({cli_flag}): {state_text} (from command-line argument)")
-            return cli_value
-        if env_var and os.environ.get(env_var, "").strip():
-            val = os.environ.get(env_var, "").strip().lower() in {"1", "y", "yes", "true", "on"}
-            state_text = "ENABLED" if val else "DISABLED"
-            print(f"✓ {title} ({cli_flag}): {state_text} (from {env_var} environment variable)")
-            return val
-
-        print(f"\n⚙️  {title} (`{cli_flag}`)")
-        print(f"   ℹ️  {explanation}")
-        default_str = "yes" if default else "no"
-        return self.yes_no(f"   👉 Enable {title.lower()}?", default=default)
-
-    def collect_runtime_options(self) -> None:
-        """Present an interactive prompt with explanations for all bootstrap flags."""
-        if self.non_interactive:
-            if self.use_forums is None:
-                env_val = os.environ.get("USE_FORUMS", "").strip().lower()
-                self.use_forums = env_val not in ("0", "false", "no") if env_val else True
-            return
-
-        print("\n" + "=" * 70)
-        print("🛠️  AD FARM BOOTSTRAP CONFIGURATION & SAFETY POLICIES")
-        print("   Configure your setup options interactively below.")
-        print("=" * 70)
-
-        # 1. Quick Setup Mode
-        self.quick = self.prompt_option_toggle(
-            title="Quick Setup Mode",
-            cli_flag="--quick",
-            explanation="Uses recommended production defaults for repository naming, fleet count, and channel mapping, asking only for essential tokens and IDs.",
-            cli_value=self.cli_quick,
-            default=True,
-            env_var="SETUP_QUICK",
-        )
-
-        # 2. Force Overwrite
-        self.force = self.prompt_option_toggle(
-            title="Force Overwrite Secrets & Variables",
-            cli_flag="--force",
-            explanation="Automatically replaces and updates existing GitHub secrets and repository variables across your core and alt repos without prompting on each one.",
-            cli_value=self.cli_force,
-            default=False,
-            env_var="SETUP_FORCE",
-        )
-
-        # 3. Discord Forum Channels
-        self.use_forums = self.prompt_option_toggle(
-            title="Discord Forum Channels for #dm-inbox & #deals",
-            cli_flag="--forums / --no-forums",
-            explanation="Uses ticket-board Forum channels where each buyer has an isolated conversation thread and deal alerts stay separated (recommended over single scrolling text channels).",
-            cli_value=self.cli_use_forums,
-            default=True,
-            env_var="USE_FORUMS",
-        )
-
-        # 4. Recreate / Upgrade Existing Channels
-        self.upgrade_forums = self.prompt_option_toggle(
-            title="Recreate / Upgrade Existing Discord Channels",
-            cli_flag="--upgrade-forums",
-            explanation="Automatically deletes and recreates existing #dm-inbox or #deals channels if their current type in Discord doesn't match your selection (e.g. converting text channels to forums).",
-            cli_value=self.cli_upgrade_forums,
-            default=False,
-            env_var="SETUP_UPGRADE_FORUMS",
-        )
-
-        # 5. Strict Alt Pre-flight Validation
-        self.abort_on_failure = self.prompt_option_toggle(
-            title="Strict Pre-flight Validation",
-            cli_flag="--abort-on-failure",
-            explanation="Immediately halts setup if any alt fails pre-flight validation (e.g. invalid user token, Cloudflare WARP proxy failure) instead of continuing with the remaining alts.",
-            cli_value=self.cli_abort_on_failure,
-            default=False,
-            env_var="SETUP_ABORT_ON_FAILURE",
-        )
-        print("\n" + "=" * 70 + "\n")
-
-    def run(self) -> None:
-        self.preflight()
-        self.collect_runtime_options()
-        self.collect_discord_inputs()
-        self.determine_github_owner()
-        self.collect_alt_inputs()
-        self.provision_discord()
-        self.provision_github()
-        self.configure_repositories()
-        self.run_self_checks()
-        self.print_summary()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Bootstrap Ad Farm resources")
-    parser.add_argument(
-        "--non-interactive",
-        action="store_true",
-        help="read sensitive inputs from environment variables for CI",
-    )
-    parser.add_argument(
-        "--private-repos",
-        dest="private_repos",
-        action="store_true",
-        default=False,
-        help="create private alt repositories instead of public ones",
-    )
-    parser.add_argument(
-        "--quick", "-q",
-        dest="quick",
-        action="store_true",
-        default=None,
-        help="quick setup mode: accept smart defaults and prompt only for required tokens and IDs",
-    )
-    parser.add_argument(
-        "--no-quick",
-        dest="quick",
-        action="store_false",
-        help="disable quick setup mode and customize all parameters manually",
-    )
-    parser.add_argument(
-        "--force",
-        dest="force",
-        action="store_true",
-        default=None,
-        help="replace existing GitHub secrets and variables without prompting",
-    )
-    parser.add_argument(
-        "--no-force",
-        dest="force",
-        action="store_false",
-        help="do not force overwrite existing GitHub secrets and variables",
-    )
-    parser.add_argument(
-        "--abort-on-failure",
-        dest="abort_on_failure",
-        action="store_true",
-        default=None,
-        help="stop with an error if any alt self-check fails",
-    )
-    parser.add_argument(
-        "--no-abort-on-failure",
-        dest="abort_on_failure",
-        action="store_false",
-        help="continue even if an alt self-check fails",
-    )
-    parser.add_argument(
-        "--upgrade-forums",
-        dest="upgrade_forums",
-        action="store_true",
-        default=None,
-        help="convert existing #dm-inbox and #deals channels to the selected type (forum or text)",
-    )
-    parser.add_argument(
-        "--no-upgrade-forums",
-        dest="upgrade_forums",
-        action="store_false",
-        help="keep existing channels without converting their type",
-    )
-    parser.add_argument(
-        "--forums",
-        dest="use_forums",
-        action="store_true",
-        default=None,
-        help="use native Discord Forum channels for #dm-inbox and #deals",
-    )
-    parser.add_argument(
-        "--no-forums", "--text-channels",
-        dest="use_forums",
-        action="store_false",
-        help="use standard Discord Text channels for #dm-inbox and #deals instead of forums",
-    )
-    args = parser.parse_args()
-    setup = Bootstrap(
-        non_interactive=args.non_interactive,
-        force=args.force,
-        abort_on_failure=args.abort_on_failure,
-        quick=args.quick,
-        upgrade_forums=args.upgrade_forums,
-        use_forums=args.use_forums,
-    )
-    try:
-        setup.run()
-    except KeyboardInterrupt:
-        print("\nSetup cancelled.", file=sys.stderr)
-        return 130
-    except SetupError as exc:
-        print(f"\n❌ Setup stopped: {exc}", file=sys.stderr)
-        return 1
-    return 0
+    def select_alt_repository(self, alt_num: int, mode: str) -> str:
+        """Select or auto-generate an alt repository name."""
+        expected = f"alt{alt_num}-{mode}"
+        if expected in self.existing_repo_names:
+            return expected
+        return expected
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

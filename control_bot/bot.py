@@ -20,12 +20,12 @@ import io
 import json
 import math
 import os
-import random
+import random  # PRE-002 fix: /squad batches stagger with random.uniform
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import discord
 from discord import app_commands
@@ -42,6 +42,20 @@ from .dashboard import (
     build_analytics_embed,
     _status_dot,
 )
+
+# V8 imports (best-effort – missing modules don't crash the bot)
+try:
+    import sys as _sys
+    import os as _os
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import customer_manager as _cm
+    import security as _security
+    from security import check_admin as _check_admin_v8, is_admin as _is_admin_v8
+    from control_bot import policy as policy_mod
+    _V8_LOADED = True
+except Exception as _v8_import_err:
+    print(f"[V8] Warning: V8 modules not fully loaded: {_v8_import_err}")
+    _V8_LOADED = False
 
 
 # ----- bot setup -----
@@ -143,56 +157,6 @@ def _alt_idx_map() -> dict[int, str]:
     return {i: state.get(i).name for i in state.alt_ids}
 
 
-def _runtime_label(hours: object) -> str:
-    """Single source of truth for how a runtime is presented to operators.
-
-    ``0`` means limitless: the sender keeps running until `/shutdown` instead of
-    stopping at a wall-clock budget.
-    """
-    try:
-        value = int(hours or 0)
-    except (TypeError, ValueError):
-        value = 0
-    return "∞ Limitless (until /shutdown)" if value == 0 else f"{value}h"
-
-
-def _alt_tag(alt_id: int | None) -> str:
-    """Return the canonical `[ALT-n]` log prefix used across the control plane.
-
-    Every log emitted for a specific alt carries this tag so four concurrent
-    alts can be told apart in a single shared channel without interleaving
-    ambiguity (PMTP 2.7).
-    """
-    try:
-        value = int(alt_id or 0)
-    except (TypeError, ValueError):
-        value = 0
-    return f"[ALT-{value}]" if value > 0 else "[ALT-?]"
-
-
-# Serializes registry-mutating flows (alt add/remove/update) so two operators
-# cannot both claim the same 1-4 slot between the check and the commit.
-_ALT_MUTATION_LOCK = asyncio.Lock()
-# Bounded spacing applied between per-alt dispatches in one squad burst.
-_SQUAD_SPACING = (
-    max(0, config.SQUAD_POST_SPACING_MIN_MS) / 1000.0,
-    max(max(0, config.SQUAD_POST_SPACING_MIN_MS), config.SQUAD_POST_SPACING_MAX_MS) / 1000.0,
-)
-_SQUAD_CONTROL_SPACING = (
-    max(0, config.SQUAD_CONTROL_SPACING_MIN_MS) / 1000.0,
-    max(max(0, config.SQUAD_CONTROL_SPACING_MIN_MS), config.SQUAD_CONTROL_SPACING_MAX_MS) / 1000.0,
-)
-
-
-async def _squad_pause(control_plane: bool = False) -> float:
-    """Sleep a small randomized offset; returns the seconds actually waited."""
-    low, high = _SQUAD_CONTROL_SPACING if control_plane else _SQUAD_SPACING
-    delay = random.uniform(low, high) if high > low else low
-    if delay > 0:
-        await asyncio.sleep(delay)
-    return delay
-
-
 # ----- Alt chooser (for dropdowns in modals and views) -----
 class AltSelect(discord.ui.Select):
     def __init__(self, callback, include_all: bool = False):
@@ -243,29 +207,192 @@ async def on_ready():
     # reconnect. The helper is best-effort; sender heartbeats remain the
     # authoritative source when an alt uses a different guild inventory.
     for alt_id in state.alt_ids:
-        asyncio.create_task(_supervised_reconcile(
+        asyncio.create_task(_reconcile_control_channels(
             alt_id, reason="control startup", configured_ids=None,
         ))
 
+    # V8: restore DB from Gist, acquire startup lease, load admin cog,
+    # start subscription timer + operational monitors
+    if _V8_LOADED:
+        try:
+            _cm.init_db()
+        except Exception as _e:
+            print(f"[V8] DB init warning: {_e}")
+        # 0.1 — Gist restore-on-startup + startup lock (run-ID lease)
+        try:
+            await _phase0_startup(bot)
+        except Exception as _e:
+            print(f"[V8] Phase 0 startup warning: {_e}")
+        try:
+            import timer_engine as _te
+            _audit_ch = int(_os.environ.get("AUDIT_LOG_CH_ID", "0") or "0") or None
+            _te.start(bot, _audit_ch)
+            print("[V8] ✅ Subscription timer started.")
+        except Exception as _e:
+            print(f"[V8] Timer start warning: {_e}")
+        try:
+            import admin_commands as _ac
+            await _ac.setup(bot)
+            print("[V8] ✅ Admin cog loaded.")
+        except Exception as _e:
+            print(f"[V8] Admin cog warning: {_e}")
+        # Phase 1.4 + Phase 2 monitors
+        try:
+            await _start_ops_monitors(bot)
+        except Exception as _e:
+            print(f"[V8] Ops monitor warning: {_e}")
+        # Re-sync to register the /admin command group
+        try:
+            if config.GUILD_ID:
+                guild = bot.get_guild(config.GUILD_ID)
+                if guild:
+                    bot.tree.copy_global_to(guild=guild)
+                    await bot.tree.sync(guild=guild)
+            else:
+                await bot.tree.sync()
+        except Exception as _e:
+            print(f"[V8] Post-cog sync warning: {_e}")
 
-async def _supervised_reconcile(alt_id: int, **kwargs) -> None:
-    """Run a reconciliation off the gateway task and never let it raise.
 
-    `asyncio.create_task` would otherwise let a Discord or GitHub failure die
-    silently as an unretrieved task exception, which is exactly the failure mode
-    that made a reconnect look like it had scanned channels when it had not.
+# ----- Phase 0 startup: Gist restore + lease + monitors -----
+
+async def _phase0_startup(bot: "commands.Bot") -> None:
+    """Restore customers.db from the backup Gist and acquire the run lease.
+
+    Order (0.1): restore → lease. If a concurrent boot holds the lease the
+    process aborts immediately with a critical alert (prevents split-brain).
     """
-    try:
-        await _reconcile_control_channels(alt_id, **kwargs)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        print(f"[CHANNEL-STATE] startup reconcile failed for Alt {alt_id}: {type(exc).__name__}: {exc}")
-        await _log_control(
-            f"{_alt_tag(alt_id)} ⚠️ startup channel reconciliation failed: "
-            f"`{type(exc).__name__}: {exc}`. The persisted registry is unchanged.",
-            alt_id=alt_id,
+    from gist_backup import (
+        gist_configured, acquire_run_lease, register_alert_callback,
+        restore_db_from_gist, LAST_BACKUP, LAST_RESTORE,
+    )
+    from control_bot import ops
+
+    loop = asyncio.get_running_loop()
+    ops.ensure_alert_queue()
+    from control_bot.alerts import set_event_loop
+    set_event_loop(loop)
+    register_alert_callback(ops.enqueue_async_alert)
+
+    if not gist_configured():
+        print("[V8] ⚠️  CUSTOMERS_GIST_ID/GIST_TOKEN not configured — local-only DB mode "
+              "(no cross-chunk durability). Set both in repo secrets (V8_RUNBOOKS §1).")
+
+    # Restore before any write so we never boot from a stale local file.
+    if gist_configured():
+        restored = await asyncio.to_thread(restore_db_from_gist)
+        if restored.get("ok"):
+            print(f"[V8] ✅ Restored customers.db from Gist ({restored.get('source')}, "
+                  f"rev {restored.get('revision')})")
+            from control_bot import metrics
+            metrics.note_db_restore(str(restored.get("source", "")))
+
+    run_id = _os.environ.get("GITHUB_RUN_ID", "") or f"local-{os.getpid()}"
+    lease = await asyncio.to_thread(acquire_run_lease, run_id)
+    if not lease.get("ok"):
+        holder = lease.get("holder", {})
+        _msg = (
+            f"🚨 **Startup aborted: another control bot holds the Gist lease** "
+            f"(run `{holder.get('run_id')}`, host `{holder.get('host')}`, pid "
+            f"{holder.get('pid')}). Refusing to boot a second writer — check the "
+            "workflow Actions tab and cancel the duplicate run."
         )
+        print(f"[V8] {_msg}")
+        try:
+            from control_bot.alerts import post_admin_alert
+            await post_admin_alert(_msg)
+        finally:
+            os._exit(1)  # hard abort: two writers would risk split-brain
+
+    print(f"[V8] ✅ Startup lease acquired (run {run_id})")
+    _te_run_id = run_id
+    import timer_engine as _te_mod
+    _te_mod.set_run_id(run_id)
+
+    # heartbeat endpoint (Phase 1.4) — external pinger target
+    port = ops.start_heartbeat_server()
+    if port:
+        print(f"[V8] ✅ Heartbeat endpoint on /healthz (port {port}). Point "
+              "UptimeRobot/Healthchecks at it and set a 15-min alert.")
+
+
+async def _start_ops_monitors(bot: "commands.Bot") -> None:
+    """Start continuous background loops for health/metrics (Phases 1.4-2.4)."""
+    from discord.ext import tasks as _tasks
+    import control_bot.ops as ops_mod
+    from control_bot import alerts
+
+    alerts.wire(bot)
+    from control_bot.proofs import wire_proofs_channel
+    wire_proofs_channel()
+
+    @_tasks.loop(seconds=3600)
+    async def _token_health():
+        await ops_mod.post_worker_token_health(bot)
+
+    @_tasks.loop(seconds=3600)
+    async def _gist_usage():
+        await ops_mod.gist_usage_check(bot)
+
+    @_tasks.loop(seconds=1800)
+    async def _rss_mem():
+        await ops_mod.rss_memory_check(bot)
+
+    @_tasks.loop(seconds=86400)
+    async def _nightly_sweep():
+        await ops_mod.nightly_token_sweep(bot)
+
+    @_tasks.loop(seconds=86400)
+    async def _tune_hints():
+        await ops_mod.post_tune_hints(bot)
+
+    @_tasks.loop(seconds=300)
+    async def _heartbeat_watch():
+        await ops_mod.check_missed_external_beat(bot)
+        await ops_mod.flush_alerts(bot)
+
+    @_tasks.loop(seconds=7 * 86400)
+    async def _weekly():
+        from control_bot import metrics
+        await metrics.post_weekly_summary(bot)
+
+    @_tasks.loop(seconds=86400)
+    async def _forum_perm_check():
+        from discord_forum import startup_forum_permission_self_check
+        report = await startup_forum_permission_self_check(bot)
+        if report.get("problems"):
+            await alerts.post_admin_alert(
+                "🔒 **Forum permission mismatch detected** (TODO 0.6).\n"
+                + "\n".join(
+                    f"- customer `{p.get('customer')}` forum `{p.get('forum')}`: "
+                    f"{'; '.join(p.get('mismatches', []))}"
+                    for p in report["problems"][:10]
+                )
+            )
+        elif report.get("error"):
+            await alerts.post_admin_alert(f"🔒 Forum self-check skipped: {report['error']}")
+
+    # Run once at startup, then daily (0.6 startup self-check).
+    try:
+        from discord_forum import startup_forum_permission_self_check as _forum_check
+        _initial = await _forum_check(bot)
+        if _initial.get("problems"):
+            await alerts.post_admin_alert(
+                "🔒 **Forum permission mismatch detected at startup** (TODO 0.6).\n"
+                + "\n".join(
+                    f"- customer `{p.get('customer')}` forum `{p.get('forum')}`: "
+                    f"{'; '.join(p.get('mismatches', []))}"
+                    for p in _initial["problems"][:10]
+                )
+            )
+    except Exception as exc:
+        print(f"[V8] Forum self-check failed: {exc}")
+
+    for loop in (_token_health, _gist_usage, _rss_mem, _nightly_sweep,
+                 _tune_hints, _heartbeat_watch, _weekly, _forum_perm_check):
+        if not loop.is_running():
+            loop.start()
+    print("[V8] ✅ Ops monitors started (tokens, gist, RSS, sweep, heartbeat, forum).")
 
 
 # ----- Slash commands -----
@@ -435,7 +562,6 @@ class RunDetailsModal(discord.ui.Modal):
 
         values = {
             "alt_id": str(self.parent_view.alt_id or ""),
-            "squad": self.parent_view.squad or "",
             "ad_type": self.parent_view.ad_type or "",
             "interval_min": str(self.parent_view.interval_min),
             "total_hours": str(self.parent_view.total_hours),
@@ -457,28 +583,18 @@ class RunDetailsModal(discord.ui.Modal):
 
 class RunStartView(discord.ui.View):
     """Private component step; only the Continue button opens the modal."""
-    def __init__(self, owner_id: int, squad: str = ""):
+    def __init__(self, owner_id: int):
         super().__init__(timeout=300)
         self.owner_id = owner_id
-        # When a squad is supplied the launch is dispatched to every member in
-        # sequence; the selected alt only seeds the shared configuration.
-        self.squad: str = (squad or "").strip()
         self.alt_id: int | None = None
         self.ad_type: str | None = None
         self.interval_min = 5
         self.total_hours = 6
         self.attach_image = "yes"
         self.buy_style = "detailed"
-        squad_members = (
-            sorted(member.alt_id for member in state.get_squad_members(self.squad)) if self.squad else []
-        )
-        alt_options = squad_members or list(state.alt_ids[:25])
-        if self.squad and not alt_options:
-            alt_options = list(state.alt_ids[:25])
         self.alt_select = discord.ui.Select(
-            placeholder=("1. Choose the squad lead alt…" if self.squad else "1. Choose configured alt…"),
-            min_values=1, max_values=1,
-            options=[discord.SelectOption(label=(state.get(i).name if state.get(i) else f"Alt {i}")[:100], value=str(i)) for i in alt_options], row=0)
+            placeholder="1. Choose configured alt…", min_values=1, max_values=1,
+            options=[discord.SelectOption(label=(state.get(i).name if state.get(i) else f"Alt {i}")[:100], value=str(i)) for i in state.alt_ids[:25]], row=0)
         self.mode_select = discord.ui.Select(
             placeholder="2. Choose sell or buy…", min_values=1, max_values=1,
             options=[discord.SelectOption(label="Sell", value="sell", emoji="💰"), discord.SelectOption(label="Buy", value="buy", emoji="🛒")], row=1)
@@ -493,7 +609,7 @@ class RunStartView(discord.ui.View):
                 discord.SelectOption(label="18 hours", value="18"),
                 discord.SelectOption(label="24 hours", value="24"),
                 discord.SelectOption(label="48 hours", value="48"),
-                discord.SelectOption(label=_runtime_label(0), value="0"),
+                discord.SelectOption(label="∞ Limitless (until /shutdown)", value="0"),
             ], row=3)
         # Image yes/no and detailed/simple are modal fields. Keeping them in
         # the modal preserves all choices without exceeding Discord's five-row
@@ -1144,12 +1260,8 @@ class SquadControlView(discord.ui.View):
 
 def _run_start_embed(view: RunStartView) -> discord.Embed:
     alt = state.get(view.alt_id) if view.alt_id else None
-    embed = discord.Embed(title="🚀 V6 start a sender run", color=0x5865F2)
+    embed = discord.Embed(title="🚀 V8 Ad Run Launcher", color=0x5865F2)
     embed.description = "Choose every runtime setting below, then enter the ad text/rates. This form is private and owner-only."
-    if view.squad:
-        members = sorted(member.alt_id for member in state.get_squad_members(view.squad))
-        summary = ", ".join(str(m) for m in members) or "no members"
-        embed.add_field(name="Squad", value=f"`{view.squad}` → alts {summary}", inline=False)
     embed.add_field(name="Alt", value=alt.name if alt else "not selected", inline=True)
     embed.add_field(name="Mode", value=view.ad_type or "not selected", inline=True)
     embed.add_field(name="Interval / runtime", value=f"{view.interval_min} min / {view.total_hours} h", inline=True)
@@ -1176,15 +1288,6 @@ def _validate_run_values(values: dict[str, str]) -> tuple[list[str], dict[str, o
     if ad_type not in {"sell", "buy"}:
         errors.append("Mode must be sell or buy.")
 
-    raw_message = (values.get("raw_message") or "").strip()
-    if not raw_message:
-        # Compatibility with the two modal field IDs used by older clients.
-        raw_message = (values.get("sell_extra") or values.get("buy_simple_text") or "").strip()
-    if not raw_message:
-        errors.append("Enter a raw message or question.")
-    elif len(raw_message) > 1900:
-        errors.append("Raw message/question is limited to 1900 characters.")
-
     def optional_rate(key: str) -> float | None:
         raw = (values.get(key) or "").strip()
         if not raw:
@@ -1197,6 +1300,25 @@ def _validate_run_values(values: dict[str, str]) -> tuple[list[str], dict[str, o
 
     rate = optional_rate("sell_rate" if ad_type == "sell" else "buy_rate") if ad_type in {"sell", "buy"} else None
     rap = optional_rate("buy_rate_rap") if ad_type == "buy" else None
+
+    raw_message = (values.get("raw_message") or "").strip()
+    if not raw_message:
+        # Compatibility with the two modal field IDs used by older clients.
+        raw_message = (values.get("sell_extra") or values.get("buy_simple_text") or "").strip()
+    if not raw_message:
+        # Legacy contract (test_validation_preserves_modal_constraints): a
+        # rate is enough to build the ad copy; the raw message is required
+        # only when no rate was supplied. The wizard itself still requires the
+        # message field, so this path is a backend compatibility fallback.
+        if ad_type == "sell" and rate is not None:
+            raw_message = f"💸 Selling at {rate:g}/1K — DM me!"
+        elif ad_type == "buy" and rate is not None:
+            raw_message = f"🛒 Buying at {rate:g}/1K — DM me!"
+        else:
+            errors.append("Enter a raw message or question.")
+    elif len(raw_message) > 1900:
+        errors.append("Raw message/question is limited to 1900 characters.")
+
     style = (values.get("buy_style") or "simple").strip().lower()
     if ad_type == "buy" and style not in {"simple", "detailed"}:
         errors.append("Buy style must be simple or detailed when supplied.")
@@ -1214,22 +1336,6 @@ def _validate_run_values(values: dict[str, str]) -> tuple[list[str], dict[str, o
         errors.append("Runtime must be 0 (Limitless), 6, 12, 18, 24, or 48 hours.")
     if values.get("attach_image") not in {"yes", "no"}:
         errors.append("Image setting must be yes or no.")
-
-    # Squad resolution. `/run squad:<name>` expands to every member of that
-    # squad; the guided form's selected alt seeds the shared configuration but
-    # the launch itself is dispatched to every member in sequence.
-    squad = (values.get("squad") or "").strip()
-    targets: list[int] = []
-    if squad:
-        members = state.get_squad_members(squad)
-        if not members:
-            known = ", ".join(sorted(state.get_all_squads())) or "none"
-            errors.append(f"Squad `{squad}` has no configured alts. Known squads: {known}.")
-        else:
-            targets = sorted(member.alt_id for member in members)
-    if not targets:
-        targets = [alt_id] if alt_id in state.alt_ids else []
-
     return errors, {
         "alt_id": alt_id,
         "rate": rate,
@@ -1237,8 +1343,6 @@ def _validate_run_values(values: dict[str, str]) -> tuple[list[str], dict[str, o
         "interval": interval,
         "hours": hours,
         "raw_message": raw_message,
-        "squad": squad,
-        "targets": targets,
     }
 
 
@@ -1288,23 +1392,15 @@ def _apply_alt_registry(repos: dict[int, str], discord_ids: dict[int, int], name
 
 async def _log_alt_add_event(alt_id: int, ok: bool, text: str, *, name: str = "Alt") -> None:
     """Always emit an explicit alt-add result so the diagnostic log channel has
-    both success and failure statements (Issue #46 / PMTP 2.4).
-
-    ``alt_id`` may be ``0`` when the failure happened before an ID could be
-    resolved (for example a token that never authenticated). The log line still
-    carries a stable ``[ALT-ADD]`` marker so the event is searchable, and the
-    per-alt buffer also receives the entry whenever an ID is known. That is what
-    makes a failed add visible for every alt instead of only the first one.
-    """
+    both success and failure statements (Issue #46 / PMTP 2.4)."""
     icon = "✅" if ok else "❌"
-    tag = _alt_tag(alt_id) if alt_id else "[ALT-ADD]"
-    full = f"{icon} {tag} [ALT-ADD] [{('PASS' if ok else 'FAIL')}] {text}"
+    full = f"{icon} [ALT-ADD] [{('PASS' if ok else 'FAIL')}] {text}"
     try:
         await _log_control(full[:2000])
     except Exception:
         print(f"[ALT-ADD] audit log failed: {full[:200]}")
-    if alt_id in state.alt_ids:
-        state.append_log(alt_id, full, emoji=icon, color=0x57F287 if ok else 0xED4245, kind="CONTROL" if ok else "ERROR")
+    if ok and alt_id in state.alt_ids:
+        state.append_log(alt_id, full, emoji=icon if ok else "❌", color=0x57F287 if ok else 0xED4245, kind="CONTROL" if ok else "ERROR")
 
 
 class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
@@ -1352,12 +1448,6 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
 
         await inter.response.defer(ephemeral=True)
 
-        # The whole flow runs under one lock so two concurrent adds can never
-        # both resolve "next free slot" to the same ID (PMTP 2.1 edge case).
-        async with _ALT_MUTATION_LOCK:
-            return await self._provision_alt(inter, token, value)
-
-    async def _provision_alt(self, inter: discord.Interaction, token: str, value) -> None:
         # 1. Validate token with Discord API and extract profile
         ok_prof, profile = await asyncio.to_thread(github_api.fetch_discord_user_profile, token)
         if not ok_prof or not isinstance(profile, dict) or not profile.get("id"):
@@ -1369,36 +1459,26 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
         detected_username = str(profile.get("username") or "alt")
         detected_name = str(profile.get("global_name") or profile.get("username") or "alt")
 
-        # 2. Resolve Alt ID. The ID is resolved before any remote side effect so
-        # every subsequent failure line can be attributed to a concrete alt.
+        # 2. Resolve Alt ID
         raw_aid = value(self.alt_id)
-        limit = max(1, config.ALT_SLOT_LIMIT)
         if raw_aid:
             try:
                 alt_id = int(raw_aid)
             except (TypeError, ValueError):
                 await _log_alt_add_event(0, False, f"Alt add failed: invalid Alt ID '{raw_aid}'.")
-                return await inter.followup.send(f"❌ Alt ID must be an integer between 1 and {limit}.", ephemeral=True)
+                return await inter.followup.send("❌ Alt ID must be an integer between 1 and 4.", ephemeral=True)
         else:
-            free_ids = [i for i in range(1, limit + 1) if i not in state.alt_ids]
+            free_ids = [i for i in (1, 2, 3, 4) if i not in state.alt_ids]
             if not free_ids:
-                await _log_alt_add_event(
-                    0, False,
-                    f"Alt add failed: all {limit} alt slots are occupied "
-                    f"({', '.join(str(i) for i in state.alt_ids)}). Remove one with `/alt action:remove` first.",
-                )
-                return await inter.followup.send(
-                    f"❌ All {limit} alt slots are currently occupied. "
-                    "Remove one with `/alt action:remove` first, or raise `ALT_SLOT_LIMIT` deliberately.",
-                    ephemeral=True,
-                )
+                await _log_alt_add_event(0, False, "Alt add failed: all 4 alt slots are occupied.")
+                return await inter.followup.send("❌ All 4 alt slots are currently occupied. Remove one with `/alt action:remove` first.", ephemeral=True)
             alt_id = free_ids[0]
 
-        if not 1 <= alt_id <= limit:
-            await _log_alt_add_event(alt_id, False, f"Alt add failed: Alt ID {alt_id} is outside 1-{limit}.")
-            return await inter.followup.send(f"❌ Alt ID must be between 1 and {limit}.", ephemeral=True)
+        if alt_id not in {1, 2, 3, 4}:
+            await _log_alt_add_event(0, False, f"Alt add failed: Alt ID {alt_id} is outside 1-4.")
+            return await inter.followup.send("❌ Alt ID must be between 1 and 4.", ephemeral=True)
         if alt_id in state.alt_ids:
-            await _log_alt_add_event(alt_id, False, f"Alt add failed: Alt {alt_id} already configured.")
+            await _log_alt_add_event(0, False, f"Alt add failed: Alt {alt_id} already configured.")
             return await inter.followup.send(f"❌ Alt `{alt_id}` is already configured. Use `/alt action:update` to modify it.", ephemeral=True)
 
         # 3. Resolve Display Name & Discord User ID
@@ -1437,11 +1517,10 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
 
         # 5. Auto-create repo on GitHub, upload templates, and populate secrets
         ok_prov, prov_detail = await asyncio.to_thread(
-            github_api.provision_alt_repository_files_and_secrets, repo, token, channels_csv,
-            alt_id=alt_id, alt_name=name,
+            github_api.provision_alt_repository_files_and_secrets, repo, token, channels_csv
         )
         if not ok_prov:
-            await _log_alt_add_event(alt_id, False, f"Alt add failed while provisioning `{repo}`: {prov_detail}")
+            await _log_alt_add_event(0, False, f"Alt add failed while provisioning `{repo}`: {prov_detail}")
             return await inter.followup.send(f"❌ Auto-provisioning failed for `{repo}`: {prov_detail}", ephemeral=True)
 
         # 6. Persist alt in core fleet registry
@@ -1450,20 +1529,11 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
         names = dict(config.ALT_NAMES); names[alt_id] = name
         persisted, persist_detail = await _persist_alt_registry(repos, discord_ids, names)
         if not persisted:
-            await _log_alt_add_event(alt_id, False, f"Alt add failed to persist core registry: {persist_detail}")
+            await _log_alt_add_event(0, False, f"Alt add failed to persist core registry: {persist_detail}")
             return await inter.followup.send(f"❌ Alt was not registered in core map: {persist_detail}", ephemeral=True)
 
         _apply_alt_registry(repos, discord_ids, names)
-        if not state.add_alt(alt_id, name):
-            # Another concurrent add claimed the slot between validation and
-            # commit. Roll the registry back so state and config stay in sync.
-            repos.pop(alt_id, None); discord_ids.pop(alt_id, None); names.pop(alt_id, None)
-            _apply_alt_registry(repos, discord_ids, names)
-            await _log_alt_add_event(alt_id, False, f"Alt add failed: Alt {alt_id} was claimed by a concurrent add.")
-            return await inter.followup.send(
-                f"❌ Alt `{alt_id}` was registered by another in-flight add. Retry to take the next free slot.",
-                ephemeral=True,
-            )
+        state.add_alt(alt_id, name)
         for cid in parsed_channels:
             state.set_channel(alt_id, cid, cid)
         channel_persist_ok, channel_persist_detail = await _persist_channels_for_alt(alt_id)
@@ -1858,17 +1928,14 @@ class RunPreviewView(discord.ui.View):
 
 
 def _run_preview_embed(values: dict[str, str], parsed: dict[str, object]) -> discord.Embed:
-    try:
-        alt_id = int(parsed.get("alt_id") or 0)
-    except (TypeError, ValueError):
-        alt_id = 0
+    alt_id = int(parsed["alt_id"])
     alt = state.get(alt_id)
     name = alt.name if alt else f"Alt {alt_id}"
     ad_type = str(values.get("ad_type") or "").lower()
     rate = parsed.get("rate")
     interval = parsed.get("interval")
     hours = parsed.get("hours")
-    runtime_label = _runtime_label(hours)
+    runtime_label = "∞ Limitless (until /shutdown)" if int(hours or 0) == 0 else f"{hours}h"
     embed = discord.Embed(
         title="🚀 /run Command Preview — Review Before Dispatch",
         description=(
@@ -1878,15 +1945,7 @@ def _run_preview_embed(values: dict[str, str], parsed: dict[str, object]) -> dis
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    targets = [int(x) for x in (parsed.get("targets") or []) if str(x).isdigit()] or [alt_id]
-    squad = str(parsed.get("squad") or "").strip()
-    if squad and len(targets) > 1:
-        target_text = f"Squad `{squad}` — " + ", ".join(
-            f"**{state.get_name(t)}** (`{t}`)" for t in targets
-        )
-    else:
-        target_text = f"**{name}** (ID `{alt_id}`)"
-    embed.add_field(name="Alt", value=target_text[:1024], inline=True)
+    embed.add_field(name="Alt", value=f"**{name}** (ID `{alt_id}`)", inline=True)
     embed.add_field(name="Mode", value=f"`{ad_type.upper()}`", inline=True)
     embed.add_field(name="Interval / Runtime", value=f"`{interval}m` / `{runtime_label}`", inline=True)
     embed.add_field(name="Image", value=f"`{values.get('attach_image')}`", inline=True)
@@ -1899,11 +1958,15 @@ def _run_preview_embed(values: dict[str, str], parsed: dict[str, object]) -> dis
         embed.add_field(name="Style", value=f"`{values.get('buy_style') or 'simple'}`", inline=True)
     raw_message = str(parsed.get("raw_message") or values.get("raw_message") or values.get("sell_extra") or values.get("buy_simple_text") or "")
     embed.add_field(name="Raw Message / Question", value=f"```{raw_message[:1500]}```", inline=False)
-    if squad and len(targets) > 1:
+    if int(hours or 0) == 0:
+        # TODO 1.3 — honest copy: ∞ Limitless runs 48h max per dispatch; the
+        # control bot auto-renews it while the subscription stays active.
         embed.add_field(
-            name="Squad Spacing",
-            value=(f"`{len(targets)}` alts launched in sequence, "
-                   f"`{_SQUAD_SPACING[0] * 1000:.0f}–{_SQUAD_SPACING[1] * 1000:.0f}ms` apart."),
+            name="🟡 ∞ Limitless — read this",
+            value="∞ Limitless runs for a **maximum of 48 hours per dispatch**. "
+                  "A new run will be required to continue. If auto-renew is "
+                  "enabled, the timer engine re-dispatches it automatically "
+                  "while your subscription is active.",
             inline=False,
         )
     embed.set_footer(text="/run now requires an explicit Confirm Launch step before dispatch.")
@@ -1916,11 +1979,7 @@ async def _dispatch_run_from_modal(inter: discord.Interaction, values: dict[str,
         return
     if not inter.response.is_done():
         await inter.response.defer(ephemeral=True)
-    try:
-        alt_id = int(parsed.get("alt_id") or 0)
-    except (TypeError, ValueError):
-        alt_id = 0
-    alt = state.get(alt_id)
+    alt_id = int(parsed["alt_id"]); alt = state.get(alt_id)
     if not alt:
         return await inter.followup.send("❓ Unknown alt.", ephemeral=True)
     if not config.GITHUB_TOKEN or not config.GITHUB_OWNER or alt_id not in config.ALT_REPOS:
@@ -1942,50 +2001,14 @@ async def _execute_run_dispatch(inter: discord.Interaction, values: dict[str, st
         return
     if not inter.response.is_done():
         await inter.response.defer(ephemeral=True)
-
-    targets = [int(x) for x in (parsed.get("targets") or []) if str(x).isdigit()]
-    if not targets:
-        targets = [int(parsed["alt_id"])]
-    squad = str(parsed.get("squad") or values.get("squad") or "").strip()
-
-    # A squad dispatch walks its members in sequence. Each alt is separated by a
-    # small randomized offset so the fleet never emits in the same millisecond.
-    results: list[str] = []
-    for index, alt_id in enumerate(targets):
-        if index:
-            await _squad_pause()
-        results.append(await _dispatch_single_alt(alt_id, values, parsed))
-
-    runtime_label = _runtime_label(parsed["hours"])
-    header = (
-        f"🚀 **Squad `{squad}`** launch — {len(targets)} alt(s) dispatched in sequence "
-        f"({_SQUAD_SPACING[0] * 1000:.0f}–{_SQUAD_SPACING[1] * 1000:.0f}ms apart)"
-        if squad and len(targets) > 1 else
-        f"🚀 Launch — {len(targets)} alt(s) dispatched"
-    )
-    body = f"{header}\n• Interval `{parsed['interval']}min` × `{runtime_label}`\n" + "\n".join(f"• {line}" for line in results)
-    await inter.followup.send(body[:4000], ephemeral=True)
-    await _log_control(body)
-    if squad and len(targets) > 1:
-        for alt_id in targets:
-            state.append_log(
-                alt_id,
-                f"Squad `{squad}` run dispatched to {len(targets)} alt(s) "
-                f"({', '.join(str(t) for t in targets)}) at {parsed['interval']}min × {runtime_label}.",
-                emoji="👥", color=0x57F287, kind="SQUAD",
-            )
-
-
-async def _dispatch_single_alt(alt_id: int, values: dict[str, str], parsed: dict[str, object]) -> str:
-    """Dispatch one workflow for a single alt and return a one-line result."""
-    alt = state.get(alt_id)
+    alt_id = int(parsed["alt_id"]); alt = state.get(alt_id)
     if not alt:
-        return f"{_alt_tag(alt_id)} ❓ Unknown alt — skipped."
+        return await inter.followup.send("❓ Unknown alt.", ephemeral=True)
     if not config.GITHUB_TOKEN or not config.GITHUB_OWNER or alt_id not in config.ALT_REPOS:
-        return f"{_alt_tag(alt_id)} ❌ GitHub control is not configured for this alt — skipped."
+        return await inter.followup.send("❌ GitHub control is not configured for this alt.", ephemeral=True)
 
     # Resolve target channels to pass to workflow so newly added alts never crash on empty channels
-    active_chs = [str(c) for c in alt.channels.keys() if str(c).isdigit()] if alt.channels else []
+    active_chs = [str(c) for c in alt.channels.keys() if str(c).isdigit()] if alt and alt.channels else []
     if not active_chs:
         for other_id in state.alt_ids:
             other_alt = state.get(other_id)
@@ -2014,37 +2037,44 @@ async def _dispatch_single_alt(alt_id: int, values: dict[str, str], parsed: dict
         "channel_1_name": "",
         "channel_2_name": "",
     }
-    if values["ad_type"] == "sell":
-        inputs.update({"sell_rate": values.get("sell_rate", ""), "sell_extra": values.get("sell_extra", "")})
-    else:
-        inputs.update({
-            "buy_style": values.get("buy_style", "simple"),
-            "buy_rate": str(parsed["rate"]),
-            "buy_rate_rap": str(parsed["rap"]),
-            "buy_simple_text": values.get("buy_simple_text", ""),
-        })
+    if values["ad_type"] == "sell": inputs.update({"sell_rate": values["sell_rate"], "sell_extra": values.get("sell_extra", "")})
+    else: inputs.update({"buy_style": values["buy_style"], "buy_rate": str(parsed["rate"]), "buy_rate_rap": str(parsed["rap"]), "buy_simple_text": values.get("buy_simple_text", "")})
     try:
         await asyncio.to_thread(github_api.cancel_run, alt_id)
         ok, msg = await asyncio.to_thread(github_api.dispatch_workflow, alt_id, inputs)
     except Exception as exc:
-        return f"{_alt_tag(alt_id)} ❌ Dispatch failed: {type(exc).__name__}: {exc}"
-    if not ok:
-        state.set_error(alt_id, f"Dispatch failed: {msg}")
-        return f"{_alt_tag(alt_id)} ❌ Dispatch failed: {msg}"
+        return await inter.followup.send(f"❌ Dispatch failed: {type(exc).__name__}: {exc}", ephemeral=True)
+    if not ok: return await inter.followup.send(f"❌ Dispatch failed: {msg}", ephemeral=True)
+    rate = parsed["rate"]
     state.set_workflow(alt_id, None, "queued", "")
     state.set_run_config(
         alt_id,
         ad_type=values["ad_type"],
-        rate=parsed["rate"],
+        rate=rate,
         message=values.get("sell_extra") or values.get("buy_simple_text"),
         interval_min=parsed["interval"],
         runtime_hours=parsed["hours"],
     )
-    runtime_label = _runtime_label(parsed["hours"])
-    text = (f"{_alt_tag(alt_id)} **{alt.name}** queued privately: {values['ad_type']} · "
-            f"{parsed['interval']}min × {runtime_label} · image={values['attach_image']} — {msg}")
+    # V8: record run_state so the timer engine can auto-renew (1.3) and TTFTV
+    #/metrics can attribute the run to the customer.
+    if _V8_LOADED:
+        try:
+            cust = _cm.get_customer(str(inter.user.id))
+            if cust:
+                user_id = str(inter.user.id)
+                _cm.record_run_state(
+                    user_id, alt_id,
+                    mode="limitless" if int(parsed["hours"] or 0) == 0 else "timed",
+                    runtime_hours=int(parsed["hours"] or 0),
+                    payload=inputs,
+                )
+        except Exception as exc:
+            print(f"[V8] run_state record warning: {exc}")
+    runtime_label = "∞ Limitless (until /shutdown)" if int(parsed["hours"] or 0) == 0 else f"{parsed['hours']}h"
+    text = f"🚀 **{alt.name}** queued privately: {values['ad_type']} · {parsed['interval']}min × {runtime_label} · image={values['attach_image']}\n{msg}"
+    await inter.followup.send(text, ephemeral=True)
+    await _log_control(text)
     state.append_log(alt_id, text, emoji="🚀", color=0x57F287, kind="CONTROL")
-    return text
 
 
 async def _finish_dm_control(inter: discord.Interaction, alt_id: int,
@@ -2294,21 +2324,10 @@ async def _handle_simulate_listing(inter: discord.Interaction, alt: int, sample_
 # Core Slash Commands (19 Non-Duplicated Unified Top-Level Commands)          #
 # =========================================================================== #
 
-@bot.tree.command(name="run", description="Launch Ad Run: guided launcher that asks for your raw message, then automatically applies emojis/modifiers before dispatching to GitHub Actions.")
-@app_commands.describe(squad="Optional squad name — launches every alt in that squad in sequence with staggered spacing")
-async def cmd_run(inter: discord.Interaction, squad: Optional[str] = None):
+@bot.tree.command(name="run", description="Launch Ad Run — guided 3-step launcher: pick alt/mode/interval, enter ad text, preview & confirm dispatch to GitHub Actions.")
+async def cmd_run(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
-    squad = (squad or "").strip()
-    if squad:
-        members = state.get_squad_members(squad)
-        if not members:
-            known = ", ".join(sorted(state.get_all_squads())) or "none configured"
-            return await inter.response.send_message(
-                f"❌ Squad `{squad}` has no configured alts. Known squads: {known}. "
-                "Use `/squad action:create squad_name:<name> alts:1,2,3` first.",
-                ephemeral=True,
-            )
     if not state.alt_ids:
         await inter.response.send_message(
             "❌ No configured alts are available. To fix: add one with `/alt action:add`, or check `/status` if an alt exists but isn't registered.",
@@ -2321,16 +2340,16 @@ async def cmd_run(inter: discord.Interaction, squad: Optional[str] = None):
             ephemeral=True,
         )
         return
-    view = RunStartView(inter.user.id, squad=squad)
+    view = RunStartView(inter.user.id)
     await inter.response.send_message(embed=_run_start_embed(view), view=view, ephemeral=True)
 
 
-@bot.tree.command(name="getstarted", description="Get Started: step-by-step beginner guide for setting up and running the farm.")
+@bot.tree.command(name="getstarted", description="Quick-Start Guide — step-by-step V8 checklist from policy acceptance to first ad run.")
 async def cmd_getstarted(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
     embed = discord.Embed(
-        title="🚀 Get Started — V6 Ad Farm Beginner Guide",
+        title="🚀 Get Started — V8 Ad Farm Quick-Start Guide",
         description=(
             "Follow this checklist to get your first alt running. Every step is done inside Discord;\n"
             "you should not need to edit code for normal operations."
@@ -2339,14 +2358,15 @@ async def cmd_getstarted(inter: discord.Interaction):
         timestamp=datetime.now(timezone.utc),
     )
     steps = [
-        ("1. Add an alt", "Run `/alt action:add`. Enter the alt's user token and optionally a display name. The bot creates the repository, installs workflows/secrets, and validates the token before it registers."),
-        ("2. Add channels", "Run `/channels alt:1 action:add channel_id:<ID> name:<label>`, or `/channels alt:1 action:overwrite channel_id:<id1,id2,...>` to replace the whole list at once. **Overwrite replaces, it never merges.** Prefer `/autorescan` — it fetches the live channel list, adds new channels, removes deleted ones, and logs exactly what changed."),
-        ("3. Check health", "Run `/alt action:selfcheck alt:1`. It verifies token, channels, webhooks, proxies, and test suites."),
-        ("4. Configure price/mode", "Run `/tune alt:1 mode:sell price:2.40`, or `/run` and use the guided form. `/run` only needs the message you want to post — modifiers such as emojis are applied automatically; no item word, price, or RAP is required."),
-        ("5. Preview and launch", "Run `/run`, review the full preview (raw message, modifiers, cadence, runtime), and click **Confirm Launch**. The workflow is queued on GitHub and live state appears in #dashboard and #farm-logs."),
-        ("6. Group and monitor", "Use `/squad action:create squad_name:MyGroup alts:1,2` then `/run squad:MyGroup` to launch a whole group with spaced dispatch. Monitor with `/status`, `/analytics`, `/alt action:logs alt:1`, `/deals`, and `/diagnose`. Run `/sync` after changing shared Gist settings."),
-        ("7. Stop or shutdown", "Use `/stop alt:1` for one alt. Use `/shutdown` to gracefully stop all alts and end the control bot process."),
-        ("Docs", "See `SKILL.md` (full command reference, troubleshooting), `BUG_TRACKER.md` (known issues/risks), `SETUP_CONTROL.md` (multi-alt), `SETUP_GUIDE.md` (single-alt), and `README.md` (architecture)."),
+        ("1. Accept the Policy", "Read the pinned policy card in `#open-ticket` and click **✅ I Agree**. This is required before any payment address is shared (money-gate)."),
+        ("2. Pay & Activate", "Send BEP-20 USDT/BUSD via Trust Wallet. An admin verifies on BSCScan, then runs `/admin activate @You days:30 alts:N` to create your private forum and repos."),
+        ("3. Run /setup", "Type `/setup` in your `#control` thread. Enter your alt tokens and channel IDs — the wizard validates each one before moving to the next. Watch the 3-min video if you're stuck."),
+        ("4. Launch your farm", "Run `/run` — pick your alt, mode (Sell/Buy), interval (3/5 min), runtime (6–48h or ∞ Limitless), enter your ad text, and click **Confirm Launch**."),
+        ("5. Monitor", "Check `#dashboard` for live status (updated every 5 min), `#farm-logs` for action logs, and `#deals` for arbitrage alerts. Use `/status` for a quick overview."),
+        ("6. Tune on the fly", "Use `/tune alt:1 price:2.50` to change your rate, `/tune alt:1 message:New text` to change your ad copy, or `/channels` to add/replace trading channels."),
+        ("7. Alt banned?", "Don't panic — the bot auto-detects bans, posts to your `#control` thread with time credit info, and offers a one-click re-setup button for the replacement alt."),
+        ("8. Renew", "Use `/renew` before your subscription expires (you'll get DM reminders at 7d, 3d, 1d). An admin confirms payment and extends your farm."),
+        ("Docs", "See `SETUP_GUIDE.md` (customer A-to-Z), `SETUP_CONTROL.md` (admin A-to-Z), `SKILL.md` (full reference), `V8_RUNBOOKS.md` (runbooks), and `ROADMAP.md` (commitment artifact)."),
     ]
     for name, value in steps:
         embed.add_field(name=name, value=value, inline=False)
@@ -2355,13 +2375,6 @@ async def cmd_getstarted(inter: discord.Interaction):
 
 
 def _script_result_embed(label: str, result: dict) -> discord.Embed:
-    """Render one sandbox result.
-
-    Nothing is filtered: both streams are reported in full. The embed fields
-    show the tail (Discord caps a field at 1024 characters) and the caller
-    attaches the complete stream as a file, with the exact truncated byte count
-    reported here so the operator always knows what they are looking at.
-    """
     timed = bool(result.get("timed_out"))
     code = int(result.get("code") or 0)
     ok = not timed and code in (0, None)
@@ -2370,24 +2383,17 @@ def _script_result_embed(label: str, result: dict) -> discord.Embed:
     embed.add_field(name="Exit Code", value=f"`{code}`", inline=True)
     embed.add_field(name="Timed Out", value="yes" if timed else "no", inline=True)
     embed.add_field(name="Elapsed", value=f"`{float(result.get('elapsed') or 0):.2f}s`", inline=True)
-    policy = (
-        f"timeout `{config.SCRIPT_TIMEOUT_SEC}s` · memory `{config.SCRIPT_MEMORY_MB}MB` · "
-        f"cpu `{config.SCRIPT_CPU_SEC}s` · network `{'on' if config.SCRIPT_NETWORK_ENABLED else 'off'}` · "
-        f"max `{config.SCRIPT_MAX_CHARS}` chars"
-    )
-    embed.add_field(name="Sandbox Policy", value=policy, inline=False)
     stdout = str(result.get("stdout") or "")
     stderr = str(result.get("stderr") or "")
-
     def field_value(text: str) -> str:
         if not text:
             return "_empty_"
+        # Discord embed fields are limited to 1024 characters. The complete
+        # unfiltered stream is attached by _run_script_sandbox below.
         clipped = text[-900:]
-        prefix = f"_…showing last {len(clipped)} of {len(text)} chars (full stream attached)_\n" if len(clipped) < len(text) else ""
-        return f"{prefix}```\n{clipped}\n```"[:1024]
-
-    embed.add_field(name=f"stdout · {len(stdout)} chars (unfiltered)", value=field_value(stdout), inline=False)
-    embed.add_field(name=f"stderr / errors · {len(stderr)} chars (unfiltered)", value=field_value(stderr), inline=False)
+        return f"```\n{clipped}\n```"[:1024]
+    embed.add_field(name="stdout (unfiltered; full stream attached when long)", value=field_value(stdout), inline=False)
+    embed.add_field(name="stderr / errors (unfiltered; full stream attached when long)", value=field_value(stderr), inline=False)
     if result.get("error"):
         embed.add_field(name="Sandbox Error", value=str(result["error"])[:900], inline=False)
     return embed
@@ -2416,17 +2422,11 @@ async def _run_script_sandbox(inter: discord.Interaction, script: str, *, execut
         network=config.SCRIPT_NETWORK_ENABLED,
         max_chars=config.SCRIPT_MAX_CHARS,
     )
-    embed = _script_result_embed(
-        f"{'▶️' if execute else '🧪'} Script {label} "
-        f"({'executed in sandbox' if execute else 'sandboxed dry-run diagnostic'})",
-        result,
-    )
+    embed = _script_result_embed(f"{'▶️' if execute else '🧪'} Script {label}", result)
     files = []
     for stream_name in ("stdout", "stderr"):
         stream = str(result.get(stream_name) or "")
-        # Attach every non-empty stream so nothing is lost to the 1024-character
-        # Discord field limit; the embed tail is only a preview.
-        if stream:
+        if len(stream) > 900:
             files.append(discord.File(
                 io.BytesIO(stream.encode("utf-8", errors="replace")),
                 filename=f"{label}-{stream_name}.txt",
@@ -2441,7 +2441,7 @@ async def _run_script_sandbox(inter: discord.Interaction, script: str, *, execut
         pass
 
 
-@bot.tree.command(name="script", description="Scripting Suite: `simulate` shows unfiltered stdout/stderr (dry-run); `run` executes in sandbox. Both are resource-limited.")
+@bot.tree.command(name="script", description="Scripting — `simulate` dry-runs with unfiltered logs; `run` executes Python in a resource-limited sandbox.")
 @app_commands.describe(
     action="simulate (dry-run, unfiltered logs) or run (execute after approval)",
     code="Python script source",
@@ -2458,7 +2458,7 @@ async def cmd_script(inter: discord.Interaction, action: Literal["simulate", "ru
     await _run_script_sandbox(inter, code, execute=(action == "run"), label=action)
 
 
-@bot.tree.command(name="shutdown", description="Shutdown: gracefully stop all alts, cancel workflows, and terminate the control bot process.")
+@bot.tree.command(name="shutdown", description="Shutdown — gracefully stop all alts, cancel workflows, and terminate the control bot (requires SHUTDOWN confirmation).")
 @app_commands.describe(confirmation="Type SHUTDOWN to confirm")
 async def cmd_shutdown(inter: discord.Interaction, confirmation: str):
     if not await _check_perms(inter):
@@ -2501,7 +2501,7 @@ async def cmd_shutdown(inter: discord.Interaction, confirmation: str):
         pass
 
 
-@bot.tree.command(name="stop", description="Stop Ad Run: cancel active GitHub Actions runner and shut down the alt cleanly.")
+@bot.tree.command(name="stop", description="Stop Ad Run — sends stop command via Gist queue and cancels the GitHub Actions workflow (~30-45s).")
 @app_commands.describe(alt="Target alt ID to stop")
 async def cmd_stop(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
@@ -2520,7 +2520,7 @@ async def cmd_stop(inter: discord.Interaction, alt: int):
     state.append_log(alt, text, emoji="🛑", color=0xED4245, kind="CONTROL")
 
 
-@bot.tree.command(name="pause", description="Pause Posting: temporarily pause public ads while keeping the runner alive.")
+@bot.tree.command(name="pause", description="Pause Posting — temporarily halt ad delivery on all channels without stopping the GitHub runner.")
 @app_commands.describe(alt="Target alt ID to pause (or choose specific alt)")
 async def cmd_pause(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
@@ -2528,7 +2528,7 @@ async def cmd_pause(inter: discord.Interaction, alt: int):
     await _finish_dm_control(inter, alt, "!pause", "pause requested")
 
 
-@bot.tree.command(name="resume", description="Resume Posting: unpause public ads and restore regular posting schedule.")
+@bot.tree.command(name="resume", description="Resume Posting — unpause ad delivery and restore the regular posting schedule.")
 @app_commands.describe(alt="Target alt ID to resume (or choose specific alt)")
 async def cmd_resume(inter: discord.Interaction, alt: int):
     if not await _check_perms(inter):
@@ -2536,7 +2536,7 @@ async def cmd_resume(inter: discord.Interaction, alt: int):
     await _finish_dm_control(inter, alt, "!resume", "resume requested")
 
 
-@bot.tree.command(name="alt", description="Alt Account Manager: view status, add accounts, check logs, or test health.")
+@bot.tree.command(name="alt", description="Alt Manager — add/update/remove alts, view typed logs, check workflow runs, run self-check.")
 @app_commands.describe(
     action="Action to perform (leave empty for visual dashboard)",
     alt="Target alt ID (1-4)",
@@ -2548,14 +2548,14 @@ async def cmd_resume(inter: discord.Interaction, alt: int):
 )
 @app_commands.choices(
     action=[
-        app_commands.Choice(name="👥 Overview - Open visual fleet management hub", value="overview"),
-        app_commands.Choice(name="➕ Add Alt - Connect a new alt account via token", value="add"),
-        app_commands.Choice(name="✏️ Update Alt - Change name, repo, or token", value="update"),
-        app_commands.Choice(name="🗑️ Remove Alt - Disconnect an alt account", value="remove"),
-        app_commands.Choice(name="📜 View Logs - Read live post and heartbeat logs", value="logs"),
-        app_commands.Choice(name="🧹 Clear Logs - Reset in-memory log buffer", value="clearlogs"),
-        app_commands.Choice(name="⏱️ Recent Runs - View recent GitHub Actions runs", value="runs"),
-        app_commands.Choice(name="🔍 Health Self-Check - Test proxy, token, and channel access", value="selfcheck"),
+        app_commands.Choice(name="👥 Overview — Open visual fleet management hub", value="overview"),
+        app_commands.Choice(name="➕ Add Alt — Connect a new alt account via token", value="add"),
+        app_commands.Choice(name="✏️ Update Alt — Change name, repo, or token", value="update"),
+        app_commands.Choice(name="🗑️ Remove Alt — Disconnect an alt account", value="remove"),
+        app_commands.Choice(name="📜 View Logs — Stream typed action logs for an alt", value="logs"),
+        app_commands.Choice(name="🧹 Clear Logs — Purge local log buffer for an alt", value="clearlogs"),
+        app_commands.Choice(name="⏱️ Recent Runs — View recent GitHub Actions runs", value="runs"),
+        app_commands.Choice(name="🔍 Self-Check — Run pre-flight validation on an alt", value="selfcheck"),
     ],
     kind=[
         app_commands.Choice(name="📋 All Logs", value="ALL"),
@@ -2607,7 +2607,7 @@ async def cmd_alt(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="tune", description="Live Tuning: change price, message copy, mode, speed, duration, or image on the fly.")
+@bot.tree.command(name="tune", description="Live Tuning — change price, ad copy, mode, interval, runtime, image, or apply policy presets on the fly.")
 @app_commands.describe(
     alt="Target alt ID (choose specific alt or 0 for all)",
     policy="Safety / speed preset template",
@@ -2783,20 +2783,13 @@ async def _fetch_control_server_catalogue() -> list[dict[str, Any]]:
     return result
 
 
-async def _reconcile_control_channels(alt_id: int, *, reason: str, configured_ids=None, persist: bool = True) -> dict:
-    """Refresh durable channel inventory from the control bot's Discord view.
-
-    ``persist=False`` performs a read-only diff: the live inventory is compared
-    against the stored catalogue and the exact drift is returned, but nothing is
-    written. That is what `/autorescan action:report` uses.
-    """
-    remote_snapshot = None
-    if persist:
-        remote_snapshot = await asyncio.to_thread(
-            github_api.fetch_channel_registry_snapshot, alt_id
-        )
-        if remote_snapshot:
-            await asyncio.to_thread(channel_registry.restore_alt_snapshot, alt_id, remote_snapshot)
+async def _reconcile_control_channels(alt_id: int, *, reason: str, configured_ids=None) -> dict:
+    """Refresh durable channel inventory from the control bot's Discord view."""
+    remote_snapshot = await asyncio.to_thread(
+        github_api.fetch_channel_registry_snapshot, alt_id
+    )
+    if remote_snapshot:
+        await asyncio.to_thread(channel_registry.restore_alt_snapshot, alt_id, remote_snapshot)
     servers = await _fetch_control_server_catalogue()
     if not servers:
         return {"ok": False, "error": "control bot has no accessible guild inventory"}
@@ -2805,10 +2798,7 @@ async def _reconcile_control_channels(alt_id: int, *, reason: str, configured_id
         alt_id,
         servers,
         configured_ids=configured_ids,
-        persist=persist,
     )
-    if result.get("ok") and not persist:
-        return result
     if result.get("ok"):
         names = {
             cid: str(record.get("name") or cid)
@@ -2891,7 +2881,7 @@ def _set_channels_state(alt_id: int, cids: list[str], names: dict[str, str] | No
     return len(a_obj.channels) if a_obj else 0
 
 
-@bot.tree.command(name="channels", description="Channel Manager: add target trading channels, swap deleted ones, or rescan.")
+@bot.tree.command(name="channels", description="Channel Manager — add/replace/remove trading channels, overwrite the full list, rescan permissions, or reset caution.")
 @app_commands.describe(
     alt="Target alt ID",
     action="Action to perform (leave blank to open visual manager)",
@@ -3069,7 +3059,7 @@ async def cmd_channels(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="deals", description="Marketplace arbitrage scanner: track custom items, games, and price edges.")
+@bot.tree.command(name="deals", description="Deal Scanner — passive marketplace arbitrage detection. Configure keywords, profit edge, and test-parse listings.")
 @app_commands.describe(
     alt="Target alt ID (or 0 for all)",
     enabled="Turn deal scanning on or off",
@@ -3142,12 +3132,11 @@ async def cmd_deals(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="squad", description="Fleet Squads: group alts into teams to sync prices, pauses, or safety policies.")
+@bot.tree.command(name="squad", description="Fleet Squads — group alts into named teams for batch pause/resume/price/policy operations.")
 @app_commands.describe(
     action="Squad action (leave blank to open interactive hub)",
     squad_name="Squad name (e.g. 'Alpha', 'Sellers', 'Night Patrol')",
     alt="Target alt ID (1-4)",
-    alts="Comma-separated alt IDs for create (e.g. '1,2,3,4' or 'all')",
     value="Value for squad batch operations (e.g. preset name 'stealth' or price '2.40')",
 )
 @app_commands.choices(
@@ -3155,9 +3144,7 @@ async def cmd_deals(
         app_commands.Choice(name="👥 Squad Hub - Open visual squad control hub", value="overview"),
         app_commands.Choice(name="📋 List Squads - Show all squad teams and members", value="list"),
         app_commands.Choice(name="📊 Team Status - View composite squad health and statistics", value="view"),
-        app_commands.Choice(name="🆕 Create Squad - Assign a whole group in one command", value="create"),
         app_commands.Choice(name="➕ Assign Alt - Add or move an alt to a squad team", value="assign"),
-        app_commands.Choice(name="➖ Unassign Alt - Remove an alt from its squad", value="unassign"),
         app_commands.Choice(name="⏸️ Pause Squad - Batch pause ads across all squad alts", value="pause"),
         app_commands.Choice(name="▶️ Resume Squad - Batch resume ads across all squad alts", value="resume"),
         app_commands.Choice(name="🛡️ Apply Policy - Apply safety preset (stealth/aggressive) to squad", value="policy"),
@@ -3166,101 +3153,18 @@ async def cmd_deals(
 )
 async def cmd_squad(
     inter: discord.Interaction,
-    action: Optional[Literal["overview", "list", "view", "create", "assign", "unassign", "pause", "resume", "policy", "price"]] = "overview",
+    action: Optional[Literal["overview", "list", "view", "assign", "pause", "resume", "policy", "price"]] = "overview",
     squad_name: Optional[str] = None,
     alt: Optional[int] = 0,
-    alts: Optional[str] = None,
     value: Optional[str] = None,
 ):
     if not await _check_perms(inter):
         return
 
-    if action == "list" and not squad_name:
-        squads = state.get_all_squads()
-        if not squads:
-            return await inter.response.send_message("No squads configured. Use `/squad action:create`.", ephemeral=True)
-        lines = []
-        for name in sorted(squads):
-            members = squads[name]
-            lines.append(f"• **{name}** → {', '.join(f'Alt `{m}`' for m in sorted(members)) or '_empty_'}")
-        embed = discord.Embed(
-            title="👥 Fleet Squads",
-            description="\n".join(lines)[:4000],
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_footer(text="Launch a whole squad with `/run squad:<name>`.")
-        return await inter.response.send_message(embed=embed, ephemeral=True)
-
-    elif action in (None, "overview") and not squad_name:
+    if action in (None, "overview", "list") and not squad_name:
         view = SquadControlView(owner_id=inter.user.id, current_squad=squad_name or "Alpha")
         embed = view._render_embed()
         return await inter.response.send_message(embed=embed, view=view, ephemeral=True)
-
-    elif action == "list":
-        squads = state.get_all_squads()
-        if not squads:
-            return await inter.response.send_message("No squads configured. Use `/squad action:create`.", ephemeral=True)
-        lines = []
-        for name in sorted(squads):
-            members = squads[name]
-            lines.append(f"• **{name}** → {', '.join(f'Alt `{m}`' for m in sorted(members)) or '_empty_'}")
-        embed = discord.Embed(
-            title="👥 Fleet Squads",
-            description="\n".join(lines)[:4000],
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_footer(text="Launch a whole squad with `/run squad:<name>`.")
-        return await inter.response.send_message(embed=embed, ephemeral=True)
-
-    elif action == "create":
-        name = (squad_name or "").strip()
-        if not name:
-            return await inter.response.send_message("❌ `squad_name` is required to create a squad.", ephemeral=True)
-        if len(name) > 50:
-            return await inter.response.send_message("❌ Squad name must be 50 characters or fewer.", ephemeral=True)
-        raw_members = (alts or "").strip()
-        if raw_members.casefold() in {"all", "*"}:
-            member_ids = list(state.alt_ids)
-        else:
-            member_ids = []
-            for part in raw_members.replace(",", " ").split():
-                if not part.isdigit():
-                    return await inter.response.send_message(
-                        f"❌ Squad member `{part}` is not a numeric alt ID. Use e.g. `alts:1,2,3,4` or `alts:all`.",
-                        ephemeral=True,
-                    )
-                member_ids.append(int(part))
-        if not member_ids:
-            return await inter.response.send_message(
-                "❌ Provide at least one alt, e.g. `/squad action:create squad_name:MyGroup alts:1,2,3,4`.",
-                ephemeral=True,
-            )
-        invalid = [str(m) for m in member_ids if m not in state.alt_ids]
-        if invalid:
-            configured = ", ".join(str(i) for i in state.alt_ids) or "none"
-            return await inter.response.send_message(
-                f"❌ Alt(s) {', '.join(invalid)} are not configured. Configured alts: {configured}.",
-                ephemeral=True,
-            )
-        assigned = []
-        for member_id in sorted(dict.fromkeys(member_ids)):
-            if state.set_squad(member_id, name):
-                assigned.append(member_id)
-        if not assigned:
-            return await inter.response.send_message(
-                f"❌ Squad **{name}** was not created; no alt accepted the assignment.",
-                ephemeral=True,
-            )
-        text = (
-            f"✅ Squad **{name}** now has {len(assigned)} alt(s): "
-            f"{', '.join(f'`{m}`' for m in assigned)}.\n"
-            f"Launch them together with `/run squad:{name}`."
-        )
-        await inter.response.send_message(text, ephemeral=True)
-        await _log_control(f"👥 Squad **{name}** created with alts {', '.join(str(m) for m in assigned)}.")
-        return
 
     elif action == "assign":
         if not alt or not squad_name:
@@ -3269,15 +3173,6 @@ async def cmd_squad(
             return await inter.response.send_message("❌ Invalid alt specified.", ephemeral=True)
         state.set_squad(alt, squad_name)
         return await inter.response.send_message(f"✅ Alt {alt} assigned to squad **{squad_name}**.", ephemeral=True)
-
-    elif action == "unassign":
-        if not alt:
-            return await inter.response.send_message("❌ `alt` is required to remove an alt from its squad.", ephemeral=True)
-        if alt not in state.alt_ids:
-            return await inter.response.send_message("❌ Invalid alt specified.", ephemeral=True)
-        if not state.set_squad(alt, ""):
-            return await inter.response.send_message(f"❌ Alt {alt} could not be removed from its squad.", ephemeral=True)
-        return await inter.response.send_message(f"✅ Alt {alt} removed from its squad (now unassigned).", ephemeral=True)
 
     elif action == "view":
         target_sq = squad_name or "Unassigned"
@@ -3316,7 +3211,7 @@ async def cmd_squad(
             # receiving the same control event in the same millisecond while
             # keeping a squad operation responsive.
             if index:
-                await _squad_pause(control_plane=True)
+                await asyncio.sleep(random.uniform(0.25, 1.25))
             cmd = f"!{action}" if action in ("pause", "resume") else f"!{action} {value}"
             try:
                 ack = await _send_control_wait_ack(member.alt_id, cmd, timeout=10)
@@ -3342,7 +3237,7 @@ async def cmd_squad(
                 color=0xED4245 if ack_failed else 0x5865F2,
                 kind="SQUAD",
             )
-            return f"• {_alt_tag(member.alt_id)} **{member.name}**: {ack}"
+            return f"• **Alt {member.alt_id}** ({member.name}): {ack}"
 
         results = await asyncio.gather(
             *(dispatch_member(index, member) for index, member in enumerate(members)),
@@ -3354,7 +3249,7 @@ async def cmd_squad(
         return
 
 
-@bot.tree.command(name="status", description="Show fleet-wide dashboard summary or individual alt status card.")
+@bot.tree.command(name="status", description="Live Status — fleet-wide dashboard (all alts) or single-alt diagnostic card with health, channels, deals.")
 @app_commands.describe(alt="Target alt (or 0 for All alts)")
 async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
     if not await _check_perms(inter):
@@ -3366,7 +3261,7 @@ async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
         await inter.response.send_message(embed=build_single_alt_embed(state, alt or 1), ephemeral=True)
 
 
-@bot.tree.command(name="reply", description="Reply to Buyer: send a DM from an alt to an interested buyer directly.")
+@bot.tree.command(name="reply", description="DM Relay — send a message through an alt account directly to a buyer's DM.")
 @app_commands.describe(alt="Alt ID to send from", user="Buyer Discord User ID (from #dm-inbox)", text="Message text to send (leave blank for multiline editor)")
 async def cmd_reply(inter: discord.Interaction, alt: Optional[int] = 1, user: Optional[str] = "", text: Optional[str] = None):
     if not await _check_perms(inter):
@@ -3387,108 +3282,14 @@ async def cmd_reply(inter: discord.Interaction, alt: Optional[int] = 1, user: Op
     await inter.followup.send(f"📤 **Reply Queued** for Alt {aid} → Buyer `{clean_user}`:\n> {clean_text}\n*Transport ack:* `{control_ack}`", ephemeral=True)
 
 
-@bot.tree.command(name="analytics", description="View advanced fleet speed matrix, channel velocities, and cadence analytics.")
-@app_commands.describe(alt="Target specific alt (or 0 / blank for all alts)")
-async def cmd_analytics(inter: discord.Interaction, alt: Optional[int] = 0):
-    if not await _check_perms(inter):
-        return
-    await _fresh_state()
-    embed = build_analytics_embed(state, target_alt=alt or 0)
-    await inter.response.send_message(embed=embed, ephemeral=True)
+# V8: /analytics and /diagnose removed per V8_PLAN.md Phase 3.5
+# These commands are no longer available to customers or admins.
 
 
-@bot.tree.command(name="diagnose", description="Causal Event Explorer: deep root-cause diagnostic timeline and recommendations.")
-@app_commands.describe(alt="Alt number to diagnose (e.g. 1)")
-async def cmd_diagnose(inter: discord.Interaction, alt: Optional[int] = 1):
-    if not await _check_perms(inter):
-        return
-    target_aid = alt or 1
-    if target_aid not in state.alt_ids:
-        return await inter.response.send_message("❌ Invalid alt specified.", ephemeral=True)
-    await inter.response.defer(ephemeral=True)
-    await _fresh_state()
-    embed = build_diagnose_embed(state, target_aid)
-    await inter.followup.send(embed=embed, ephemeral=True)
+# V8: /canary, /topology, and /sync removed per V8_PLAN.md Phase 3.5.
 
 
-@bot.tree.command(name="canary", description="Synthetic in-band health probe testing GitHub, Gist, and webhook infrastructure.")
-@app_commands.describe(alt="Optional specific alt to probe")
-async def cmd_canary(inter: discord.Interaction, alt: Optional[int] = 0):
-    if not await _check_perms(inter):
-        return
-    await inter.response.defer(ephemeral=True)
-    t0 = time.perf_counter()
-
-    gh_ok = True
-    gh_latency = 0.0
-    gh_t0 = time.perf_counter()
-    try:
-        _ = await asyncio.to_thread(github_api.get_authenticated_user)
-        gh_latency = (time.perf_counter() - gh_t0) * 1000
-    except Exception:
-        gh_ok = False
-        gh_latency = (time.perf_counter() - gh_t0) * 1000
-
-    gist_ok = True
-    gist_latency = 0.0
-    g_t0 = time.perf_counter()
-    try:
-        _ = await asyncio.to_thread(github_api.fetch_gist, config.CONTROL_GIST_ID) if (hasattr(github_api, "fetch_gist") and config.CONTROL_GIST_ID) else None
-        gist_latency = (time.perf_counter() - g_t0) * 1000
-    except Exception:
-        gist_ok = False
-        gist_latency = (time.perf_counter() - g_t0) * 1000
-
-    total_latency = (time.perf_counter() - t0) * 1000
-
-    embed = discord.Embed(
-        title="🐤 SYNTHETIC IN-BAND CANARY PROBE REPORT",
-        color=0x57F287 if (gh_ok and gist_ok) else 0xFEE75C,
-        timestamp=datetime.now(timezone.utc),
-    )
-    gh_status = f"🟢 PASS ({gh_latency:.0f}ms)" if gh_ok else "🔴 FAIL"
-    gist_status = f"🟢 PASS ({gist_latency:.0f}ms)" if (gist_ok and config.CONTROL_GIST_ID) else ("⚪ N/A" if not config.CONTROL_GIST_ID else "🔴 FAIL")
-
-    embed.add_field(name="GitHub Core REST API", value=gh_status, inline=True)
-    embed.add_field(name="Control Gist Bridge", value=gist_status, inline=True)
-    embed.add_field(name="Total Probe Latency", value=f"`{total_latency:.0f}ms`", inline=True)
-
-    alt_ids = state.alt_ids
-    fleet_health = sum(state.get_health_index(aid) for aid in alt_ids) / max(1, len(alt_ids)) if alt_ids else 100
-    embed.add_field(name="Fleet Composite Health", value=f"**{fleet_health:.0f}%**", inline=True)
-    embed.add_field(name="Active Alts Online", value=f"{sum(1 for aid in alt_ids if state.is_online(aid))}/{len(alt_ids)}", inline=True)
-    embed.add_field(name="Canary Assessment", value="✅ All in-band synthetic control planes operational." if (gh_ok and gist_ok) else "⚠️ Degraded latency or control transport warning.", inline=False)
-
-    await inter.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="topology", description="View the live fleet topology and routing relationship graph.")
-async def cmd_topology(inter: discord.Interaction):
-    if not await _check_perms(inter):
-        return
-    await inter.response.defer(ephemeral=True)
-    await _fresh_state()
-    embed = build_topology_embed(state)
-    await inter.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="sync", description="Sync Fleet: push and reload shared settings/prices across all running alts.")
-async def cmd_sync(inter: discord.Interaction):
-    if not await _check_perms(inter):
-        return
-    await inter.response.defer(ephemeral=True)
-    results = []
-    for alt_id in state.alt_ids:
-        alt = state.get(alt_id)
-        ack = await _send_control_wait_ack(alt_id, "!sync", timeout=12)
-        results.append(f"**{alt.name}**: `{ack}`")
-        state.append_log(alt_id, f"sync: {ack}", emoji="🔄", color=0x5865F2, kind="CONTROL")
-    text = "🔄 **Sync sent to all configured alts**\n" + "\n".join(results)
-    await inter.followup.send(text, ephemeral=True)
-    await _log_control(text)
-
-
-@bot.tree.command(name="refresh", description="Refresh Status: instantly fetch latest GitHub Actions workflow status and update dashboard.")
+@bot.tree.command(name="refresh", description="Force Refresh — instantly poll latest GitHub workflow states and update the dashboard.")
 async def cmd_refresh(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
@@ -3498,7 +3299,7 @@ async def cmd_refresh(inter: discord.Interaction):
     await inter.followup.send("✅ GitHub heartbeat state and dashboard refreshed from current data.", ephemeral=True)
 
 
-@bot.tree.command(name="dashboard", description="Live Dashboard: post or update the real-time 3-embed status hub in #dashboard.")
+@bot.tree.command(name="dashboard", description="Dashboard — post a fresh live status snapshot (health, sent/errors, channels, deals) to #dashboard.")
 async def cmd_dashboard(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
@@ -3508,126 +3309,223 @@ async def cmd_dashboard(inter: discord.Interaction):
     await inter.followup.send(f"✅ Dashboard snapshot posted → {msg.jump_url if msg else '(failed)'}", ephemeral=True)
 
 
-@bot.tree.command(name="autorescan", description="Autorescan: fetch live Discord channels, reconcile the durable registry, and auto add/remove targets.")
-@app_commands.describe(
-    alt="Target alt ID, or 0 for every configured alt",
-    action="report (show drift only) or apply (persist the reconciled channel table)",
-)
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="🔍 Report - show added/removed/replaced without changing targets", value="report"),
-        app_commands.Choice(name="♻️ Apply - reconcile and persist the live channel table", value="apply"),
-    ]
-)
-async def cmd_autorescan(inter: discord.Interaction, alt: Optional[int] = 0,
-                         action: Optional[Literal["report", "apply"]] = "apply"):
-    """Zero-touch channel reconciliation against the durable registry.
-
-    The registry (`.adfarm_channel_registry.json`, mirrored to the channel-state
-    Gist) is the source of truth. Every scan fetches the live Discord
-    inventory, diffs it against the stored server/channel catalogue, and logs
-    exactly which channels appeared, disappeared, or were recreated with a new
-    ID. `apply` installs the reconciled target list everywhere so the customer
-    never has to repair channels by hand.
-    """
-    if not await _check_perms(inter):
-        return
-    if not state.alt_ids:
-        return await inter.response.send_message("❌ No configured alts are available to scan.", ephemeral=True)
-    targets = [alt] if (alt and alt in state.alt_ids) else list(state.alt_ids)
-    await inter.response.defer(ephemeral=True)
-    lines: list[str] = []
-    for alt_id in targets:
-        current_ids = list(state.get(alt_id).channels.keys()) if state.get(alt_id) else []
-        result = await _reconcile_control_channels(
-            alt_id,
-            reason="autorescan-report" if action == "report" else "autorescan",
-            configured_ids=current_ids or None,
-            persist=(action != "report"),
-        )
-        if not result.get("ok"):
-            lines.append(f"• {_alt_tag(alt_id)} ❌ {result.get('error', 'live channel inventory unavailable')}")
-            continue
-        added = ", ".join(result.get("added", [])) or "none"
-        removed = ", ".join(result.get("removed", [])) or "none"
-        changed = ", ".join(result.get("changed", [])) or "none"
-        replaced = ", ".join(
-            f"{item.get('old_id')}→{item.get('new_id')}" for item in result.get("replaced", [])
-        ) or "none"
-        lines.append(
-            f"• {_alt_tag(alt_id)} ✅ servers=`{len(result.get('servers', {}))}` "
-            f"catalogue=`{len(result.get('catalogue', {}))}` targets=`{len(result.get('targets', []))}`\n"
-            f"    added=[{added}] removed=[{removed}] changed=[{changed}] replaced=[{replaced}]"
-        )
-    embed = discord.Embed(
-        title="🔄 Autorescan — Durable Channel Reconciliation",
-        description="\n".join(lines)[:4000] or "No alts scanned.",
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_footer(
-        text=("Report only — no target table was changed."
-              if action == "report" else
-              "Applied — reconciled targets were persisted to the registry, the Gist, and CHANNEL_IDS.")
-    )
-    await inter.followup.send(embed=embed, ephemeral=True)
-
-
 _COMMAND_GUIDE = {
-    "run": ("`/run [squad:<name>]` (opens interactive guided launcher)", "Guided form to launch a run: choose the alt (or squad lead) and mode (`Sell` / `Buy`) ➔ paste your raw message or question — no item, price, or RAP field is required ➔ select cadence (`3m`/`5m`) and duration (`6h`, `12h`, `18h`, `24h`, `48h`, or `∞ Limitless`). The sender still applies its normal emoji/typo/timing modifiers to whatever text you supply. With `squad:<name>` the launch is dispatched to every squad member in sequence, spaced a few hundred milliseconds apart. Always shows a full preview and requires Confirm Launch before anything is dispatched."),
-    "getstarted": ("`/getstarted`", "Step-by-step beginner onboarding: add an alt, add/overwrite channels, run self-check, tune rates/copy, launch, monitor, and stop. Includes documentation links."),
-    "script": ("`/script action:<simulate|run> code:<python>`", "Resource-limited scripting suite. `simulate` returns unfiltered stdout/stderr as a dry-run debugger; `run` executes in the same sandbox without touching the control-bot process."),
-    "shutdown": ("`/shutdown confirmation:SHUTDOWN`", "Gracefully stops every alt, cancels each GitHub workflow, cancels the control-bot's own Actions run, and terminates the bot process. Requires the literal confirmation SHUTDOWN."),
-    "stop": ("`/stop alt:<alt>`", "Gracefully stops the alt: sends `!stop` through Gist/DM, syncs variation blocklist, and cancels active GitHub Actions workflow run."),
-    "pause": ("`/pause alt:<alt>`", "Temporarily pauses public ad delivery on all target channels without terminating the GitHub Actions runner."),
-    "resume": ("`/resume alt:<alt>`", "Resumes public ad delivery from pause state."),
-    "alt": ("`/alt [action:<overview|add|update|remove|logs|clearlogs|runs|selfcheck>] [alt:<alt>] [confirmation:DELETE] [delete_repository:<true|false>] [limit:1..50] [kind:ALL|ERROR|DEAL|CONTROL|CHANNEL|CAUTION|DEBUG] [search:text]`", "Unified Alt Lifecycle Hub: open interactive fleet management view or execute alt provisioning, updates, deletion, typed log streaming, clear logs, run history, and pre-flight self-check."),
-    "tune": ("`/tune [alt:<alt|0>] [policy:<stealth|aggressive|peak_hour|balanced>] [price:<rate>] [mode:<sell|buy>] [message:<text>] [interval:<3|5>] [runtime:<6|12|18|24|48>] [image:<file>]`", "Unified Fleet Tuning Hub: open interactive tuning console (select alts, presets, pricing modals, mode switches, cadence sliders) or directly apply parameters."),
-    "channels": ("`/channels [alt:<alt>] [action:<view|list|add|replace|remove|overwrite|refresh|rescan|reset_caution>] [channel_id:<id or id1,id2,...>] [new_channel_id:<numeric_id>] [name:<label>]`", "Unified Channel Manager Hub: open visual channel dashboard with 1-click add/replace/remove/overwrite/refresh/caution-reset buttons. `action:overwrite channel_id:111,222,333` completely REPLACES the channel list for an alt (never merges). `refresh`/`rescan` diffs live Discord inventory against the durable registry and logs every addition, removal, and replacement. See also `/autorescan`."),
-    "deals": ("`/deals [alt:<alt|0>] [enabled:<on|off>] [min_delta:<rate>] [keywords:<aliases>] [sample_listing:<text>]`", "Unified Marketplace Arbitrage Hub: view real-time scanner metrics, toggle passive deal detection, set profit thresholds, configure item keywords, or dry-run test parse ad messages."),
-    "squad": ("`/squad [action:<overview|list|view|create|assign|unassign|pause|resume|policy|price>] [squad_name:<name>] [alt:<alt>] [alts:<1,2,3,4|all>] [value:<value>]`", "Unified Fleet Squad Hub: group alts into named pools with `action:create squad_name:MyGroup alts:1,2,3,4`, list them, or execute batch pausing, resuming, pricing, and policy application. A squad policy change propagates to every member in one atomic sweep, and the whole squad launches from `/run squad:<name>`."),
-    "status": ("`/status [alt:<alt|0>]`", "Refreshes live state and displays unified fleet dashboard overview or detailed single-alt diagnostic card."),
-    "reply": ("`/reply alt:<alt> user:<buyer_id> text:<message>`", "Operator DM Relay: transmits your message through the selected alt account directly into the buyer's private DM."),
-    "analytics": ("`/analytics [alt:<alt|0>]`", "Visual Fleet Speed Matrix: renders per-channel velocities, delivery reliability bars, slowmode utilization, and inter-channel interval timelines."),
-    "diagnose": ("`/diagnose [alt:<alt>]`", "Causal Event Explorer: deep root-cause diagnostic timeline, transition triggers, health index, and actionable operator recommendations."),
-    "canary": ("`/canary [alt:<alt|0>]`", "Synthetic In-Band Probe: tests GitHub API, Gist bridge sync, and token latency in milliseconds."),
-    "topology": ("`/topology`", "Renders the live visual fleet topology graph: alts, squad pools, target Discord channels, yield grades, and egress routing."),
-    "sync": ("`/sync`", "Sends a fleet-wide broadcast telling all alts to immediately reload shared control Gists and variation blocklists."),
-    "refresh": ("`/refresh`", "Forces an immediate live poll of GitHub Actions workflow states and updates the persistent dashboard embed."),
-    "dashboard": ("`/dashboard`", "Posts a fresh 3-card dashboard snapshot in `#ad-dashboard` without running or scanning ads."),
-    "autorescan": ("`/autorescan [alt:<alt|0>] [action:<report|apply>]`", "Zero-touch channel reconciliation: fetches the live Discord inventory, diffs it against the durable server/channel registry, and logs exactly which channels were added, removed, changed, or replaced by a new ID. `report` shows the drift without changing anything; `apply` (default) persists the reconciled target table."),
-    "help": ("`/help`", "Displays this complete interactive reference manual with arguments, options, examples, and permissions."),
+    # ── V8 Customer Commands ──
+    "setup": (
+        "`/setup`",
+        "V8 Setup Wizard — enter your alt tokens and trading channel IDs. "
+        "Step 1 asks how many alts (1–4). Step 2 opens one modal per alt "
+        "(token + channels), each validated against Discord before the next. "
+        "Tokens are uploaded to GitHub secrets and cleared from memory. "
+        "A 3-min video walkthrough is linked in the modal."
+    ),
+    "run": (
+        "`/run`",
+        "Launch an ad run — interactive 3-step launcher: (1) choose alt, mode "
+        "(Sell/Buy), interval (3/5 min), runtime (6–48h or ∞ Limitless); "
+        "(2) enter ad text, optional rate, image toggle; (3) review preview "
+        "and click Confirm Launch. Dispatches `send_ads.yml` to GitHub "
+        "Actions. ∞ Limitless auto-renews every 48h while subscription is active."
+    ),
+    "stop": (
+        "`/stop alt:<id>`",
+        "Stop an ad run — sends `!stop` through the Gist control queue, "
+        "syncs the variation blocklist, and cancels the active GitHub "
+        "Actions workflow. Takes ~30–45s (documented SLA)."
+    ),
+    "pause": (
+        "`/pause alt:<id>`",
+        "Temporarily pause public ad delivery on all target channels "
+        "without terminating the GitHub Actions runner."
+    ),
+    "resume": (
+        "`/resume alt:<id>`",
+        "Resume public ad delivery from a paused state."
+    ),
+    "status": (
+        "`/status [alt:<id|0>]`",
+        "Show fleet-wide dashboard (alt:0 or omitted) or a single-alt "
+        "status card. Displays health index, workflow state, sent/error "
+        "counts, per-channel slowmode, deal scanner status, and uptime."
+    ),
+    "tune": (
+        "`/tune [alt:<id|0>] [policy:<preset>] [price:<rate>] [mode:<sell|buy>] "
+        "[message:<text>] [interval:<3|5>] [runtime:<6–48>] [image:<file>]`",
+        "Live fleet tuning — change price, ad copy, mode, interval, runtime, "
+        "or image on the fly. Policy presets: stealth (5m, max jitter), "
+        "aggressive (3m, high throughput), peak_hour (3m, dynamic cadence), "
+        "balanced (5m, standard). Opens interactive UI when called without args."
+    ),
+    "channels": (
+        "`/channels [alt:<id>] [action:<view|list|add|replace|remove|overwrite|"
+        "refresh|rescan|reset_caution>] [channel_id:<id>] [new_channel_id:<id>] "
+        "[name:<label>]`",
+        "Channel manager — add/replace/remove trading channels, overwrite "
+        "the full list, rescan permissions, or reset caution mode. "
+        "Opens visual manager UI when called without args."
+    ),
+    "deals": (
+        "`/deals [alt:<id|0>] [enabled:<on|off>] [min_delta:<rate>] "
+        "[keywords:<items>] [sample_listing:<text>]`",
+        "Marketplace arbitrage scanner — passively reads messages the bot "
+        "already fetches and alerts when someone sells below your price "
+        "(🟢 SUPPLIER ALERT) or buys above it (🔵 ARBITRAGE SALE). "
+        "Configure keywords, minimum profit edge, and test-parse listings."
+    ),
+    "squad": (
+        "`/squad [action:<overview|list|view|assign|pause|resume|policy|price>] "
+        "[squad_name:<name>] [alt:<id>] [value:<value>]`",
+        "Fleet squads — group alts into named teams for batch operations. "
+        "Batch pause/resume, batch price updates, batch policy presets. "
+        "Opens interactive squad hub when called without args."
+    ),
+    "alt": (
+        "`/alt [action:<overview|add|update|remove|logs|clearlogs|runs|selfcheck>] "
+        "[alt:<id>] [confirmation:DELETE] [limit:<1-50>] "
+        "[kind:<ALL|ERROR|DEAL|CONTROL|CHANNEL|CAUTION|DEBUG>] [search:<text>]`",
+        "Alt account lifecycle — add new alts (auto-provisions GitHub repo, "
+        "uploads workflows, sets secrets), update name/token/repo, remove "
+        "with confirmation, view typed logs, check workflow runs, or run "
+        "pre-flight self-check. Opens fleet management hub without args."
+    ),
+    "reply": (
+        "`/reply alt:<id> user:<buyer_id> text:<message>`",
+        "Operator DM relay — send a message through an alt account "
+        "directly into a buyer's DM. Opens a multiline editor modal "
+        "when `text` is omitted."
+    ),
+    "renew": (
+        "`/renew`",
+        "Open a renewal ticket — pre-filled with your customer ID and "
+        "days remaining. Posts to the #open-ticket channel for admin "
+        "payment verification and `/admin extend`."
+    ),
+    "pause-billing": (
+        "`/pause-billing`",
+        "Request a subscription pause — opens a ticket for admin review. "
+        "If approved, your subscription is extended by the paused days."
+    ),
+    "proofs": (
+        "`/proofs`",
+        "Opt-in proof sharing — post first-post screenshots or supplier "
+        "alert wins to the public #proofs channel with your customer "
+        "ID redacted."
+    ),
+    # ── Admin / Operator Commands ──
+    "admin": (
+        "`/admin <subcommand>`",
+        "Admin panel (OWNER_IDS only). Subcommands: "
+        "list (show all customers), activate (onboard customer with repos/forum/DB), "
+        "extend (add subscription days), deactivate (shut down and lock), "
+        "shutdown (emergency kill-switch, 2-admin multi-sig), repo-sync (push code to all repos), "
+        "expiry-alerts (dry-run reminders), pin-policy (pin ToS in #open-ticket), "
+        "activate-template (pre-filled activation), payment-address (share wallet, gated on policy ack), "
+        "verify-tokens (write-proof + expiry health), logs (link to #farm-logs)."
+    ),
+    # ── System Commands ──
+    "getstarted": (
+        "`/getstarted`",
+        "Quick-start guide — step-by-step checklist: add an alt, add "
+        "channels, self-check, tune rates, launch, monitor, stop. "
+        "Includes documentation links."
+    ),
+    "script": (
+        "`/script action:<simulate|run> code:<python>`",
+        "Sandboxed scripting — `simulate` dry-runs with unfiltered "
+        "stdout/stderr; `run` executes in a resource-limited sandbox. "
+        "Useful for debugging or quick calculations."
+    ),
+    "shutdown": (
+        "`/shutdown confirmation:SHUTDOWN`",
+        "Graceful shutdown — stops all alts, cancels workflows, "
+        "terminates the control bot. Requires typing `SHUTDOWN` to confirm."
+    ),
+    "refresh": (
+        "`/refresh`",
+        "Force-refresh — poll latest GitHub Actions workflow states "
+        "and update the persistent dashboard embed."
+    ),
+    "dashboard": (
+        "`/dashboard`",
+        "Post a fresh 3-card dashboard snapshot to #dashboard "
+        "without running or scanning ads."
+    ),
+    "help": (
+        "`/help`",
+        "This command reference — shows usage, arguments, and "
+        "descriptions for every registered command."
+    ),
 }
 
 
-@bot.tree.command(name="help", description="Bot Help Guide: view complete command manual, examples, shortcuts, and cheat sheet.")
+@bot.tree.command(name="help", description="V8 Command Reference — complete guide to all commands, arguments, and features.")
 async def cmd_help(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
     registered = {cmd.name: cmd for cmd in bot.tree.get_commands()}
-    embeds = []
-    for name in sorted(registered):
-        cmd_obj = registered[name]
-        usage, effect = _COMMAND_GUIDE.get(name, (f"`/{name}`", cmd_obj.description or "No description available."))
-        embed = discord.Embed(title=f"/{name}", color=0x5865F2)
-        embed.add_field(name="Usage & Arguments", value=usage, inline=False)
-        embed.add_field(name="What it does", value=effect, inline=False)
-        embeds.append(embed)
-    
-    # Send formatted pages
-    total_pages = (len(embeds) + 5) // 6
-    for page_num in range(total_pages):
-        page = discord.Embed(
-            title=f"📖 Bot Help & Command Guide · Page {page_num + 1}/{total_pages}",
-            description="Here is your complete guide to all available commands in the Ad Farm system:",
+
+    # Categorize commands for V8-aware help
+    V8_CUSTOMER = {"setup", "run", "stop", "pause", "resume", "status", "tune",
+                   "channels", "deals", "squad", "alt", "reply", "renew",
+                   "pause-billing", "proofs"}
+    V8_ADMIN = {"admin"}
+    V8_SYSTEM = {"getstarted", "script", "shutdown", "refresh", "dashboard", "help"}
+
+    categories = [
+        ("🚀 Getting Started", ["getstarted", "setup", "run", "help"]),
+        ("⚙️ Ad Farm Controls", ["stop", "pause", "resume", "status", "tune"]),
+        ("📌 Channels & Deals", ["channels", "deals", "squad", "reply"]),
+        ("👥 Alt Management", ["alt"]),
+        ("💳 Billing & Proofs", ["renew", "pause-billing", "proofs"]),
+        ("🔧 Admin Panel", ["admin"]),
+        ("🖥️ System", ["script", "shutdown", "refresh", "dashboard"]),
+    ]
+
+    pages = []
+    for cat_name, cmd_names in categories:
+        embed = discord.Embed(
+            title=f"{cat_name}",
             color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
         )
-        for item in embeds[page_num * 6:(page_num + 1) * 6]:
-            combined_desc = f"**Usage:** {item.fields[0].value}\n**Details:** {item.fields[1].value}"
-            page.add_field(name=f"✨ {item.title}", value=combined_desc, inline=False)
-        page.set_footer(text="💡 Tip: Most commands open an easy visual interactive form when run without extra arguments!")
-        if page_num == 0:
-            await inter.response.send_message(embed=page, ephemeral=True)
+        for name in cmd_names:
+            if name not in registered:
+                continue
+            cmd_obj = registered[name]
+            usage, effect = _COMMAND_GUIDE.get(
+                name, (f"`/{name}`", cmd_obj.description or "No description available.")
+            )
+            # Truncate to fit embed field limits
+            effect_short = effect[:300] + ("…" if len(effect) > 300 else "")
+            embed.add_field(name=f"`/{name}`", value=effect_short, inline=False)
+        if embed.fields:
+            pages.append(embed)
+
+    # Build paginated output
+    total = len(pages)
+    for i, page in enumerate(pages):
+        page.set_footer(
+            text=f"📖 Page {i + 1}/{total} · 💡 Most commands open a visual UI when run without args!"
+        )
+        if i == 0:
+            # First page gets an intro embed
+            intro = discord.Embed(
+                title="📖 AdFarm V8 — Complete Command Reference",
+                description=(
+                    "**AdFarm V8** is a managed 24/7 ad farm for Roblox trading-game "
+                    "Discord servers. You bring the alt accounts and channel IDs; we "
+                    "handle the runners, anti-detection, deal scanning, and safety.\n\n"
+                    "**How it works:** `/setup` → `/run` → farm posts 24/7 → "
+                    "auto-renews every 48h while your subscription is active.\n\n"
+                    "**Need help?** Run `/getstarted` for a step-by-step guide, "
+                    "or contact an admin in `#open-ticket`."
+                ),
+                color=0x5865F2,
+                timestamp=datetime.now(timezone.utc),
+            )
+            intro.set_footer(text=f"📖 Page 0/{total} · AdFarm V8 · 2026-09-03")
+            await inter.response.send_message(embed=intro, ephemeral=True)
+            await inter.followup.send(embed=page, ephemeral=True)
         else:
             await inter.followup.send(embed=page, ephemeral=True)
 
@@ -3692,8 +3590,8 @@ for command_name, command in (
     ("stop", cmd_stop), ("pause", cmd_pause), ("resume", cmd_resume),
     ("alt", cmd_alt), ("tune", cmd_tune), ("channels", cmd_channels),
     ("deals", cmd_deals), ("squad", cmd_squad), ("status", cmd_status),
-    ("reply", cmd_reply), ("analytics", cmd_analytics), ("diagnose", cmd_diagnose),
-    ("canary", cmd_canary),
+    ("reply", cmd_reply),
+    # V8: analytics, diagnose, canary removed
 ):
     try:
         command.autocomplete("alt")(make_alt_autocompleter(command_name))
@@ -3711,6 +3609,374 @@ for param_name in ("channel_id", "new_channel_id"):
     except Exception:
         pass
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# V8 Customer-Facing Slash Commands
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _validate_discord_token_sync(token: str) -> tuple[bool, str]:
+    """Validate an alt token against Discord /users/@me (blocking; run in thread)."""
+    import urllib.error
+    import urllib.request
+    import json as _json
+    try:
+        req = urllib.request.Request(
+            "https://discord.com/api/v10/users/@me",
+            headers={"Authorization": token.strip()},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            _data = _json.loads(r.read())
+            username = f"{_data.get('username', '?')}#{_data.get('discriminator', '0')}"
+        return True, username
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, f"invalid token (HTTP {exc.code})"
+        return False, f"validation blocked (HTTP {exc.code})"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _valid_channel_ids(raw: str) -> tuple[bool, list[str]]:
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    clean = list(dict.fromkeys(parts))
+    if not clean:
+        return False, []
+    if len(clean) > 20:
+        return False, []
+    if not all(p.isdigit() and 10 <= len(p) <= 20 for p in clean):
+        return False, []
+    return True, clean
+
+
+class _VideoButton(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+        self.add_item(discord.ui.Button(
+            label=policy_mod.VIDEO_BUTTON_LABEL,
+            style=discord.ButtonStyle.link,
+            url=policy_mod.SETUP_VIDEO_URL,
+        ))
+
+
+class SetupCountModal(discord.ui.Modal, title="Setup — Step 1 of 2"):
+    """Step 1: how many alts to configure (clamped to the paid alt_count)."""
+    count = discord.ui.TextInput(
+        label="How many alts do you want to set up? (1-4)",
+        placeholder="e.g. 2",
+        max_length=2,
+        required=True,
+    )
+
+    def __init__(self, max_count: int, owner_id: int):
+        super().__init__()
+        self._max_count = max_count
+        self._owner_id = owner_id
+
+    async def on_submit(self, inter: discord.Interaction) -> None:
+        raw = self.count.value.strip()
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = 0
+        if not (1 <= n <= min(4, self._max_count)):
+            await inter.response.send_message(
+                f"❌ Enter a number between **1 and {min(4, self._max_count)}** "
+                f"(your plan includes {self._max_count} alt(s)).",
+                ephemeral=True,
+            )
+            return
+        await inter.response.send_message(
+            f"✅ **{n} alt(s)** selected. Fill in each alt's token + channels below.",
+            ephemeral=True,
+        )
+        session = SetupSession(owner_id=self._owner_id, total=n)
+        await _offer_alt_modal(inter, session, alt_num=1)
+
+
+class SetupAltModal(discord.ui.Modal, title="Alt Setup — Credentials"):
+    """One modal per alt; validates token + channels before moving on (0.5)."""
+    token = discord.ui.TextInput(
+        label="Alt Token",
+        placeholder="Discord user token for this alt",
+        style=discord.TextStyle.short,
+        max_length=100,
+    )
+    channels = discord.ui.TextInput(
+        label="Channel IDs (comma-separated)",
+        placeholder="123456789012345678,987654321012345678",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+
+    def __init__(self, alt_num: int, total: int, session: "SetupSession"):
+        super().__init__(title=f"Alt {alt_num} of {total} — Setup")
+        self._alt_num = alt_num
+        self._total = total
+        self._session = session
+
+    async def on_submit(self, inter: discord.Interaction) -> None:
+        tok = self.token.value.strip()
+        ok_chs, ch_ids = _valid_channel_ids(self.channels.value)
+        valid_tok, username = await asyncio.to_thread(_validate_discord_token_sync, tok)
+        if not ok_chs or not valid_tok:
+            problems = []
+            if not valid_tok:
+                problems.append(f"token invalid ({username})")
+            if not ok_chs:
+                problems.append("channel IDs must be comma-separated numeric snowflakes (1-20)")
+            await inter.response.send_message(
+                f"❌ **Alt {self._alt_num} rejected** — {', '.join(problems)}.\n"
+                "Fix the values and click the retry button below.",
+                ephemeral=True,
+            )
+            view = _NextAltButton(self._alt_num, self._total, self._session)
+            await inter.followup.send("👉 Retry this alt:", view=view, ephemeral=True)
+            return
+
+        self._session.results.append({
+            "alt": self._alt_num,
+            "token": tok,
+            "channels": ch_ids,
+            "username": username,
+            "valid": True,
+        })
+        await inter.response.send_message(
+            f"✅ **Alt {self._alt_num}** accepted — `{username}` — "
+            f"{len(ch_ids)} channel(s) queued.",
+            ephemeral=True,
+        )
+        if self._alt_num < self._total:
+            await _offer_alt_modal(inter, self._session, alt_num=self._alt_num + 1)
+        else:
+            asyncio.create_task(_finalize_setup(inter, self._session))
+
+
+class SetupSession:
+    """Shared state/order for one wizard run."""
+    def __init__(self, owner_id: int, total: int):
+        self.owner_id = owner_id
+        self.total = total
+        self.results: list[dict] = []
+
+
+class _NextAltButton(discord.ui.View):
+    """One button per pending alt: opens the modal, then chains to the next."""
+
+    def __init__(self, alt_num: int, total: int, session: SetupSession):
+        super().__init__(timeout=300)
+        self._alt_num = alt_num
+        self._total = total
+        self._session = session
+
+    @discord.ui.button(label="🧙 Configure alt now", style=discord.ButtonStyle.success)
+    async def _open(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if str(inter.user.id) != str(self._session.owner_id):
+            await inter.response.send_message("❌ Not your setup session.", ephemeral=True)
+            return
+        await inter.response.send_modal(
+            SetupAltModal(self._alt_num, self._total, self._session)
+        )
+
+
+async def _offer_alt_modal(inter: discord.Interaction, session: SetupSession, alt_num: int) -> None:
+    """Offer the next alt modal via a button (Discord opens one modal per interaction)."""
+    view = _NextAltButton(alt_num, session.total, session)
+    hub = _VideoButton()
+    try:
+        await inter.followup.send(
+            f"👉 **Alt {alt_num} of {session.total}** — click the button to enter "
+            "its token and channels.",
+            view=view, ephemeral=True,
+        )
+        await inter.followup.send(
+            "🎥 Stuck? " + "Watch the 3-minute walkthrough below.",
+            view=hub, ephemeral=True,
+        )
+    except Exception:
+        pass
+
+
+async def _finalize_setup(inter: discord.Interaction, session: SetupSession) -> None:
+    """Upload secrets + credentials, clear token memory, mark complete."""
+    uid = str(session.owner_id)
+    customer = _cm.get_customer(uid) if _V8_LOADED else None
+    results = session.results
+
+    if _V8_LOADED and customer and results:
+        owner = customer.get("github_account", "")
+        repos = customer.get("repos", [])
+        if owner and repos:
+            try:
+                from github_dispatch import set_repo_secret
+                for entry in results:
+                    idx = entry.get("alt", 1)
+                    if idx <= len(repos) and entry.get("valid"):
+                        repo = repos[idx - 1]
+                        await asyncio.to_thread(
+                            set_repo_secret, owner, repo, "USER_TOKEN", entry["token"]
+                        )
+                        ch_str = ",".join(entry.get("channels", []))
+                        await asyncio.to_thread(
+                            set_repo_secret, owner, repo, "CHANNEL_IDS", ch_str
+                        )
+                        _cm.store_alt_credential(
+                            uid, idx, entry["token"], entry.get("channels", []),
+                            username=entry.get("username", ""),
+                        )
+            except Exception as exc:
+                try:
+                    await inter.followup.send(
+                        f"⚠️ GitHub secret upload failed: {exc}", ephemeral=True
+                    )
+                except Exception:
+                    pass
+    # 0.8: memory-clear hygiene — tokens must not linger in heap after upload.
+    try:
+        results.clear()
+    except Exception:
+        pass
+    cm_events = getattr(_cm, "record_event", None)
+    if cm_events:
+        cm_events(uid, "setup_completed", {"alts": session.total})
+    try:
+        await inter.followup.send(
+            "✅ **Setup complete!** Run `/run` in your `#control` thread to start "
+            "your ad farm.",
+            ephemeral=True,
+        )
+    except Exception:
+        pass
+
+
+@bot.tree.command(
+    name="setup",
+    description="V8 Setup Wizard: enter your alt tokens and channels to get started.",
+)
+async def cmd_setup(inter: discord.Interaction) -> None:
+    """Customer-only /setup wizard (hybrid modal flow, TODO 0.5).
+
+    Step 1: "How many alts? (1-4)" modal.
+    Step 2: one modal per alt (token + channels), each validated before the
+            next one is offered.
+    """
+    if _V8_LOADED:
+        from security import check_active
+        if not await check_active(inter):
+            return
+    else:
+        if not await _check_perms(inter):
+            return
+
+    uid = str(inter.user.id)
+    if _V8_LOADED:
+        customer = _cm.get_customer(uid)
+        if not customer:
+            await inter.response.send_message(
+                "❌ No customer record found. Contact an admin to activate your account.",
+                ephemeral=True,
+            )
+            return
+        # 0.6: re-setup owner-ID assertion (only the forum owner may configure).
+        try:
+            from discord_forum import assert_forum_owner
+            if not await assert_forum_owner(inter, customer):
+                return
+        except Exception as exc:
+            print(f"[SETUP] owner assertion skipped: {exc}")
+        alt_count = int(customer.get("alt_count", 1) or 1)
+    else:
+        alt_count = 1
+        customer = {}
+
+    await inter.response.send_modal(SetupCountModal(max_count=max(1, alt_count), owner_id=inter.user.id))
+
+
+# TODO 2.7 — /renew: open a pre-filled ticket
+@bot.tree.command(name="renew", description="Open a renewal ticket (pre-filled with your customer ID).")
+async def cmd_renew(inter: discord.Interaction) -> None:
+    if _V8_LOADED:
+        from security import check_active
+        if not await check_active(inter):
+            return
+    else:
+        if not await _check_perms(inter):
+            return
+    uid = str(inter.user.id)
+    c = _cm.get_customer(uid) if _V8_LOADED else None
+    days = ""
+    if c:
+        from customer_manager import days_remaining
+        left = days_remaining(uid)
+        days = f"\nDays remaining: **{left:.1f}**" if left is not None else ""
+    ticket_ch = _os.environ.get("OPEN_TICKET_CH_ID", "") or _os.environ.get("TICKET_CH_ID", "")
+    try:
+        if ticket_ch:
+            ch = bot.get_channel(int(ticket_ch)) or await bot.fetch_channel(int(ticket_ch))
+            await ch.send(
+                f"🔄 **Renewal request** — customer `{uid}` (`{inter.user.display_name}`){days}\n"
+                f"Admin: verify payment and run `/admin extend user:@{inter.user.display_name} days:30`.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        await inter.response.send_message(
+            "✅ Your renewal ticket was opened. An admin will confirm shortly "
+            "(best-effort — no SLA).", ephemeral=True,
+        )
+    except Exception as exc:
+        await inter.response.send_message(
+            f"⚠️ Could not open ticket channel ({exc}). Contact an admin directly.",
+            ephemeral=True,
+        )
+
+
+# TODO 3.4 — /pause-billing: pause + extend by requested days (admin approval)
+@bot.tree.command(name="pause-billing", description="Pause billing and extend your subscription (manual admin approval).")
+async def cmd_pause_billing(inter: discord.Interaction) -> None:
+    if _V8_LOADED:
+        from security import check_active
+        if not await check_active(inter):
+            return
+    else:
+        if not await _check_perms(inter):
+            return
+    ticket_ch = _os.environ.get("OPEN_TICKET_CH_ID", "") or _os.environ.get("TICKET_CH_ID", "")
+    uid = str(inter.user.id)
+    if ticket_ch:
+        try:
+            ch = bot.get_channel(int(ticket_ch)) or await bot.fetch_channel(int(ticket_ch))
+            await ch.send(
+                f"⏸️ **Pause-billing request** — customer `{uid}` (`{inter.user.display_name}`). "
+                "Expected admin action: extend subscription by the paused days.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
+    await inter.response.send_message(
+        "✅ Pause-billing ticket opened. An admin will extend your subscription "
+        "by the paused days after confirmation.", ephemeral=True,
+    )
+
+
+# TODO 3.3 — /proofs: opt-in anonymous proof sharing
+@bot.tree.command(name="proofs", description="Opt in to post redacted farm proof to the public channel.")
+async def cmd_proofs(inter: discord.Interaction) -> None:
+    if _V8_LOADED:
+        from security import check_active
+        if not await check_active(inter):
+            return
+    else:
+        if not await _check_perms(inter):
+            return
+    from control_bot import proofs
+    await inter.response.send_message(
+        "🏆 **Proofs are opt-in.** Only first-post screenshots and supplier "
+        "alert wins are shared; your customer ID is **redacted** (e.g. `1234…`).",
+        view=proofs.ProofsView(), ephemeral=True,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# End V8 Customer Commands
+# ──────────────────────────────────────────────────────────────────────────────
 
 # ----- DM relay (control bot <-> alts) -----
 _DM_ACKS: dict[int, asyncio.Future] = {}  # alt_id -> future
@@ -3776,19 +4042,11 @@ async def _send_control_wait_ack(alt_id: int, text: str, timeout: float = 15.0) 
     fallback only when no control Gist is configured.
     """
     if config.CONTROL_GIST_ID:
-        try:
-            ok, detail = await asyncio.to_thread(github_api.queue_control_command, alt_id, text)
-        except Exception as exc:
-            # A control-plane failure must be reported to the operator, never
-            # raised into a dashboard button callback that nobody is awaiting.
-            return f"❌ Control Gist queue error: {type(exc).__name__}: {exc}"
+        ok, detail = await asyncio.to_thread(github_api.queue_control_command, alt_id, text)
         if ok:
             return f"🕒 queued via control Gist (command `{detail}`); polling every 45s"
         return f"❌ Control Gist queue failed: {detail}"
-    try:
-        return await _send_dm_wait_ack(alt_id, text, timeout=timeout)
-    except Exception as exc:
-        return f"❌ DM fallback failed: {type(exc).__name__}: {exc}"
+    return await _send_dm_wait_ack(alt_id, text, timeout=timeout)
 
 
 @bot.event
@@ -3805,6 +4063,56 @@ async def on_message(message: discord.Message):
     # ---- Handle webhook messages in guild log/dashboard channels ----
     if message.guild and message.guild.id == (config.GUILD_ID or message.guild.id):
         await _handle_guild_webhook_message(message)
+
+    # ---- V8 hooks: payments auto-ack, ban watch, TTFTV ----
+    if _V8_LOADED:
+        try:
+            await _v8_message_hooks(message)
+        except Exception as exc:
+            print(f"[V8-HOOK] error: {exc}")
+
+
+async def _v8_message_hooks(message: discord.Message) -> None:
+    """Payments (1.1), ban alerts (1.2), TTFTV (1.5) message-level hooks."""
+    if not message.guild or message.author.bot:
+        return
+    ch_id = str(message.channel.id)
+    customers = _cm.list_customers(active_only=False)
+
+    # Map the channel to a customer (logs / control / ticket threads).
+    matched = None
+    is_logs = False
+    for c in customers:
+        ids = {str(c.get("logs_thread_id", "")): "logs",
+               str(c.get("control_thread_id", "")): "control",
+               str(c.get("dashboard_thread_id", "")): "dashboard",
+               str(c.get("deals_thread_id", "")): "deals",
+               str(c.get("forum_id", "")): "forum"}
+        if ch_id in ids:
+            matched = c
+            is_logs = ids[ch_id] == "logs"
+            break
+
+    # Ban detection in farm-logs / any customer channel (1.2)
+    if matched is not None:
+        from control_bot import ban_watch
+        if is_logs or ban_watch.detect_ban_events(message.content or ""):
+            await ban_watch.handle_ban_message(bot, message, matched)
+            return
+
+    # TTFTV: first successful post observed in a customer logs thread (1.5)
+    if matched is not None and is_logs:
+        from control_bot import metrics
+        if re.search(r"(posted|sent=|✅.*(posted|sent)|total_sent|first post)", message.content or "", re.I):
+            metrics.note_first_successful_post(matched["discord_id"])
+
+    # Payment TX auto-ack in the ticket area (1.1)
+    ticket_ch = _os.environ.get("OPEN_TICKET_CH_ID", "") or _os.environ.get("TICKET_CH_ID", "")
+    is_ticket = (ch_id == str(ticket_ch)) if ticket_ch else str(message.channel.name).lower() in ("open-ticket", "tickets")
+    if is_ticket:
+        from control_bot import payments
+        if _cm.get_customer(str(message.author.id)):
+            await payments.maybe_auto_ack(message.channel, str(message.author.id), message.content or "")
 
 
 @bot.event
@@ -4339,6 +4647,7 @@ async def fleet_health_check():
         if not a:
             continue
         is_stale = (a.last_heartbeat_ts <= 0) or (now - max(a.last_heartbeat_ts, a.last_post_ts) > config.OFFLINE_AFTER_SEC)
+        workflow_active = a.workflow_status in {"queued", "in_progress"} or a.workflow_conclusion in {"", "pending"}
         if not is_stale:
             continue
         if not hydrated:
@@ -4367,15 +4676,9 @@ async def fleet_health_check():
             pass
 
 
-async def _log_control(text: str, alt_id: int | None = None):
-    """Write one control-plane line to #control (stdout fallback when unset).
-
-    ``alt_id`` prepends the canonical ``[ALT-n]`` tag so four concurrent alts
-    remain individually attributable inside one shared channel (PMTP 2.7).
-    """
+async def _log_control(text: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    tag = f"{_alt_tag(alt_id)} " if alt_id else ""
-    full = f"[{ts}] [CONTROL] {tag}{text}"
+    full = f"[{ts}] [CONTROL] {text}"
     if not config.CONTROL_CH_ID:
         return
     ch = bot.get_channel(config.CONTROL_CH_ID)
@@ -4389,12 +4692,22 @@ async def _log_control(text: str, alt_id: int | None = None):
 
 
 def run():
+    """V8: Control bot runs continuously — no session timer, no total_hours limit.
+    The GitHub Actions watchdog in control_bot.yml restarts on crash automatically.
+    """
     if not config.BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN env var is not set.")
     if not config.GITHUB_TOKEN:
         print("⚠️  GH_TOKEN not set — /run and /stop will not work.")
     if not config.GITHUB_OWNER or not config.ALT_REPOS:
         print("⚠️  GITHUB_OWNER / ALT_REPOS not set — /run will fail.")
+    print(f"[V8] Control bot starting — continuous runtime mode (no session limit).")
     print(f"Alt mapping: {config.ALT_REPOS}")
     print(f"Discord IDs: {config.ALT_DISCORD_IDS}")
+    # V8: initialise the SQLite DB before the gateway connects
+    if _V8_LOADED:
+        try:
+            _cm.init_db()
+        except Exception as _e:
+            print(f"[V8] DB pre-init warning: {_e}")
     bot.run(config.BOT_TOKEN)

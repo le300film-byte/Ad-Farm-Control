@@ -104,13 +104,29 @@ try:
 except Exception:
     ChannelRegistryStore = None
 
+# R-17 (TODO 0.8): curl_cffi is mandatory for the browser-grade TLS/HTTP2
+# fingerprint. Fail LOUDLY at import with actionable guidance instead of a
+# confusing "Session got unexpected keyword 'impersonate'" crash later.
+# ALLOW_REQUESTS_FALLBACK=1 exists only for offline tests / emergency fallback.
 try:
     from curl_cffi import requests as creq
     import curl_cffi
     _HAS_CURL_CFFI = True
-except Exception:
-    import requests as creq
+except Exception as _curl_import_err:
     _HAS_CURL_CFFI = False
+    if os.environ.get("ALLOW_REQUESTS_FALLBACK", "").strip() in {"1", "true", "yes", "on"}:
+        import requests as creq
+        print(
+            "[WARN] curl_cffi unavailable — using requests fallback "
+            "(browser fingerprint protection is DISABLED; do not run this in production)."
+        )
+    else:
+        raise RuntimeError(
+            "❌ curl_cffi is REQUIRED for the AdFarm sender — it provides the "
+            "browser-grade TLS/JA3/HTTP2 fingerprint that keeps the alt safe. "
+            f"Import failed: {type(_curl_import_err).__name__}: {_curl_import_err}\n"
+            "Install with:  pip install 'curl_cffi>=0.6.0'"
+        )
 
 try:
     from PIL import Image, PngImagePlugin, ImageEnhance
@@ -339,6 +355,33 @@ DEFAULT_ITEM_KEYWORDS = _parse_deal_keywords(
     _env("DEFAULT_ITEM_KEYWORDS", "item,stock,goods,assets")
 )
 
+# Built-in game alias table for the DM intent classifier. Canonical emoji-label
+# per alias; operator-configured keywords remain a lower-priority fallback.
+_GAME_ALIASES = {
+    "blade ball": "⚔️ Blade Ball",
+    "bladeball": "⚔️ Blade Ball",
+    "bb": "⚔️ Blade Ball",
+    "mm2": "🔪 MM2",
+    "murder mystery 2": "🔪 MM2",
+    "murder mystery": "🔪 MM2",
+    "ps99": "🐾 Pet Sim 99",
+    "pet sim 99": "🐾 Pet Sim 99",
+    "pet simulator 99": "🐾 Pet Sim 99",
+    "grow a garden": "🌱 Grow a Garden",
+    "gag": "🌱 Grow a Garden",
+    "adopt me": "🐶 Adopt Me",
+    "adoptme": "🐶 Adopt Me",
+    "jailbreak": "🚔 Jailbreak",
+    "royale high": "👑 Royale High",
+    "royalehigh": "👑 Royale High",
+    "blox fruits": "🍉 Blox Fruits",
+    "bloxfruits": "🍉 Blox Fruits",
+    "pet sim": "🐾 Pet Sim 99",
+    "fisch": "🎣 Fisch",
+    "grand piece": "🏴‍☠️ Grand Piece Online",
+    "gpo": "🏴‍☠️ Grand Piece Online",
+}
+
 DEAL_ITEM_KEYWORDS = _parse_deal_keywords(
     _env("DEAL_ITEM_KEYWORDS", "item,stock,goods,assets")
 )
@@ -380,11 +423,6 @@ if CONFIRM_TIMEOUT > 300: CONFIRM_TIMEOUT = 300
 CONTROLLER_USER_IDS = set(x.strip() for x in _env("CONTROLLER_USER_IDS", "").split(",") if x.strip())
 ALT_ID              = _int("ALT_ID", 0)        # 1..N; shown on dashboard
 ALT_NAME            = _env("ALT_NAME", f"Alt{ALT_ID if ALT_ID else '?'}")
-# Single-alt installations (SETUP_GUIDE.md) frequently run without ALT_ID. The
-# control plane still addresses them as alt 1 (`control_1.json`,
-# `channel_state_1.json`), so derive a stable routing ID instead of silently
-# disabling the Gist control channel and the durable channel registry.
-REGISTRY_ALT_ID     = ALT_ID if ALT_ID >= 1 else 1
 HEARTBEAT_INTERVAL_SEC = _int("HEARTBEAT_INTERVAL_SEC", 300)
 CONTROL_GIST_ID     = _env("CONTROL_GIST_ID", "")  # optional: shared gist for runtime overrides
 SYNC_GIST_INTERVAL_SEC = _int("SYNC_GIST_INTERVAL_SEC", 45)
@@ -392,7 +430,7 @@ SYNC_GIST_INTERVAL_SEC = _int("SYNC_GIST_INTERVAL_SEC", 45)
 # volume; the atomic store still makes it safe on ordinary local disk.
 CHANNEL_STATE_FILE   = _env("CHANNEL_STATE_FILE", ".adfarm_channel_registry.json")
 CHANNEL_STATE_GIST_ID = _env("CHANNEL_STATE_GIST_ID") or CONTROL_GIST_ID
-CHANNEL_STATE_GIST_FILE = f"channel_state_{REGISTRY_ALT_ID}.json"
+CHANNEL_STATE_GIST_FILE = f"channel_state_{ALT_ID}.json" if ALT_ID else ""
 CONTROL_CMD_PREFIX  = _env("CONTROL_CMD_PREFIX", "!")
 if HEARTBEAT_INTERVAL_SEC < 60: HEARTBEAT_INTERVAL_SEC = 60
 if SYNC_GIST_INTERVAL_SEC < 15: SYNC_GIST_INTERVAL_SEC = 15
@@ -644,7 +682,9 @@ def _scrape_build_number_and_ua(session):
 # --------------------------------------------------------------------------- #
 def _build_session():
     proxy_map = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
-    return creq.Session(impersonate=_BROWSER, proxies=proxy_map)
+    if _HAS_CURL_CFFI:
+        return creq.Session(impersonate=_BROWSER, proxies=proxy_map)
+    return creq.Session(proxies=proxy_map)
 
 SESSION = _build_session()
 
@@ -1208,9 +1248,7 @@ def _dashboard_cycle_embed(cycle, elapsed_min, sent, img_attach, txt_only, edits
     lines = []
     for cid in CHANNEL_IDS:
         name = ch_names_dict.get(cid, cid)
-        s = per_ch.get(cid) if isinstance(per_ch, dict) else None
-        if not isinstance(s, dict):
-            s = {}
+        s = per_ch[cid]
         alive = "✅" if cid in active_channels_set else "⛔"
         last_ts = last_sent_dict.get(cid)
         if last_ts:
@@ -1219,8 +1257,8 @@ def _dashboard_cycle_embed(cycle, elapsed_min, sent, img_attach, txt_only, edits
             last_str = "—"
         lines.append(
             f"{alive} **#{name}** `{cid}`\n"
-            f"   ↳ sent:{s.get('sent', 0)} (💬{s.get('txt', 0)}/📷{s.get('img', 0)}/✏️{s.get('edits', 0)})  "
-            f"err:{s.get('errors', 0)}  last:{last_str}"
+            f"   ↳ sent:{s['sent']} (💬{s['txt']}/📷{s['img']}/✏️{s['edits']})  "
+            f"err:{s['errors']}  last:{last_str}"
         )
     ch_breakdown = "\n".join(lines) if lines else "—"
     afk_str = f"☕ AFK — {afk_left/60:.1f}m remaining" if in_afk_flag else "active"
@@ -1284,7 +1322,7 @@ def _send_completion_summary_webhook(reason, start_ts, sent, err, skip, distract
     for cid in CHANNEL_IDS[:8]:
         s = per_ch.get(cid, {"sent": 0, "errors": 0, "skipped": 0, "txt": 0, "img": 0, "edits": 0})
         name = ch_names.get(cid, cid) if ch_names else cid
-        ch_lines.append(f"• `#{name}`: **{s.get('sent', 0)}** sent (💬{s.get('txt', 0)}/📷{s.get('img', 0)}/✏️{s.get('edits', 0)}) · ❌{s.get('errors', 0)} err")
+        ch_lines.append(f"• `#{name}`: **{s['sent']}** sent (💬{s['txt']}/📷{s['img']}/✏️{s['edits']}) · ❌{s['errors']} err")
     if ch_lines:
         fields.append({
             "name": f"📂 Channel Breakdown ({len(CHANNEL_IDS)} targets)",
@@ -1834,9 +1872,6 @@ def channel_caution_multiplier(cid):
 # --------------------------------------------------------------------------- #
 _guilds_cache_fetched = False
 _guilds_list_cache = []
-# Re-entrant: the cache is refreshed from the controller thread while the main
-# loop and the discovery path read it. Readers always receive a snapshot copy.
-_guilds_cache_lock = threading.RLock()
 
 def _resolve_channel_keywords():
     """Resolve keyword-only channel targets using the authenticated account.
@@ -1853,17 +1888,13 @@ def _resolve_channel_keywords():
     if not keywords:
         if not numeric:
             log("❌ CONFIG ERROR: provide CHANNEL_IDS or CHANNEL_NAMES/CHANNEL_KEYWORDS.")
-        with _state_lock:
-            CHANNEL_IDS = numeric
-            numeric_count = len(CHANNEL_IDS)
-        return bool(numeric_count)
+        CHANNEL_IDS = numeric
+        return bool(CHANNEL_IDS)
     gids = _fetch_my_guilds_fallback()
     if not gids:
         log("❌ CHANNEL RESOLUTION FAILED: no accessible guild context for keyword targets.")
-        with _state_lock:
-            CHANNEL_IDS = numeric
-            numeric_count = len(CHANNEL_IDS)
-        return bool(numeric_count)
+        CHANNEL_IDS = numeric
+        return bool(CHANNEL_IDS)
     resolved = list(numeric)
     for keyword in keywords:
         target = keyword.strip().lower().replace(" ", "-")
@@ -1896,12 +1927,8 @@ def _resolve_channel_keywords():
             _guild_id_cache[cid] = str(gid)
             _channel_id_to_guild[cid] = str(gid)
         log(f"✅ CHANNEL KEYWORD `{keyword}` resolved → #{item.get('name') or keyword} ({cid})")
-    # The scheduler iterates CHANNEL_IDS on every cycle, so the rebinding is
-    # done under the same lock the controller handlers use.
-    with _state_lock:
-        CHANNEL_IDS = resolved
-        resolved_count = len(CHANNEL_IDS)
-    if resolved_count:
+    CHANNEL_IDS = resolved
+    if CHANNEL_IDS:
         return True
     log("❌ CHANNEL RESOLUTION FAILED: no unambiguous channel targets were found.")
     return False
@@ -1910,20 +1937,19 @@ def _fetch_my_guilds_fallback():
     """Last-resort: fetch /users/@me/guilds once to find a guild ID.
     Only called when discovery has no guild context from other channels."""
     global _guilds_cache_fetched, _guilds_list_cache
-    with _guilds_cache_lock:
-        if _guilds_cache_fetched:
-            return list(_guilds_list_cache)
-        _guilds_cache_fetched = True
-        try:
-            r = api("GET", "https://discord.com/api/v9/users/@me/guilds", retries=2)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list):
-                    _guilds_list_cache = [g.get("id") for g in data if isinstance(g, dict) and g.get("id")]
-                    dbg(f"[DISC] /@me/guilds fallback returned {len(_guilds_list_cache)} guild(s)")
-        except Exception as e:
-            dbg(f"[DISC] /@me/guilds fallback failed: {e}")
-        return list(_guilds_list_cache)
+    if _guilds_cache_fetched:
+        return _guilds_list_cache
+    _guilds_cache_fetched = True
+    try:
+        r = api("GET", "https://discord.com/api/v9/users/@me/guilds", retries=2)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                _guilds_list_cache = [g.get("id") for g in data if isinstance(g, dict) and g.get("id")]
+                dbg(f"[DISC] /@me/guilds fallback returned {len(_guilds_list_cache)} guild(s)")
+    except Exception as e:
+        dbg(f"[DISC] /@me/guilds fallback failed: {e}")
+    return _guilds_list_cache
 
 
 def _fetch_live_server_catalogue() -> list[dict]:
@@ -1999,76 +2025,17 @@ def _apply_registry_targets(result: dict) -> None:
         _active_ch_ref[:] = [cid for cid in _active_ch_ref if cid in catalogue and cid in CHANNEL_IDS]
 
 
-def _verify_configured_channels(reason: str) -> dict:
-    """Fallback reconciliation used when the guild inventory is unavailable.
-
-    `GET /users/@me/guilds` is not reachable for every user token (and is often
-    blocked by the egress proxy). Rather than leaving a rescan as a no-op, each
-    already-configured channel is verified directly so names, slowmodes, and
-    liveness are still refreshed. Channels Discord no longer returns are moved
-    out of the active rotation instead of being posted into blindly.
-    """
-    verified: list[tuple[str, str, int]] = []
-    missing: list[str] = []
-    for cid in [str(c) for c in CHANNEL_IDS if str(c).isdigit()]:
-        try:
-            info = get_channel_info(cid)
-        except Exception as exc:
-            dbg(f"[CHANNEL-STATE] per-channel verify failed for {cid}: {type(exc).__name__}: {exc}")
-            info = None
-        if not info:
-            missing.append(cid)
-            continue
-        verified.append((cid, str(info.get("name") or cid)[:80], int(info.get("rate_limit_per_user") or 0)))
-    with _state_lock:
-        for cid, name, slowmode in verified:
-            _ch_names_ref[cid] = name
-            _slowmodes_ref[cid] = slowmode
-            _dead_channels_ref.discard(cid)
-            if cid not in _active_ch_ref:
-                _active_ch_ref.append(cid)
-            if _stats_ref is not None and cid not in _stats_ref:
-                _stats_ref[cid] = {"sent": 0, "errors": 0, "skipped": 0,
-                                   "cooldown": 0, "img": 0, "txt": 0, "edits": 0}
-            _next_post_ref.setdefault(cid, time.time() + random.uniform(15, 40))
-        for cid in missing:
-            _dead_channels_ref.add(cid)
-            if cid in _active_ch_ref:
-                _active_ch_ref.remove(cid)
-        catalogue = {cid: {"id": cid, "name": _ch_names_ref.get(cid, cid),
-                           "slowmode": _slowmodes_ref.get(cid, 0)} for cid, _n, _s in verified}
-    detail = (
-        f"[CHANNEL-STATE] {reason}: guild inventory unavailable; per-channel verification "
-        f"verified={len(verified)} missing=[{', '.join(missing) or 'none'}]"
-    )
-    event_log("CHANNEL", detail)
-    send_log_webhook(f"🔄 **CHANNEL REGISTRY {reason.upper()} (PER-CHANNEL FALLBACK)**\n{detail}", kind="CHANNEL")
-    return {
-        "ok": bool(verified),
-        "servers": {},
-        "catalogue": catalogue,
-        "added": [],
-        "removed": missing,
-        "changed": [cid for cid, _n, _s in verified],
-        "replaced": [],
-        "targets": [cid for cid, _n, _s in verified],
-        "error": "" if verified else "no configured channel could be verified",
-    }
-
-
 def _reconcile_channel_registry(reason: str = "startup") -> dict:
     """Persist a full server scan and emit exact changes for operators."""
-    if not _channel_registry:
-        return {"ok": False, "error": "channel registry unavailable"}
+    if not _channel_registry or not ALT_ID:
+        return {"ok": False, "error": "channel registry unavailable or ALT_ID is unset"}
     servers = _fetch_live_server_catalogue()
     if not servers:
-        log(f"⚠️ [CHANNEL-STATE] {reason}: no live guild inventory returned; verifying configured channels individually.", kind="CHANNEL")
-        _verify_configured_channels(reason)
-        _persist_runtime_targets()
-        return {"ok": False, "error": "no live guild inventory; per-channel verification applied"}
+        log(f"⚠️ [CHANNEL-STATE] {reason}: no live guild inventory returned; keeping existing targets.", kind="CHANNEL")
+        return {"ok": False, "error": "no live guild inventory"}
     configured = [cid for cid in CHANNEL_IDS if str(cid).isdigit()]
     result = _channel_registry.reconcile(
-        REGISTRY_ALT_ID,
+        ALT_ID,
         servers,
         configured_ids=configured if configured else None,
         target_names=CHANNEL_NAMES or CHANNEL_KEYWORDS or None,
@@ -2093,10 +2060,10 @@ def _reconcile_channel_registry(reason: str = "startup") -> dict:
 
 def _persist_runtime_targets() -> bool:
     """Persist the current target IDs/names after an accepted control update."""
-    if not _channel_registry:
+    if not _channel_registry or not ALT_ID:
         return False
     names = {str(cid): str(name)[:80] for cid, name in _ch_names_ref.items() if str(cid).isdigit() and name}
-    ok, _detail = _channel_registry.set_targets(REGISTRY_ALT_ID, CHANNEL_IDS, names)
+    ok, _detail = _channel_registry.set_targets(ALT_ID, CHANNEL_IDS, names)
     if ok:
         _save_channel_registry_remote()
         log(f"[CHANNEL-STATE] persisted {len(CHANNEL_IDS)} runtime target(s)", kind="CHANNEL")
@@ -2128,7 +2095,7 @@ def _load_channel_registry_remote() -> bool:
         snapshot = json.loads(content) if content else None
         if not isinstance(snapshot, dict):
             return False
-        ok = _channel_registry.restore_alt_snapshot(REGISTRY_ALT_ID, snapshot)
+        ok = _channel_registry.restore_alt_snapshot(ALT_ID, snapshot)
         if ok:
             log(f"[CHANNEL-STATE] hydrated durable registry from {CHANNEL_STATE_GIST_FILE}", kind="CHANNEL")
         return ok
@@ -2142,7 +2109,7 @@ def _save_channel_registry_remote() -> bool:
     if not _channel_registry or not CHANNEL_STATE_GIST_ID or not GIST_TOKEN or not CHANNEL_STATE_GIST_FILE:
         return False
     try:
-        snapshot = _channel_registry.snapshot_for_alt(REGISTRY_ALT_ID)
+        snapshot = _channel_registry.snapshot_for_alt(ALT_ID)
         response = creq.patch(
             f"https://api.github.com/gists/{CHANNEL_STATE_GIST_ID}",
             headers={"Authorization": f"token {GIST_TOKEN}", "Accept": "application/vnd.github+json", "User-Agent": "adfarm-sender"},
@@ -2218,16 +2185,9 @@ def _rename_channel_entry(old_cid, new_cid, new_name, ch_names, slowmodes,
         my_last_msg_id.pop(old_cid, None)
 
 def discover_channel_by_name(guild_id, channel_name):
-    """GET /guilds/{gid}/channels, return the unique text channel whose name
-    matches (case-insensitive) or None.
-
-    `guild_id` may be a single id or list of ids (the fallback case when no
-    sibling channels have been loaded yet).
-
-    Discovery is fail-closed on ambiguity: when several channels match, the
-    result is ``{"ambiguous": True, "matches": [...]}`` instead of an arbitrary
-    pick, because advertising into the wrong channel is not recoverable.
-    """
+    """GET /guilds/{gid}/channels, return first text channel whose name matches
+    (case-insensitive) or None. `guild_id` may be a single id or list of ids
+    (the fallback case when no sibling channels have been loaded yet)."""
     # Normalize to a list of candidate guild ids
     if guild_id is None:
         candidates_gids = []
@@ -2271,17 +2231,8 @@ def discover_channel_by_name(guild_id, channel_name):
                 if target and (target in nm or nm in target):
                     matches.append(ch)
         if len(matches) > 1:
-            # Fail closed. Guessing a target from an ambiguous name can silently
-            # start advertising in the wrong channel, so the ambiguity is handed
-            # back to the caller, which either requires an explicit operator
-            # confirmation or refuses the discovery outright.
-            log(f"   ⚠️ [DISC] {len(matches)} channels matched '{target}' in guild {gid}; "
-                f"refusing to guess: {', '.join('#' + str(m.get('name')) for m in matches[:5])}.")
-            return {
-                "ambiguous": True,
-                "guild_id": gid,
-                "matches": [{"id": str(m.get("id") or ""), "name": str(m.get("name") or "")} for m in matches[:10]],
-            }
+            log(f"   ⚠️ [DISC] {len(matches)} channels matched '{target}' in guild {gid}; using first "
+                f"(#{matches[0].get('name')}).")
         if not matches:
             # Third pass: clean alphanumeric fuzzy match (handles emojis like 「💵」・market or trading﹒☆˚₊࿔)
             clean_target = re.sub(r"[^\w\s-]", "", target).strip().replace(" ", "-")
@@ -2295,20 +2246,12 @@ def discover_channel_by_name(guild_id, channel_name):
                         matches.append(ch)
         if not matches:
             continue
-        if len(matches) > 1:
-            log(f"   ⚠️ [DISC] {len(matches)} fuzzy channels matched '{target}' in guild {gid}; "
-                f"refusing to guess: {', '.join('#' + str(m.get('name')) for m in matches[:5])}.")
-            return {
-                "ambiguous": True,
-                "guild_id": gid,
-                "matches": [{"id": str(m.get("id") or ""), "name": str(m.get("name") or "")} for m in matches[:10]],
-            }
         new_cid = matches[0].get("id")
         new_name = matches[0].get("name", target)
         if new_cid:
             _guild_id_cache[new_cid] = gid
             _channel_id_to_guild[new_cid] = gid
-        return {"id": new_cid, "name": new_name, "ambiguous": False}
+        return {"id": new_cid, "name": new_name}
     return None
 
 def _poll_reactions(cid, mid, emoji_url, trusted_only, timeout):
@@ -2461,38 +2404,15 @@ def try_channel_discovery(old_cid, context):
         log(f"   ❌ [DISC] No matching text channel found in guild {gid} — skipping.")
         send_log_webhook(f"❌ **DISCOVERY FAIL** `{old_cid}` (#{ch_name}): channel name not found in guild.")
         return None
-    if found.get("ambiguous"):
-        # Fail closed: never guess between several same-named channels. An
-        # operator confirmation is the only thing that can resolve it.
-        candidates = ", ".join(
-            f"#{item.get('name')} (`{item.get('id')}`)" for item in (found.get("matches") or [])[:5]
-        ) or "unknown"
-        require_reaction = _bool("REQUIRE_DISCOVERY_REACTION", False)
-        if require_reaction and effective_confirm_users and found.get("matches"):
-            first = (found.get("matches") or [{}])[0]
-            new_cid, new_name = first.get("id"), first.get("name") or ch_name
-            log(f"   ⚠️ [DISC] Ambiguous discovery for '{ch_name}': {candidates}. "
-                "Requesting explicit operator confirmation for the closest candidate.")
-            outcome = confirm_channel(new_cid, new_name, old_cid, timeout=CONFIRM_TIMEOUT)
-        else:
-            log(f"   ❌ [DISC] Discovery refused: '{ch_name}' matched multiple channels "
-                f"({candidates}). Set REQUIRE_DISCOVERY_REACTION=1 and CONFIRM_USER_IDS to pick one.")
-            send_log_webhook(
-                f"❌ **DISCOVERY REFUSED (AMBIGUOUS)** `{old_cid}` (#{ch_name}): {candidates}",
-            )
-            return None
+    new_cid = found["id"]
+    new_name = found["name"]
+    log(f"   🔍 [DISC] Found candidate: #{new_name} (ID: `{new_cid}`).")
+
+    require_reaction = _bool("REQUIRE_DISCOVERY_REACTION", False)
+    if require_reaction and effective_confirm_users:
+        outcome = confirm_channel(new_cid, new_name, old_cid, timeout=CONFIRM_TIMEOUT)
     else:
-        new_cid = found.get("id")
-        new_name = found.get("name")
-        if not new_cid:
-            log(f"   ❌ [DISC] Discovery returned a match without an ID — skipping.")
-            return None
-        log(f"   🔍 [DISC] Found candidate: #{new_name} (ID: `{new_cid}`).")
-        require_reaction = _bool("REQUIRE_DISCOVERY_REACTION", False)
-        if require_reaction and effective_confirm_users:
-            outcome = confirm_channel(new_cid, new_name, old_cid, timeout=CONFIRM_TIMEOUT)
-        else:
-            outcome = "confirmed"
+        outcome = "confirmed"
 
     if outcome == "confirmed":
         log(f"   ✅ [DISC] Channel '#{new_name}' CONFIRMED — new ID: {new_cid}. Resuming posts to this channel.")
@@ -2853,9 +2773,6 @@ def _classify_dm_intent(text):
     # 1. Volume & budget extraction. Keep the raw text intact so arbitrary
     # item names and questions remain available to the operator.
     cleaned = raw
-    # The leading lookbehind stops a number embedded inside an asset alias
-    # (for example the "99" in "ps99") from being reported as the buyer's
-    # requested volume.
     vol_match = re.search(
         r"(?<![A-Za-z0-9])(?:(\$\s*\d+(?:\.\d+)?)|(\d+(?:\.\d+)?\s*(?:\$|usd|eur|€|gbp|£|k|m|mil|million|tokens?|b\b|billion|rap|robux|r\$)?))\b",
         cleaned,
@@ -2867,14 +2784,20 @@ def _classify_dm_intent(text):
         if volume in ("$", "usd", "eur", "k", "m"):
             volume = None
 
-    # 2. Asset recognition is configuration-driven. No game, item title,
-    # price keyword, or RAP abbreviation is required for a DM to be useful.
+    # 2. Asset recognition: built-in game aliases first (so "bb", "mm2",
+    # "ps99" resolve to human-readable labels), then configuration-driven
+    # deal keywords as a fallback for arbitrary items.
     game = None
-    aliases = list(dict.fromkeys(DEFAULT_ITEM_KEYWORDS + _get_active_deal_keywords()))
-    for alias in sorted((a for a in aliases if a), key=len, reverse=True):
+    for alias in sorted(_GAME_ALIASES, key=len, reverse=True):
         if re.search(r"(?<![A-Za-z0-9])" + re.escape(alias) + r"(?![A-Za-z0-9])", raw, re.I):
-            game = f"🏷️ {alias}"
+            game = _GAME_ALIASES[alias]
             break
+    if game is None:
+        aliases = list(dict.fromkeys(DEFAULT_ITEM_KEYWORDS + _get_active_deal_keywords()))
+        for alias in sorted((a for a in aliases if a), key=len, reverse=True):
+            if re.search(r"(?<![A-Za-z0-9])" + re.escape(alias) + r"(?![A-Za-z0-9])", raw, re.I):
+                game = f"🏷️ {alias}"
+                break
 
     # 3. Payment Method Extraction (Word-bounded)
     payments = []
@@ -3856,8 +3779,7 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
         respond(f"✅ Sync complete. Blocklist + control gist reloaded.")
     elif cmd in ("rescan", "rescan_channels", "refreshchannels"):
         global _guilds_cache_fetched
-        with _guilds_cache_lock:
-            _guilds_cache_fetched = False
+        _guilds_cache_fetched = False
         log("🔄 Manual server channel re-scan requested by controller.", kind="CHANNEL")
         ok = _resolve_channel_keywords()
         registry_result = _reconcile_channel_registry("manual rescan") if ok else {"ok": False}
@@ -3873,7 +3795,29 @@ def _handle_controller_dm(cid, author_id, content, *, trusted_source=False, repl
             )
             respond(f"✅ Re-scan complete. Active channels ({len(_active_ch_ref)}/{len(CHANNEL_IDS)}): {ch_summary}")
         elif ok:
-            respond("⚠️ Channel IDs resolved, but live inventory/state persistence failed; existing scheduler targets were retained.")
+            # PRE-001 fix: when the persistent registry is unavailable (e.g.
+            # standalone alt / test mode), verify + refresh each configured
+            # channel directly so names/slowmodes still update and no stale
+            # data survives the rescan.
+            refreshed = 0
+            with _state_lock:
+                for cid in [c for c in CHANNEL_IDS if str(c).isdigit()]:
+                    info = get_channel_info(cid)
+                    if not info:
+                        continue
+                    _ch_names_ref[cid] = str(info.get("name") or cid)[:80]
+                    _slowmodes_ref[cid] = int(info.get("rate_limit_per_user") or 0)
+                    if cid not in _active_ch_ref:
+                        _active_ch_ref.append(cid)
+                    _dead_channels_ref.discard(cid)
+                    refreshed += 1
+            event_log("CHANNEL", f"channel re-scan fallback: verified {refreshed} target(s)")
+            send_log_webhook(
+                f"🔄 **CHANNELS RESCANNED (direct verify)** → {refreshed} target(s) refreshed",
+                kind="CHANNEL",
+            )
+            ch_summary = ", ".join(f"#{_ch_names_ref.get(c, c)} (`{c}`)" for c in CHANNEL_IDS)
+            respond(f"✅ Re-scan complete (direct verification). Active channels ({len(_active_ch_ref)}/{len(CHANNEL_IDS)}): {ch_summary}")
         else:
             respond("⚠️ Re-scan failed: no valid channel targets resolved from CHANNEL_NAMES/CHANNEL_KEYWORDS.")
     elif cmd in ("resetcaution", "clearcaption", "clearcaution"):
@@ -3963,7 +3907,7 @@ def _sync_control_gist(force=False):
         broadcast = {}
         targeted = {}
         targeted_filename = ""
-        preferred = f"control_{REGISTRY_ALT_ID}.json".lower()
+        preferred = f"control_{ALT_ID}.json".lower()
         for fname, finfo in files.items():
             lower_name = str(fname).lower()
             if lower_name not in {"control.json", preferred}:
@@ -4143,22 +4087,17 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
     # Channel breakdown
     ch_data = {}
     for cid in CHANNEL_IDS:
-        # Autorescan can add a channel before its stats row exists, so every
-        # lookup is defensive: a missing row is an empty counter, not a crash.
-        ch_stats = stats.get(cid) if isinstance(stats, dict) else None
-        if not isinstance(ch_stats, dict):
-            ch_stats = {}
         ch_data[cid] = {
             "name": ch_names.get(cid, cid),
-            "sent": int(ch_stats.get("sent") or 0),
-            "errors": int(ch_stats.get("errors") or 0),
+            "sent": stats[cid]["sent"],
+            "errors": stats[cid]["errors"],
             "last_post": last_sent.get(cid, 0),
             "slowmode": slowmodes.get(cid, 0),
             "alive": cid in active_channels_list,
         }
     ip_org = ""
     ip_country = ""
-    registry_snapshot = _channel_registry.snapshot_for_alt(REGISTRY_ALT_ID) if _channel_registry else {}
+    registry_snapshot = _channel_registry.snapshot_for_alt(ALT_ID) if _channel_registry and ALT_ID else {}
     payload_json = {
         "heartbeat": True,
         "type": "heartbeat",
@@ -4229,14 +4168,14 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
     # Include a compact, readable per-channel breakdown. The parser uses the
     # numeric ID in each field name to rebuild the live channel table.
     for cid, details in list(ch_data.items())[:15]:
-        alive = "✅ alive" if details.get("alive") else "❌ unavailable"
+        alive = "✅ alive" if details["alive"] else "❌ unavailable"
         ch_name = str(details["name"] or cid)[:60]
         last_post = int(details.get("last_post") or 0)
         last_label = f"<t:{last_post}:R>" if last_post > 0 else "never"
         fields.append({
             "name": f"Channel: {cid} · #{ch_name}"[:256],
-            "value": (f"{alive} · sent `{details.get('sent', 0)}` · errors `{details.get('errors', 0)}` · "
-                      f"slowmode `{details.get('slowmode', 0)}s` · last {last_label}"),
+            "value": (f"{alive} · sent `{details['sent']}` · errors `{details['errors']}` · "
+                      f"slowmode `{details['slowmode']}s` · last {last_label}"),
             "inline": False,
         })
     embed = {
@@ -6218,13 +6157,11 @@ def _print_stats(start_ts, sent, err, skip, distractions, img, edits, per_ch):
     log("")
     log("📂 Per-channel breakdown:")
     for cid in CHANNEL_IDS:
-        s = per_ch.get(cid) if isinstance(per_ch, dict) else None
-        if not isinstance(s, dict):
-            s = {}
+        s = per_ch[cid]
         name = ch_names.get(cid, "?") if ch_names else "?"
         log(f"   #{name} ({cid}):")
-        log(f"      ✅ sent={s.get('sent', 0)}  (💬{s.get('txt', 0)}/📷{s.get('img', 0)}/✏️{s.get('edits', 0)})  "
-            f"❌err={s.get('errors', 0)}  ⏭️skip={s.get('skipped', 0)}  🔁cooldown={s.get('cooldown', 0)}")
+        log(f"      ✅ sent={s['sent']}  (💬{s['txt']}/📷{s['img']}/✏️{s['edits']})  "
+            f"❌err={s['errors']}  ⏭️skip={s['skipped']}  🔁cooldown={s['cooldown']}")
     log("=" * 66)
 
 

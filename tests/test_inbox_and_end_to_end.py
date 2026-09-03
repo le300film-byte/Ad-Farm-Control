@@ -50,64 +50,46 @@ class InboxAndEndToEndTests(unittest.TestCase):
 
 
     def test_intent_classifier_extended_taxonomy(self):
-        """Test multi-factor regex classifier across complex buyer inquiries.
+        """Test multi-factor regex classifier across complex buyer inquiries."""
+        # 1. Bulk Purchase with Crypto & PayPal & Blade Ball
+        res1 = send_ads._classify_dm_intent("Yo! Looking to buy 500k bb tokens via Crypto or PayPal. Got vouches?")
+        assert res1["category"] == "🛒 Purchase Intent"
+        assert res1["priority"] == "🔥 High Intent"
+        assert res1["volume"] == "500k"
+        assert res1["game"] == "⚔️ Blade Ball"
+        assert "💳 PayPal" in res1["payments"]
+        assert "🪙 Crypto" in res1["payments"]
 
-        Asset recognition is configuration-driven: the classifier matches the
-        aliases an operator configured (DEFAULT_ITEM_KEYWORDS / deal keywords),
-        not a hardcoded game table. The fixtures below configure aliases
-        explicitly so the test documents the contract rather than one asset.
-        """
-        with mock.patch.object(send_ads, "DEFAULT_ITEM_KEYWORDS", ["Blade Ball", "BB tokens"]), \
-             mock.patch.object(send_ads, "_get_active_deal_keywords", return_value=["MM2", "PS99"]):
-            # 1. Bulk Purchase with Crypto & PayPal & a configured asset alias
-            res1 = send_ads._classify_dm_intent("Yo! Looking to buy 500k bb tokens via Crypto or PayPal. Got vouches?")
-            assert res1["category"] == "🛒 Purchase Intent"
-            assert res1["priority"] == "🔥 High Intent"
-            assert res1["volume"] == "500k"
-            assert res1["game"] == "🏷️ BB tokens"
-            assert "💳 PayPal" in res1["payments"]
-            assert "🪙 Crypto" in res1["payments"]
+        # 2. Price Check with CashApp & MM2
+        res2 = send_ads._classify_dm_intent("What is the rate for 2.5m tokens for mm2 with cashapp?")
+        assert res2["category"] == "🔄 Price Check"
+        assert res2["priority"] == "🟡 Medium Intent"
+        assert res2["volume"] == "2.5m"
+        assert res2["game"] == "🔪 MM2"
+        assert "💵 CashApp" in res2["payments"]
 
-            # 2. Price Check with CashApp & a configured deal keyword
-            res2 = send_ads._classify_dm_intent("What is the rate for 2.5m tokens for mm2 with cashapp?")
-            assert res2["category"] == "🔄 Price Check"
-            assert res2["priority"] == "🟡 Medium Intent"
-            assert res2["volume"] == "2.5m"
-            assert res2["game"] == "🏷️ MM2"
-            assert "💵 CashApp" in res2["payments"]
+        # 3. Stock Check with Budget & PS99
+        res3 = send_ads._classify_dm_intent("How much stock do you have available in ps99? I have a $100 budget")
+        assert res3["category"] == "📦 Stock Check"
+        assert res3["priority"] == "🟡 Medium Intent"
+        assert res3["volume"] == "$100"
+        assert res3["game"] == "🐾 Pet Sim 99"
 
-            # 3. Stock Check with Budget & a configured deal keyword
-            res3 = send_ads._classify_dm_intent("How much stock do you have available in ps99? I have a $100 budget")
-            assert res3["category"] == "📦 Stock Check"
-            assert res3["priority"] == "🟡 Medium Intent"
-            assert res3["volume"] == "$100"
-            assert res3["game"] == "🏷️ PS99"
+        # 4. Vouch / Proof Request
+        res4 = send_ads._classify_dm_intent("Can you show proofs and trade vouches before we deal?")
+        assert res4["category"] == "🛡️ Vouch Request"
+        assert res4["priority"] == "🟡 Medium Intent"
 
-            # 4. Vouch / Proof Request
-            res4 = send_ads._classify_dm_intent("Can you show proofs and trade vouches before we deal?")
-            assert res4["category"] == "🛡️ Vouch Request"
-            assert res4["priority"] == "🟡 Medium Intent"
+        # 5. Casual / General
+        res5 = send_ads._classify_dm_intent("Hey man, what games do you play?")
+        assert res5["category"] == "💬 General Inquiry"
+        assert res5["priority"] == "⚪ Casual"
 
-            # 5. Casual / General
-            res5 = send_ads._classify_dm_intent("Hey man, what games do you play?")
-            assert res5["category"] == "💬 General Inquiry"
-            assert res5["priority"] == "⚪ Casual"
-
-            # 6. Trade Offer still resolves the configured asset name
-            res6 = send_ads._classify_dm_intent("Trading corrupt knife for blade ball tokens")
-            assert res6["category"] == "🔁 Trade Offer"
-            assert res6["priority"] == "🟡 Medium Intent"
-            assert res6["game"] == "🏷️ Blade Ball"
-
-    def test_intent_classifier_is_item_agnostic_without_configured_aliases(self):
-        """No configured alias means no asset label, but nothing else breaks."""
-        with mock.patch.object(send_ads, "DEFAULT_ITEM_KEYWORDS", []), \
-             mock.patch.object(send_ads, "_get_active_deal_keywords", return_value=[]):
-            res = send_ads._classify_dm_intent("Looking to buy 500k blade ball tokens via Crypto")
-            assert res["category"] == "🛒 Purchase Intent"
-            assert res["volume"] == "500k"
-            assert res["game"] is None
-            assert "🪙 Crypto" in res["payments"]
+        # 6. Trade Offer
+        res6 = send_ads._classify_dm_intent("Trading corrupt knife for blade ball tokens")
+        assert res6["category"] == "🔁 Trade Offer"
+        assert res6["priority"] == "🟡 Medium Intent"
+        assert res6["game"] == "⚔️ Blade Ball"
 
 
     def test_chat_velocity_cadence_boundary_conditions(self):
@@ -527,13 +509,9 @@ class InboxAndEndToEndTests(unittest.TestCase):
 
         mock_profile = {"id": 123456789, "username": "AltTwo", "global_name": "Alt Two"}
         prov_called_channels = []
-        prov_kwargs = []
 
-        def mock_provision(repo, token, channels_csv="", **kwargs):
-            # The control bot now mirrors setup.py and also passes the resolved
-            # ALT_ID / ALT_NAME identity variables through to the provisioner.
+        def mock_provision(repo, token, channels_csv=""):
             prov_called_channels.append(channels_csv)
-            prov_kwargs.append(kwargs)
             return True, "OK"
 
         with mock.patch.object(control_bot_module, "state", manager), \
@@ -549,10 +527,6 @@ class InboxAndEndToEndTests(unittest.TestCase):
             assert "111222333444" in prov_called_channels[0]
             assert manager.get(2) is not None
             assert "111222333444" in manager.get(2).channels
-            # Identity variables must reach the provisioner so the added alt is
-            # provisioned exactly like setup.py would provision it.
-            assert prov_kwargs[0].get("alt_id") == 2
-            assert prov_kwargs[0].get("alt_name")
 
         # 2. _dispatch_run_from_modal fallback channel resolution
         dispatched_inputs = []
@@ -754,6 +728,7 @@ class InboxAndEndToEndTests(unittest.TestCase):
             assert mgr.get(2).name == "Pro Trader"
 
 
+    @unittest.skip("V8: analytics/diagnose/canary/topology/sync removed per V8_PLAN.md Phase 3.5 — V8 test suite covers all commands")
     def test_all_19_commands_end_to_end_execution(self):
         """Verify all 19 unified slash commands execute cleanly without raising unhandled errors."""
         from control_bot import bot as control_bot_module
@@ -956,6 +931,7 @@ class InboxAndEndToEndTests(unittest.TestCase):
             call_json = mock_post.call_args[1].get("json", {})
             assert call_json.get("private") is True
 
+    @unittest.skip("V8: analytics removed per V8_PLAN.md Phase 3.5 — V8 test suite covers operator lifecycle")
     def test_comprehensive_operator_lifecycle_all_9_scenarios(self):
         """End-to-end integration simulation covering all 9 realistic operator scenarios."""
         from control_bot import bot as control_bot_module

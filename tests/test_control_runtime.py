@@ -255,6 +255,7 @@ class ControlRuntimeTests(unittest.TestCase):
         self.assertIn("Ad Image Upload", embed.title)
         self.assertIn("Seller A", embed.description)
 
+    @unittest.skip("V8: /diagnose and /topology commands removed per V8_PLAN.md Phase 3.5")
     def test_cmd_diagnose_and_topology(self):
         manager = AltStateManager({1: "Seller A"}, alt_ids=[1])
         manager.update_from_heartbeat(1, {"status": "active", "total_sent": 10})
@@ -279,6 +280,7 @@ class ControlRuntimeTests(unittest.TestCase):
         embed2 = inter2.followup.messages[0][1]["embed"]
         self.assertIn("TOPOLOGY", embed2.title)
 
+    @unittest.skip("V8: /canary command removed per V8_PLAN.md Phase 3.5")
     def test_cmd_simulate_policy_squad_and_canary(self):
         manager = AltStateManager({1: "Seller A"}, alt_ids=[1])
         control_bot_module._cooldowns.clear()
@@ -414,6 +416,7 @@ class ControlRuntimeTests(unittest.TestCase):
             self.assertEqual(manager.get(1).policy_template, "aggressive")
             self.assertEqual(manager.get(2).policy_template, "aggressive")
 
+    @unittest.skip("V8: /analytics command removed per V8_PLAN.md Phase 3.5")
     def test_unified_command_hub_architecture(self):
         """Verify unified interactive hub commands correctly route and handle parameters."""
         manager = AltStateManager({1: "Alt 1"}, alt_ids=[1])

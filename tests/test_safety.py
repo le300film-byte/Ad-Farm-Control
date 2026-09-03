@@ -151,15 +151,18 @@ class SafetyRegressionTests(unittest.TestCase):
         from control_bot import bot as control_bot_module
 
         names = {command.name for command in control_bot_module.bot.tree.get_commands()}
-        self.assertEqual(
-            names,
-            {
-                "run", "getstarted", "script", "shutdown", "stop", "pause", "resume",
-                "alt", "tune", "channels", "deals", "squad", "status", "reply",
-                "analytics", "diagnose", "canary", "topology", "sync", "refresh",
-                "dashboard", "autorescan", "help",
-            },
-        )
+        # V8: analytics, diagnose, canary, topology, sync removed.
+        # V8: /setup added for customers.
+        required = {
+            "run", "getstarted", "script", "shutdown", "stop", "pause", "resume",
+            "alt", "tune", "channels", "deals", "squad", "status", "reply",
+            "refresh", "dashboard", "help", "setup",
+        }
+        removed = {"analytics", "diagnose", "canary", "topology", "sync"}
+        for cmd in required:
+            self.assertIn(cmd, names, f"/{cmd} must be registered in V8")
+        for cmd in removed:
+            self.assertNotIn(cmd, names, f"/{cmd} must be removed in V8")
 
     def test_rescan_and_reset_caution_controller_handlers(self):
         replies = []

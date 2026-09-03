@@ -168,21 +168,6 @@ DEFAULT_DEAL_KEYWORDS = [
 # ---------- Run preview / confirmation ----------
 RUN_PREVIEW_REQUIRED = _env("RUN_PREVIEW_REQUIRED", "1").lower() in {"1", "true", "yes", "on"}
 
-# ---------- Squad / fleet batching ----------
-# A squad run posts through every member in sequence. The per-alt offset keeps
-# two runners from emitting in the same millisecond, which is what triggers
-# Discord's shared rate-limit bucket, while staying invisible to observers.
-SQUAD_POST_SPACING_MIN_MS = _int("SQUAD_POST_SPACING_MIN_MS", 200)
-SQUAD_POST_SPACING_MAX_MS = _int("SQUAD_POST_SPACING_MAX_MS", 500)
-# Control-plane commands (pause/policy/price) use a wider human-range offset
-# because they are not part of a single visible posting burst.
-SQUAD_CONTROL_SPACING_MIN_MS = _int("SQUAD_CONTROL_SPACING_MIN_MS", 250)
-SQUAD_CONTROL_SPACING_MAX_MS = _int("SQUAD_CONTROL_SPACING_MAX_MS", 1250)
-# Maximum number of concurrently registered alts. Discord-facing automation is
-# intentionally capped so a misconfigured fleet cannot scale without review.
-ALT_SLOT_LIMIT = _int("ALT_SLOT_LIMIT", 4)
-MAX_CHANNELS_PER_ALT = _int("MAX_CHANNELS_PER_ALT", 100)
-
 # ---------- Scripting sandbox ----------
 SCRIPT_TIMEOUT_SEC = _int("SCRIPT_TIMEOUT_SEC", 20)
 SCRIPT_MEMORY_MB = _int("SCRIPT_MEMORY_MB", 256)
