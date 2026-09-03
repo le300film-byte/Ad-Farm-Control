@@ -2336,7 +2336,7 @@ async def _handle_simulate_listing(inter: discord.Interaction, alt: int, sample_
 # Core Slash Commands (19 Non-Duplicated Unified Top-Level Commands)          #
 # =========================================================================== #
 
-@bot.tree.command(name="run", description="Launch Ad Run — guided 3-step launcher: pick alt/mode/interval, enter ad text, preview & confirm dispatch to GitHub Actions.")
+@bot.tree.command(name="run", description="Launch Ad Run — pick alt, enter ad text, preview & confirm dispatch")
 async def cmd_run(inter: discord.Interaction):
     if not await _check_perms(inter):
         return
@@ -2453,7 +2453,7 @@ async def _run_script_sandbox(inter: discord.Interaction, script: str, *, execut
         pass
 
 
-@bot.tree.command(name="script", description="Scripting — `simulate` dry-runs with unfiltered logs; `run` executes Python in a resource-limited sandbox.")
+@bot.tree.command(name="script", description="Scripting — simulate dry-runs or execute Python in a sandbox")
 @app_commands.describe(
     action="simulate (dry-run, unfiltered logs) or run (execute after approval)",
     code="Python script source",
@@ -2470,7 +2470,7 @@ async def cmd_script(inter: discord.Interaction, action: Literal["simulate", "ru
     await _run_script_sandbox(inter, code, execute=(action == "run"), label=action)
 
 
-@bot.tree.command(name="shutdown", description="Shutdown — gracefully stop all alts, cancel workflows, and terminate the control bot (requires SHUTDOWN confirmation).")
+@bot.tree.command(name="shutdown", description="Shutdown — stop all alts and terminate the bot (requires SHUTDOWN)")
 @app_commands.describe(confirmation="Type SHUTDOWN to confirm")
 async def cmd_shutdown(inter: discord.Interaction, confirmation: str):
     if not await _check_perms(inter):
@@ -2619,7 +2619,7 @@ async def cmd_alt(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="tune", description="Live Tuning — change price, ad copy, mode, interval, runtime, image, or apply policy presets on the fly.")
+@bot.tree.command(name="tune", description="Live Tuning — change price, ad copy, mode, interval, runtime, or images")
 @app_commands.describe(
     alt="Target alt ID (choose specific alt or 0 for all)",
     policy="Safety / speed preset template",
@@ -2893,7 +2893,7 @@ def _set_channels_state(alt_id: int, cids: list[str], names: dict[str, str] | No
     return len(a_obj.channels) if a_obj else 0
 
 
-@bot.tree.command(name="channels", description="Channel Manager — add/replace/remove trading channels, overwrite the full list, rescan permissions, or reset caution.")
+@bot.tree.command(name="channels", description="Channel Manager — add, replace, remove, or refresh trading channels")
 @app_commands.describe(
     alt="Target alt ID",
     action="Action to perform (leave blank to open visual manager)",
@@ -3071,7 +3071,7 @@ async def cmd_channels(
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="deals", description="Deal Scanner — passive marketplace arbitrage detection. Configure keywords, profit edge, and test-parse listings.")
+@bot.tree.command(name="deals", description="Deal Scanner — configure marketplace arbitrage keywords and alerts")
 @app_commands.describe(
     alt="Target alt ID (or 0 for all)",
     enabled="Turn deal scanning on or off",
@@ -3261,7 +3261,7 @@ async def cmd_squad(
         return
 
 
-@bot.tree.command(name="status", description="Live Status — fleet-wide dashboard (all alts) or single-alt diagnostic card with health, channels, deals.")
+@bot.tree.command(name="status", description="Live Status — fleet-wide dashboard or single-alt diagnostic card")
 @app_commands.describe(alt="Target alt (or 0 for All alts)")
 async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
     if not await _check_perms(inter):
