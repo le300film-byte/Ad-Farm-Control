@@ -129,6 +129,123 @@ def _is_operator(inter_or_user: Any) -> bool:
         return False
 
 
+def _customer_owned_alt_ids(uid: Any) -> set[int]:
+    """Fleet alt IDs that belong to customer *uid* (V8 bug-fix, plan #4).
+
+    Ownership is resolved from the invoking customer's OWN database record —
+    never from the global fleet list — so one customer can never see another
+    customer's (or an admin's) alts:
+
+      1. Repo match: the fleet ``ALT_REPOS`` entry for the alt points at the
+         same repository (basename) provisioned for this customer by
+         ``/admin activate``.
+      2. The alt account's Discord ID (``ALT_DISCORD_IDS``) equals the
+         customer's own Discord ID.
+      3. ``/setup`` credentials: the alt-account username captured during THIS
+         customer's setup wizard matches the fleet alt's display name.
+    """
+    owned: set[int] = set()
+    if not _V8_LOADED:
+        return owned
+    try:
+        uid_s = str(int(uid))
+    except (TypeError, ValueError):
+        return owned
+    try:
+        customer = _cm.get_customer(uid_s)
+    except Exception:
+        return owned
+    if not customer:
+        return owned
+
+    def _base(repo: Any) -> str:
+        return str(repo or "").strip().strip("/").split("/")[-1].lower()
+
+    cust_repos = {_base(r) for r in (customer.get("repos") or [])}
+    cust_repos.discard("")
+    if cust_repos:
+        for alt_id, repo in dict(config.ALT_REPOS).items():
+            base = _base(repo)
+            if base and base in cust_repos:
+                owned.add(int(alt_id))
+    for alt_id, did in dict(config.ALT_DISCORD_IDS).items():
+        if str(did) == uid_s:
+            owned.add(int(alt_id))
+    try:
+        fleet_names = {
+            int(aid): str(getattr(state.get(aid), "name", "") or "").strip().lower()
+            for aid in state.alt_ids if state.get(aid)
+        }
+        for cred in _cm.get_alt_credentials(uid_s):
+            uname = str(cred.get("username") or "").split("#")[0].strip().lower()
+            if not uname:
+                continue
+            for aid, fname in fleet_names.items():
+                if fname and fname == uname:
+                    owned.add(int(aid))
+    except Exception:
+        pass
+    return owned
+
+
+def _visible_alt_ids(uid: Any) -> tuple[bool, list[int]]:
+    """Return ``(is_admin, alt_ids_visible_to_user)`` for *uid*.
+
+    Admins/owners manage the whole fleet; every other user only sees the alts
+    owned by their own customer record (V8 bug-fix, plan #4 — `/alt` used to
+    render the operator's full fleet to freshly-activated accounts).
+    """
+    is_admin = False
+    try:
+        is_admin = bool(_is_owner(uid))
+        if not is_admin and _V8_LOADED:
+            is_admin = bool(_is_admin_v8(int(uid)))
+    except Exception:
+        is_admin = False
+    if is_admin:
+        return True, list(state.alt_ids)
+    owned = _customer_owned_alt_ids(uid)
+    return False, [aid for aid in state.alt_ids if aid in owned]
+
+
+def _customer_for_alt(alt_id: int) -> Optional[dict]:
+    """Return the ACTIVE customer record that owns fleet alt *alt_id*.
+
+    Reverse mapping of :func:`_customer_owned_alt_ids` — used by the VIP DM
+    auto-reply watcher (plan feature #5) to attribute an incoming buyer DM to
+    the right customer. Returns None when the alt belongs to the operator's
+    own fleet (no customer record matches).
+    """
+    if not _V8_LOADED:
+        return None
+    try:
+        repo = str(config.ALT_REPOS.get(int(alt_id), "") or "")
+        repo_base = repo.strip().strip("/").split("/")[-1].lower()
+        alt_discord_id = str(config.ALT_DISCORD_IDS.get(int(alt_id), "") or "")
+        alt_obj = state.get(int(alt_id))
+        alt_name = str(getattr(alt_obj, "name", "") or "").strip().lower()
+        for c in _cm.list_customers(active_only=True):
+            cust_repos = {
+                str(r).strip().strip("/").split("/")[-1].lower()
+                for r in (c.get("repos") or [])
+            }
+            if repo_base and repo_base in cust_repos:
+                return c
+            if alt_discord_id and alt_discord_id == str(c.get("discord_id") or ""):
+                return c
+            if alt_name:
+                try:
+                    for cred in _cm.get_alt_credentials(str(c.get("discord_id"))):
+                        uname = str(cred.get("username") or "").split("#")[0].strip().lower()
+                        if uname and uname == alt_name:
+                            return c
+                except Exception:
+                    pass
+    except Exception:
+        return None
+    return None
+
+
 def _ad_icon(ad_type: str) -> str:
     if (ad_type or "").lower() == "sell":
         return "💰"
@@ -318,6 +435,13 @@ async def _phase0_startup(bot: "commands.Bot") -> None:
                   f"rev {restored.get('revision')})")
             from control_bot import metrics
             metrics.note_db_restore(str(restored.get("source", "")))
+            # The restored file may predate the current schema (e.g. a v2
+            # backup restored by a v3 bot — missing customers.autoreply_text).
+            # init_db() is idempotent and applies the lightweight migration.
+            try:
+                _cm.init_db()
+            except Exception as _mig_exc:
+                print(f"[V8] Post-restore schema migration warning: {_mig_exc}")
 
     run_id = _os.environ.get("GITHUB_RUN_ID", "") or f"local-{os.getpid()}"
     lease = await asyncio.to_thread(acquire_run_lease, run_id)
@@ -449,7 +573,7 @@ except Exception:
 # Role sets (V8 bug-fix F): slash commands are grouped by the viewer's tier so
 # /help and the interaction gate can apply one consistent rule per command.
 ROLE_ADMIN_COMMANDS = {"admin"}
-ROLE_VIP_COMMANDS = {"squad", "script"}
+ROLE_VIP_COMMANDS = {"squad", "script", "vip"}
 ROLE_PUBLIC_COMMANDS = {"help", "getstarted"}
 ROLE_CUSTOMER_COMMANDS = {
     "setup", "run", "stop", "pause", "resume", "tune", "channels",
@@ -1547,6 +1671,24 @@ async def _log_alt_add_event(alt_id: int, ok: bool, text: str, *, name: str = "A
         state.append_log(alt_id, full, emoji=icon if ok else "❌", color=0x57F287 if ok else 0xED4245, kind="CONTROL" if ok else "ERROR")
 
 
+def _pick_fleet_repo_owner() -> str:
+    """Owner for auto-created fleet alt repos (V8 bug-fix, plan #1).
+
+    Round-robins across the configured WORKER GitHub accounts when worker
+    credentials exist; falls back to the fleet owner (GITHUB_OWNER or the
+    core repo owner) only when no workers are configured at all.
+    """
+    try:
+        from github_dispatch import pick_worker
+        worker_user, _tok = pick_worker()
+        worker_user = (worker_user or "").strip().strip("/")
+        if worker_user:
+            return worker_user
+    except Exception as exc:
+        print(f"[ALT-ADD] worker round-robin unavailable ({type(exc).__name__}: {exc})")
+    return config.GITHUB_OWNER or (config.CORE_REPO.split("/")[0] if "/" in config.CORE_REPO else "owner")
+
+
 class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
     user_token = discord.ui.TextInput(
         label="Alt Discord User Token",
@@ -1639,7 +1781,10 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
             repo = raw_repo if "/" in raw_repo else f"{config.GITHUB_OWNER}/{raw_repo}"
         else:
             clean_slug_name = re.sub(r"[^a-zA-Z0-9_-]", "", detected_username.lower().replace(" ", "-")) or f"alt{alt_id}"
-            owner = config.GITHUB_OWNER or (config.CORE_REPO.split("/")[0] if "/" in config.CORE_REPO else "owner")
+            # V8 bug-fix (plan #1): auto-created alt repos round-robin onto
+            # the WORKER GitHub accounts — never the main account. github_api
+            # resolves the matching worker PAT for create/secret calls.
+            owner = _pick_fleet_repo_owner()
             repo = f"{owner}/alt{alt_id}-{clean_slug_name}"
 
         # Resolve Advertising Channels (inherit from fleet if blank)
@@ -1802,18 +1947,28 @@ class ReplaceChannelModal(discord.ui.Modal, title="Replace Trading Channel"):
         await cmd_channels.callback(inter, alt=self.alt_id, action="replace", channel_id=old_id, new_channel_id=new_id, name=name)
 
 
-def _build_alt_overview_embed(selected_alt: Optional[int] = None) -> discord.Embed:
+def _build_alt_overview_embed(
+    selected_alt: Optional[int] = None,
+    allowed_ids: Optional[list[int]] = None,
+) -> discord.Embed:
+    """Fleet hub embed. ``allowed_ids`` restricts the rows to the caller's own
+    alts (V8 bug-fix, plan #4); ``None`` keeps the full-fleet admin view."""
     embed = discord.Embed(
         title="👥 Fleet Alt Management Hub",
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    if not state.alt_ids:
+    visible = list(state.alt_ids) if allowed_ids is None else [
+        aid for aid in allowed_ids if aid in state.alt_ids
+    ]
+    if not visible:
         embed.description = "⚠️ _No alts configured in fleet._ Click **➕ Add Alt** below to add one."
         return embed
 
     rows = []
     for a in state.all():
+        if a.alt_id not in visible:
+            continue
         repo = config.ALT_REPOS.get(a.alt_id, "not mapped")
         dot, _ = _status_dot(a)
         health = state.get_health_index(a.alt_id)
@@ -1824,7 +1979,10 @@ def _build_alt_overview_embed(selected_alt: Optional[int] = None) -> discord.Emb
             f"   ↳ **Mode:** `{a.ad_type or 'sell'}` @ `${a.rate or 2.50:.2f}/1k` | **Sent:** `{a.total_sent}` | **Errors:** `{a.total_errors}`"
         )
     embed.description = "\n\n".join(rows)
-    embed.set_footer(text="Credentials and tokens are encrypted and never shown. Select an action below.")
+    if allowed_ids is not None:
+        embed.set_footer(text="Showing only the alts that belong to your account. Tokens are encrypted and never shown.")
+    else:
+        embed.set_footer(text="Credentials and tokens are encrypted and never shown. Select an action below.")
     return embed
 
 
@@ -1856,15 +2014,26 @@ def _build_deals_overview_embed(selected_alt: Optional[int] = 0) -> discord.Embe
 
 
 class AltControlHubView(discord.ui.View):
-    def __init__(self, owner_id: int, selected_alt: int = 1):
+    def __init__(self, owner_id: int, selected_alt: int = 1,
+                 visible_alts: Optional[list[int]] = None):
         super().__init__(timeout=180)
         self.owner_id = owner_id
-        self.selected_alt = selected_alt if selected_alt in state.alt_ids else (state.alt_ids[0] if state.alt_ids else 1)
+        # V8 bug-fix (plan #4): the hub only ever lists/controls the alts the
+        # invoking user owns; admins pass None and keep the full fleet view.
+        self._full_fleet = visible_alts is None
+        if visible_alts is None:
+            self.visible: list[int] = list(state.alt_ids)
+        else:
+            self.visible = [aid for aid in visible_alts if aid in state.alt_ids]
+        self.selected_alt = (
+            selected_alt if selected_alt in self.visible
+            else (self.visible[0] if self.visible else 1)
+        )
         self._build_items()
 
     def _build_items(self):
         self.clear_items()
-        if len(state.alt_ids) > 1:
+        if len(self.visible) > 1:
             options = [
                 discord.SelectOption(
                     label=f"Alt {i}: {state.get(i).name if state.get(i) else f'Alt {i}'}"[:100],
@@ -1872,7 +2041,7 @@ class AltControlHubView(discord.ui.View):
                     default=(i == self.selected_alt),
                     emoji="🟢" if state.is_online(i) else "⚪",
                 )
-                for i in state.alt_ids[:25]
+                for i in self.visible[:25]
             ]
             class _AltPicker(discord.ui.Select):
                 def __init__(parent_self):
@@ -1880,7 +2049,10 @@ class AltControlHubView(discord.ui.View):
                 async def callback(sel_self, inter: discord.Interaction):
                     if not _is_operator(inter):
                         return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
-                    self.selected_alt = int(sel_self.values[0])
+                    picked = int(sel_self.values[0])
+                    if picked not in self.visible:  # plan #4: never switch to a hidden alt
+                        return await inter.response.send_message("❓ That alt is not available to you.", ephemeral=True)
+                    self.selected_alt = picked
                     self._build_items()
                     embed = self._render_embed()
                     await inter.response.edit_message(embed=embed, view=self)
@@ -1950,7 +2122,11 @@ class AltControlHubView(discord.ui.View):
         self.add_item(btn_refresh)
 
     def _render_embed(self) -> discord.Embed:
-        return _build_alt_overview_embed(self.selected_alt)
+        # Non-admin viewers get the ownership-filtered embed (plan #4).
+        return _build_alt_overview_embed(
+            self.selected_alt,
+            allowed_ids=None if self._full_fleet else self.visible,
+        )
 
 
 class DealsHubView(discord.ui.View):
@@ -2523,7 +2699,7 @@ async def cmd_getstarted(inter: discord.Interaction):
     steps = [
         ("1. Accept the Policy", "Read the pinned policy card in `#open-ticket` and click **✅ I Agree**. This is required before any payment address is shared (money-gate)."),
         ("2. Pay & Activate", "Send BEP-20 USDT/BUSD via Trust Wallet. An admin verifies on BSCScan, then runs `/admin activate @You days:30 alts:N` to create your private forum and repos."),
-        ("3. Run /setup", "Type `/setup` in your `#control` thread. Enter your alt tokens and channel IDs — the wizard validates each one before moving to the next. The wizard modal links the token walkthrough video if you need it."),
+        ("3. Run /setup", "Type `/setup` in your `#control` thread. Enter your alt tokens and channel IDs — the wizard validates each one before moving to the next. Need help finding your token? See the text guide in `docs/SETUP_GUIDE.md` (section 9)."),
         ("4. Launch your farm", "Run `/run` — pick your alt, mode (Sell/Buy), interval (3/5 min), runtime (6–48h or ∞ Limitless), enter your ad text, and click **Confirm Launch**."),
         ("5. Monitor", "Check `#dashboard` for live status (updated every 5 min), `#farm-logs` for action logs, and `#deals` for arbitrage alerts. Use `/status` for a quick overview."),
         ("6. Tune on the fly", "Use `/tune alt:1 price:2.50` to change your rate, `/tune alt:1 message:New text` to change your ad copy, or `/channels` to add/replace trading channels."),
@@ -2743,7 +2919,55 @@ async def cmd_alt(
     if not await _check_perms(inter, role="customer"):
         return
 
-    target_aid = alt if (alt and alt in state.alt_ids) else (state.alt_ids[0] if state.alt_ids else 1)
+    # V8 bug-fix (plan #4): /alt must only ever show alts that belong to the
+    # customer running the command — never other customers' or the admins'
+    # fleet alts. Ownership is resolved from the invoker's discord_id.
+    is_admin, visible = _visible_alt_ids(inter.user.id)
+
+    if action != "add" and not is_admin and not visible:
+        # Activated but nothing connected yet: explain what THEIR account has
+        # (provisioned repos from the customer record) and point at /setup.
+        embed = discord.Embed(
+            title="👥 Your Alt Accounts",
+            description="You have no alt accounts connected yet, so there is nothing to show.\n\n",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        if _V8_LOADED:
+            try:
+                cust = _cm.get_customer(str(inter.user.id))
+            except Exception:
+                cust = None
+            if cust:
+                repos = [str(r) for r in (cust.get("repos") or []) if str(r).strip()]
+                plan_alts = int(cust.get("alt_count") or 0) or len(repos)
+                if repos:
+                    owner = str(cust.get("github_account") or "").strip()
+                    embed.description += (
+                        f"Your plan includes **{plan_alts}** alt(s). Provisioned "
+                        f"repo(s){f' on `{owner}`' if owner else ''}:\n"
+                        + "\n".join(f"• `{r}`" for r in repos[:10])
+                        + "\n\n"
+                    )
+                elif plan_alts:
+                    embed.description += (
+                        f"Your plan includes **{plan_alts}** alt(s), but no repos "
+                        "are provisioned yet — contact an admin.\n\n"
+                    )
+        embed.description += (
+            "👉 Run `/setup` to connect your alt token(s). Once connected, your "
+            "alts appear here — and only yours."
+        )
+        embed.set_footer(text="For privacy, /alt never shows other members' alts.")
+        return await inter.response.send_message(embed=embed, ephemeral=True)
+
+    if alt is not None and alt not in visible:
+        return await inter.response.send_message(
+            "❓ That alt does not exist or does not belong to your account.",
+            ephemeral=True,
+        )
+
+    target_aid = alt if (alt and alt in visible) else (visible[0] if visible else 1)
 
     if action == "add":
         return await inter.response.send_modal(AltAddModal())
@@ -2764,8 +2988,12 @@ async def cmd_alt(
     elif action == "selfcheck":
         return await _handle_alt_selfcheck(inter, target_aid)
 
-    # Default: Interactive Alt Hub View
-    view = AltControlHubView(owner_id=inter.user.id, selected_alt=target_aid)
+    # Default: Interactive Alt Hub View (filtered to the caller's own alts)
+    view = AltControlHubView(
+        owner_id=inter.user.id,
+        selected_alt=target_aid,
+        visible_alts=None if is_admin else visible,
+    )
     embed = view._render_embed()
     await inter.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -3487,8 +3715,7 @@ _COMMAND_GUIDE = {
         "V8 Setup Wizard — enter your alt tokens and trading channel IDs. "
         "Step 1 asks how many alts (1–4). Step 2 opens one modal per alt "
         "(token + channels), each validated against Discord before the next. "
-        "Tokens are uploaded to GitHub secrets and cleared from memory. "
-        "A 3-min video walkthrough is linked in the modal."
+        "Tokens are uploaded to GitHub secrets and cleared from memory."
     ),
     "run": (
         "`/run`",
@@ -3582,6 +3809,14 @@ _COMMAND_GUIDE = {
         "alert wins to the public #proofs channel with your customer "
         "ID redacted."
     ),
+    # ── VIP Commands ──
+    "vip": (
+        "`/vip autoreply [message:<text>|off]`",
+        "VIP DM auto-reply — set a custom message that is automatically "
+        "relayed to buyers who DM your alt(s) (max once per 30 min per "
+        "buyer, while your farm runner is active). `message:off` disables "
+        "it; run without arguments to view the current setting."
+    ),
     # ── Admin / Operator Commands ──
     "admin": (
         "`/admin <subcommand>`",
@@ -3651,6 +3886,7 @@ async def cmd_help(inter: discord.Interaction):
         ("⚙️ Ad Farm Controls", ["stop", "pause", "resume", "status", "tune"]),
         ("📌 Channels & Deals", ["channels", "deals", "squad", "reply"]),
         ("👥 Alt Management", ["alt"]),
+        ("⭐ VIP Features", ["vip"]),
         ("💳 Billing & Proofs", ["renew", "pause-billing", "proofs"]),
         ("🔧 Admin Panel", ["admin"]),
         ("🖥️ System", ["script", "shutdown", "refresh", "dashboard"]),
@@ -3713,9 +3949,12 @@ def make_alt_autocompleter(command_name: str = ""):
         try:
             cur = str(current or "").strip().lower()
             out = []
+            # V8 bug-fix (plan #4): suggest only the alts visible to the
+            # invoking user — customers never see other operators' alt names.
+            _is_adm, visible = _visible_alt_ids(inter.user.id)
             if command_name in ("status", "deals", "tune", "analytics", "canary"):
                 out.append(app_commands.Choice(name="All alts (0)", value=0))
-            for i in state.alt_ids:
+            for i in visible:
                 label = _alt_label(i)
                 if not cur or cur in label.lower() or cur in str(i):
                     out.append(app_commands.Choice(name=label[:100], value=i))
@@ -3825,14 +4064,8 @@ def _valid_channel_ids(raw: str) -> tuple[bool, list[str]]:
     return True, clean
 
 
-class _VideoButton(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=600)
-        self.add_item(discord.ui.Button(
-            label=policy_mod.VIDEO_BUTTON_LABEL,
-            style=discord.ButtonStyle.link,
-            url=policy_mod.SETUP_VIDEO_URL,
-        ))
+# V8 bug-fix (plan #3): the _VideoButton view (link to the cancelled 3-min
+# token walkthrough video) was removed entirely from the /setup wizard.
 
 
 class SetupCountModal(discord.ui.Modal, title="Setup — Step 1 of 2"):
@@ -3975,16 +4208,11 @@ class _NextAltButton(discord.ui.View):
 async def _offer_alt_modal(inter: discord.Interaction, session: SetupSession, alt_num: int) -> None:
     """Offer the next alt modal via a button (Discord opens one modal per interaction)."""
     view = _NextAltButton(alt_num, session.total, session)
-    hub = _VideoButton()
     try:
         await inter.followup.send(
             f"👉 **Alt {alt_num} of {session.total}** — click the button to enter "
             "its token and channels.",
             view=view, ephemeral=True,
-        )
-        await inter.followup.send(
-            "🎥 Stuck? " + "Watch the 3-minute walkthrough below.",
-            view=hub, ephemeral=True,
         )
     except Exception:
         pass
@@ -4091,7 +4319,11 @@ async def cmd_renew(inter: discord.Interaction) -> None:
         from customer_manager import days_remaining
         left = days_remaining(uid)
         days = f"\nDays remaining: **{left:.1f}**" if left is not None else ""
-    ticket_ch = _os.environ.get("OPEN_TICKET_CH_ID", "") or _os.environ.get("TICKET_CH_ID", "")
+    # V8 bug-fix (plan #2): fall back to the channel persisted by
+    # /admin ticket-panel (DB meta) and to a guild name lookup.
+    from control_bot.tickets import resolve_ticket_channel_id
+    _ticket_id = resolve_ticket_channel_id(inter.guild)
+    ticket_ch = str(_ticket_id or "")
     try:
         if ticket_ch:
             ch = bot.get_channel(int(ticket_ch)) or await bot.fetch_channel(int(ticket_ch))
@@ -4128,7 +4360,10 @@ async def cmd_renew(inter: discord.Interaction) -> None:
 async def cmd_pause_billing(inter: discord.Interaction) -> None:
     if not await _check_perms(inter, role="customer"):
         return
-    ticket_ch = _os.environ.get("OPEN_TICKET_CH_ID", "") or _os.environ.get("TICKET_CH_ID", "")
+    # V8 bug-fix (plan #2): same resolver chain as /renew (env → DB meta →
+    # panel channel → guild name lookup).
+    from control_bot.tickets import resolve_ticket_channel_id
+    ticket_ch = str(resolve_ticket_channel_id(inter.guild) or "")
     uid = str(inter.user.id)
     if ticket_ch:
         try:
@@ -4169,6 +4404,131 @@ async def cmd_proofs(inter: discord.Interaction) -> None:
         "alert wins are shared; your customer ID is **redacted** (e.g. `1234…`).",
         view=proofs.ProofsView(), ephemeral=True,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# V8 plan feature #5 — VIP DM Auto-Reply
+# ──────────────────────────────────────────────────────────────────────────────
+
+# One auto-reply per (alt, buyer) inside this window so a chatty buyer never
+# gets spammed by the relay.
+AUTOREPLY_COOLDOWN_SEC = int(_os.environ.get("AUTOREPLY_COOLDOWN_SEC", "1800") or "1800")
+_autoreply_last_sent: dict[tuple[int, str], float] = {}
+
+vip_group = app_commands.Group(
+    name="vip",
+    description="VIP plan features (DM auto-reply, …)",
+)
+
+
+@vip_group.command(
+    name="autoreply",
+    description="VIP: auto-reply message sent to buyers who DM your alts.",
+)
+@app_commands.describe(
+    message="The auto-reply text — 'off' disables it, leave blank to view the current setting.",
+)
+async def vip_autoreply(inter: discord.Interaction, message: Optional[str] = None) -> None:
+    """Set/clear/view the VIP DM auto-reply (V8 plan feature #5).
+
+    When a buyer DMs one of THIS customer's alts and the DM lands in the
+    #dm-inbox, the control bot relays the saved message back to the buyer
+    through the alt (via the `!reply` Gist control command) — at most once
+    per buyer per cooldown window.
+    """
+    if not await _check_perms(inter, role="vip"):
+        return
+    uid = str(inter.user.id)
+    raw = str(message or "").strip()
+
+    # View current setting
+    if not raw:
+        current = ""
+        if _V8_LOADED:
+            try:
+                current = _cm.get_autoreply(uid)
+            except Exception:
+                current = ""
+        embed = discord.Embed(
+            title="⭐ VIP DM Auto-Reply",
+            color=0xFEE75C if current else 0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        if current:
+            embed.description = (
+                f"**Status:** 🟢 Enabled\n**Message:**\n```{current[:1000]}```\n"
+                f"Buyers who DM your alts receive this automatically (max once "
+                f"per {AUTOREPLY_COOLDOWN_SEC // 60} min per buyer)."
+            )
+        else:
+            embed.description = (
+                "**Status:** ⚪ Disabled\n\n"
+                "Set it with `/vip autoreply message:Hey! I'm away from my "
+                "desk — leave your offer and I'll reply within the hour.`\n"
+                "Disable it any time with `/vip autoreply message:off`."
+            )
+        embed.set_footer(text="Relayed through your alt while its farm runner is active.")
+        return await inter.response.send_message(embed=embed, ephemeral=True)
+
+    # Disable
+    if raw.lower() in {"off", "disable", "disabled", "none", "stop"}:
+        ok = False
+        if _V8_LOADED:
+            try:
+                ok = _cm.set_autoreply(uid, "")
+            except Exception as exc:
+                return await inter.response.send_message(
+                    f"❌ Could not update your auto-reply: {exc}", ephemeral=True
+                )
+        if not ok:
+            return await inter.response.send_message(
+                "❌ No customer record found for you — contact an admin.", ephemeral=True
+            )
+        return await inter.response.send_message(
+            "⚪ **VIP auto-reply disabled.** Buyers will no longer receive an "
+            "automatic message.", ephemeral=True,
+        )
+
+    # Enable / update
+    if len(raw) > 1500:
+        return await inter.response.send_message(
+            f"❌ Auto-reply message is too long ({len(raw)}/1500 characters).",
+            ephemeral=True,
+        )
+    # Sanitize mass mentions — an auto-reply must never ping everyone.
+    lowered = raw.lower()
+    if "@everyone" in lowered or "@here" in lowered:
+        raw = re.sub(r"@(everyone|here)", r"(mention:\1)", raw, flags=re.I)
+    ok = False
+    if _V8_LOADED:
+        try:
+            ok = _cm.set_autoreply(uid, raw)
+        except Exception as exc:
+            return await inter.response.send_message(
+                f"❌ Could not save your auto-reply: {exc}", ephemeral=True
+            )
+    if not ok:
+        return await inter.response.send_message(
+            "❌ No customer record found for you — contact an admin to be "
+            "activated first.", ephemeral=True,
+        )
+    try:
+        _cm.record_event(uid, "vip_autoreply_set", {"chars": len(raw)})
+    except Exception:
+        pass
+    await inter.response.send_message(
+        "✅ **VIP auto-reply saved!**\n"
+        f"```{raw[:1000]}```\n"
+        f"When a buyer DMs your alt(s), this message is relayed back automatically "
+        f"(at most once per {AUTOREPLY_COOLDOWN_SEC // 60} min per buyer) while "
+        "your farm runner is active.\n"
+        "• Change it any time: `/vip autoreply message:<new text>`\n"
+        "• Disable it: `/vip autoreply message:off`",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(vip_group)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -4304,8 +4664,14 @@ async def _v8_message_hooks(message: discord.Message) -> None:
             metrics.note_first_successful_post(matched["discord_id"])
 
     # Payment TX auto-ack in the ticket area (1.1)
-    ticket_ch = _os.environ.get("OPEN_TICKET_CH_ID", "") or _os.environ.get("TICKET_CH_ID", "")
-    is_ticket = (ch_id == str(ticket_ch)) if ticket_ch else str(message.channel.name).lower() in ("open-ticket", "tickets")
+    # V8 bug-fix (plan #2): resolve via env → DB meta → name lookup.
+    try:
+        from control_bot.tickets import resolve_ticket_channel_id
+        _ticket_id = resolve_ticket_channel_id(getattr(message, "guild", None))
+    except Exception:
+        _ticket_id = None
+    ticket_ch = str(_ticket_id or "")
+    is_ticket = (ch_id == ticket_ch) if ticket_ch else str(message.channel.name).lower() in ("open-ticket", "tickets")
     if is_ticket:
         from control_bot import payments
         if _cm.get_customer(str(message.author.id)):
@@ -4373,6 +4739,139 @@ def _alt_id_for_discord_id(did: int) -> int | None:
     return None
 
 
+def _is_dm_inbox_message(message: discord.Message) -> bool:
+    """Whether *message* was posted into a buyer-DM inbox destination.
+
+    Candidates (V8 plan feature #5):
+      * the global ``DM_INBOX_CH_ID`` channel (when configured),
+      * any channel/thread literally named ``dm-inbox``,
+      * a customer's private VIP forum dm-inbox thread (``dm_thread_id`` in
+        customers.db — only checked for forum threads to stay cheap).
+    """
+    ch_id = message.channel.id
+    if config.DM_INBOX_CH_ID and ch_id == config.DM_INBOX_CH_ID:
+        return True
+    name = str(getattr(message.channel, "name", "") or "").strip().lower()
+    if name in ("dm-inbox", "dm_inbox", "buyer-dms"):
+        return True
+    if _V8_LOADED and isinstance(message.channel, discord.Thread):
+        try:
+            for c in _cm.list_customers(active_only=True):
+                dm_t = str(c.get("dm_thread_id") or "").strip()
+                if dm_t and dm_t != "0" and dm_t == str(ch_id):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+async def _maybe_vip_autoreply(message: discord.Message) -> None:
+    """VIP DM auto-reply relay (V8 plan feature #5).
+
+    Fires on buyer-DM posts forwarded by an alt runner into a #dm-inbox.
+    The forwarded embed carries a ``/reply alt:N user:<buyer_id>`` quick-reply
+    field; we parse the target alt + buyer id from it, attribute the alt to
+    its owning customer, and — when that customer is an ACTIVE VIP with a
+    saved auto-reply — queue ``!reply <buyer> <text>`` through the control
+    Gist so the runner DMs the buyer from the alt account. Rate-limited to
+    one auto-reply per buyer per ``AUTOREPLY_COOLDOWN_SEC``.
+    """
+    if not _V8_LOADED:
+        return
+    author_name = str(
+        getattr(message.author, "name", "") or getattr(message.author, "display_name", "") or ""
+    )
+    if author_name.lower().endswith("(alt)"):
+        return  # echo of the alt's own DM (FORWARD_OWN_DMS) — not a buyer DM
+
+    # Extract the fleet alt id and buyer uid from the forwarded DM embed.
+    alt_id: Optional[int] = None
+    buyer_uid = ""
+    for embed in getattr(message, "embeds", []) or []:
+        for field in getattr(embed, "fields", []) or []:
+            m = re.search(
+                r"alt:\s*(\d+)\s+user:\s*(\d+)",
+                str(getattr(field, "value", "") or ""), re.I,
+            )
+            if m:
+                alt_id = int(m.group(1))
+                buyer_uid = m.group(2)
+        if alt_id is None:
+            footer = getattr(embed, "footer", None)
+            footer_text = str(getattr(footer, "text", "") or "") if footer else ""
+            fm = re.search(r"Alt\s+(\d+)", footer_text)
+            if fm:
+                alt_id = int(fm.group(1))
+    if not buyer_uid:
+        return  # nothing we can relay to (no quick-reply field)
+
+    # Attribute to a customer: by the inbox thread first, then by alt owner.
+    customer = None
+    ch_id = str(message.channel.id)
+    try:
+        for c in _cm.list_customers(active_only=True):
+            dm_t = str(c.get("dm_thread_id") or "").strip()
+            if dm_t and dm_t != "0" and dm_t == ch_id:
+                customer = c
+                break
+    except Exception:
+        customer = None
+    if alt_id is None and customer is not None:
+        owned = _customer_owned_alt_ids(customer.get("discord_id"))
+        if len(owned) == 1:
+            alt_id = next(iter(owned))
+    if customer is None and alt_id is not None:
+        customer = _customer_for_alt(alt_id)
+    if customer is None or alt_id is None:
+        return
+
+    uid = str(customer.get("discord_id") or "")
+    try:
+        if not customer.get("vip") or not _security.is_vip_customer(uid):
+            return  # VIP-plan feature only
+        if not _cm.is_active(uid):
+            return
+        text = _cm.get_autoreply(uid)
+    except Exception:
+        return
+    if not text:
+        return
+
+    # Per-buyer rate limit — never spam a buyer who writes several messages.
+    now = time.time()
+    key = (int(alt_id), buyer_uid)
+    if now - _autoreply_last_sent.get(key, 0.0) < AUTOREPLY_COOLDOWN_SEC:
+        return
+    _autoreply_last_sent[key] = now
+    if len(_autoreply_last_sent) > 5000:
+        cutoff = now - AUTOREPLY_COOLDOWN_SEC
+        for k in [k for k, ts in _autoreply_last_sent.items() if ts < cutoff]:
+            _autoreply_last_sent.pop(k, None)
+
+    ack = await _send_control_wait_ack(int(alt_id), f"!reply {buyer_uid} {text}", timeout=15)
+    ok = ack.startswith(("🕒", "✅"))
+    log_text = (
+        f"⭐ VIP auto-reply {'queued' if ok else 'FAILED'} for buyer "
+        f"`…{buyer_uid[-4:]}` via Alt {alt_id} "
+        f"({customer.get('discord_username', uid)}): {ack[:200]}"
+    )
+    try:
+        state.append_log(int(alt_id), log_text, emoji="⭐", color=0xFEE75C, kind="CONTROL")
+    except Exception:
+        pass
+    try:
+        await _log_control(log_text)
+    except Exception:
+        pass
+    try:
+        _cm.record_event(
+            uid, "vip_autoreply_sent",
+            {"alt": int(alt_id), "buyer_suffix": buyer_uid[-4:], "ok": bool(ok)},
+        )
+    except Exception:
+        pass
+
+
 async def _handle_guild_webhook_message(message: discord.Message, is_edit: bool = False):
     """Parse consolidated dashboard and farm-log webhook messages.
 
@@ -4399,6 +4898,16 @@ async def _handle_guild_webhook_message(message: discord.Message, is_edit: bool 
             if len(_processed_webhook_ids) > 5000:
                 _processed_webhook_ids.clear()
                 _processed_webhook_ids.add(message_id)
+
+    # V8 plan feature #5 — VIP DM auto-reply watcher: buyer DMs forwarded
+    # into a #dm-inbox trigger the customer's saved auto-reply relay.
+    if not is_edit:
+        try:
+            if _is_dm_inbox_message(message):
+                await _maybe_vip_autoreply(message)
+        except Exception as exc:
+            print(f"[VIP-AUTOREPLY] watcher error: {type(exc).__name__}: {exc}")
+
     if ch_id == config.DASHBOARD_CH_ID:
         _parse_dashboard_message(message)
 

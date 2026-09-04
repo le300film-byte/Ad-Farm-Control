@@ -273,6 +273,37 @@ def create_repo(
     ) or {}
 
 
+def discover_repo_owner(repo: str) -> str:
+    """Find which configured account actually holds *repo* (V8 bug-fix, plan #1).
+
+    Legacy customer records could store an empty ``github_account`` (the old
+    silent main-account fallback), which broke every later owner-scoped call
+    (``/repos//name`` → HTTP 404 on run cancels, syncs, deletes).  This probes
+    every configured worker account first, then the main account, and returns
+    the resolved owner login (``""`` when the repo is nowhere reachable).
+    """
+    repo = _norm_repo(repo)
+    if not repo:
+        return ""
+    for user, tok in get_workers():
+        owner = _norm_owner(user)
+        if not owner:
+            continue
+        try:
+            if repo_exists(owner, repo, tok):
+                return owner
+        except Exception:
+            continue
+    # Main account as the last resort (repos created before workers existed).
+    try:
+        main_owner = _resolve_owner("")
+        if repo_exists(main_owner, repo):
+            return main_owner
+    except Exception:
+        pass
+    return ""
+
+
 def soft_delete_repo(owner: str, repo: str, token: Optional[str] = None) -> dict[str, Any]:
     """Phase 3.2: soft-delete a repo — rename into a 24h quarantine window.
 

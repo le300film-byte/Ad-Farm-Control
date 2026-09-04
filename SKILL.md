@@ -153,7 +153,7 @@ The control plane provides **21 customer/operator commands + 12 admin subcommand
 ### 🧙 V8 Customer Commands
 | Command | Arguments | Function & Use Case |
 |---|---|---|
-| `/setup` | *(None — opens wizard)* | **V8 Setup Wizard:** Step 1 asks how many alts (1–4). Step 2 opens one modal per alt (token + channel IDs), each validated against Discord before the next. Tokens uploaded to GitHub secrets and cleared from memory. 3-min video linked in modal. |
+| `/setup` | *(None — opens wizard)* | **V8 Setup Wizard:** Step 1 asks how many alts (1–4). Step 2 opens one modal per alt (token + channel IDs), each validated against Discord before the next. Tokens uploaded to GitHub secrets and cleared from memory. Text token guide: docs/SETUP_GUIDE.md §9. |
 | `/renew` | *(None)* | **Renewal Ticket:** Opens a pre-filled ticket in `#open-ticket` with customer ID and days remaining. Admin verifies payment and runs `/admin extend`. |
 | `/pause-billing` | *(None)* | **Pause Request:** Opens a ticket requesting subscription pause. Admin reviews and extends by the paused days if approved. |
 | `/proofs` | *(None)* | **Opt-In Proofs:** Share first-post screenshots or supplier alert wins to the public `#proofs` channel with customer ID redacted. |
@@ -162,7 +162,7 @@ The control plane provides **21 customer/operator commands + 12 admin subcommand
 | Command | Arguments | Function & Use Case |
 |---|---|---|
 | `/admin list` | *(None)* | **Customer List:** Shows all customers with ID, username, alt count, VIP status, days remaining, active/expired status. |
-| `/admin activate` | `@User, days: N, alts: N, [vip], [github_account]` | **Onboard Customer:** Creates GitHub repos, provisions Discord forum (#control, #dashboard, #farm-logs, #dm-inbox, #deals), stores record in customers.db, sends welcome DM with video link. |
+| `/admin activate` | `@User, days: N, alts: N, [vip], [github_account]` | **Onboard Customer:** Creates GitHub repos, provisions Discord forum (#control, #dashboard, #farm-logs, #dm-inbox, #deals), stores record in customers.db (repos created in WORKER GitHub accounts, round-robin), sends welcome DM with setup instructions. |
 | `/admin extend` | `@User, days: N` | **Extend Subscription:** Adds days to an existing customer's expiry date. |
 | `/admin deactivate` | `@User` | **Shut Down Customer:** Runs shutdown sequence and locks the account. |
 | `/admin shutdown` | `confirm: ALL` | **Emergency Kill-Switch:** 2-admin multi-sig confirmation (120s window). Stops ALL customers. |

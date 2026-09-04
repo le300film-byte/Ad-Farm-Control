@@ -66,7 +66,12 @@ TOKEN_VAULT_KEY = os.environ.get("TOKEN_VAULT_KEY", "").strip()
 STORE_ALT_TOKENS = os.environ.get("STORE_ALT_TOKENS_IN_DB", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 # Schema version — bump when tables change so the runbook can detect staleness.
-SCHEMA_VERSION = 2
+# v3: customers.autoreply_text (VIP DM auto-reply, V8 plan feature #5).
+SCHEMA_VERSION = 3
+
+# Hard cap for the VIP auto-reply message (relayed through the `!reply`
+# control command whose args are truncated at 1900 chars runner-side).
+MAX_AUTOREPLY_CHARS = 1500
 
 
 def _db_path() -> str:
@@ -125,9 +130,16 @@ def init_db() -> None:
                 dashboard_thread_id TEXT,
                 logs_thread_id      TEXT,
                 dm_thread_id        TEXT,
-                deals_thread_id     TEXT
+                deals_thread_id     TEXT,
+                autoreply_text      TEXT DEFAULT ''
             )
         """)
+        # Lightweight migration for databases created before schema v3
+        # (V8 plan feature #5 — VIP DM auto-reply). Idempotent: also repairs
+        # a customers.db restored from an older Gist backup.
+        cols = {str(row[1]) for row in con.execute("PRAGMA table_info(customers)")}
+        if "autoreply_text" not in cols:
+            con.execute("ALTER TABLE customers ADD COLUMN autoreply_text TEXT DEFAULT ''")
         con.execute("""
             CREATE TABLE IF NOT EXISTS reminder_sent (
                 discord_id TEXT NOT NULL,
@@ -393,6 +405,32 @@ def set_vip(discord_id: str, vip: bool) -> bool:
         record_event(discord_id, "vip_changed", {"vip": bool(vip)})
         _after_write("set_vip")
     return rows > 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VIP DM auto-reply (V8 plan feature #5)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def set_autoreply(discord_id: str, text: str) -> bool:
+    """Store (or clear with ``""``) a VIP customer's DM auto-reply message."""
+    clean = str(text or "").strip()[:MAX_AUTOREPLY_CHARS]
+    with _conn() as con:
+        rows = con.execute(
+            "UPDATE customers SET autoreply_text = ? WHERE discord_id = ?",
+            (clean, discord_id),
+        ).rowcount
+    if rows > 0:
+        record_event(discord_id, "autoreply_changed", {"enabled": bool(clean)})
+        _after_write("autoreply")
+    return rows > 0
+
+
+def get_autoreply(discord_id: str) -> str:
+    """Return the customer's stored auto-reply message ("" when disabled)."""
+    c = get_customer(discord_id)
+    if not c:
+        return ""
+    return str(c.get("autoreply_text") or "").strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

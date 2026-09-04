@@ -16,7 +16,7 @@
 6. [Step 3 — Wait for Activation](#6-step-3--wait-for-activation)
 7. [Step 4 — Run `/setup`](#7-step-4--run-setup)
 8. [Step 5 — Run `/run` (Start Your Farm)](#8-step-5--run-run-start-your-farm)
-9. [How to Get Your Alt Token (3-min video)](#9-how-to-get-your-alt-token-3-min-video)
+9. [How to Get Your Alt Token](#9-how-to-get-your-alt-token)
 10. [How to Find Channel IDs](#10-how-to-find-channel-ids)
 11. [Daily Use — What Happens Automatically](#11-daily-use--what-happens-automatically)
 12. [Your Commands](#12-your-commands)
@@ -140,8 +140,8 @@ After payment verification:
 
 1. An admin runs `/admin activate @YourName days:30 alts:2` (or however many alts you purchased).
 2. You'll receive a **welcome DM** from the bot with:
-   - A link to the 3-min token extraction video.
    - Instructions to run `/setup` in your new `#control` thread.
+   - A pointer to the step-by-step token guide (section 9 of this document).
 3. A private forum is created for you in the 🏢 **Customer Hub** category with:
    - **#control** — your main interaction point (run commands here)
    - **#dashboard** — live status cards updated every 5 minutes
@@ -176,7 +176,7 @@ This is the one-time setup wizard where you enter your alt tokens and channels.
 - ✅ Push protection and secret scanning enabled.
 - ✅ Self-check workflow runs to verify everything works.
 
-> 🎥 **Stuck on tokens?** Click the **🎥 Need help? Watch this 3-min video** button in the modal.
+> 📖 **Stuck on tokens?** Follow the step-by-step text guide in section 9 below, or open a ticket with the 🎫 button in `#open-ticket`.
 
 ---
 
@@ -211,7 +211,7 @@ Once setup is complete, start your ad farm:
 
 ---
 
-## 9. How to Get Your Alt Token (3-min video)
+## 9. How to Get Your Alt Token
 
 ### Quick Steps (Desktop Browser):
 
@@ -236,7 +236,6 @@ Once setup is complete, start your ad farm:
 - **Keep it secret** — anyone with the token can fully control that alt.
 - **If the token stops working:** You may have logged in on another device (new token issued). Re-extract and re-setup.
 
-> 🎥 A video walkthrough is linked in the `/setup` modal and your welcome DM.
 
 ---
 
@@ -546,7 +545,7 @@ You might be in **caution mode** (the bot detected deletions and backed off). Ch
 
 ### Canned answers (for admins):
 Common ticket topics have pre-written responses (see [`V8_RUNBOOKS.md`](./V8_RUNBOOKS.md) §7):
-1. "Where do I find my token?" → Token extraction video.
+1. "Where do I find my token?" → Follow section 9 of this guide (text walkthrough).
 2. "It says invalid token" → Re-extract, check for whitespace.
 3. "My alt got banned" → Time credit + re-setup flow.
 4. "How do I change my price?" → `/tune alt:1 price:X`.

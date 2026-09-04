@@ -82,11 +82,41 @@ jobs:
           DASHBOARD_CH_ID:          ${{ secrets.DASHBOARD_CH_ID }}
           LOG_CH_ID:                ${{ secrets.LOG_CH_ID }}
           DEALS_CH_ID:              ${{ secrets.DEALS_CH_ID }}
-          AUDIT_LOG_CH_ID:          ${{ secrets.AUDIT_LOG_CH_ID }}
+          # setup.py stores the audit channel as AUDIT_LOGS_CH_ID (#audit-logs);
+          # accept both spellings so [AUDIT] lines reach the channel.
+          AUDIT_LOG_CH_ID:          ${{ secrets.AUDIT_LOG_CH_ID || secrets.AUDIT_LOGS_CH_ID }}
+          # V8 bug-fix (plan #2): the ticket flow reads OPEN_TICKET_CH_ID from
+          # the environment — setup.py writes it as a secret, but it was never
+          # passed to the bot, so every ticket click answered "❌ Ticket
+          # channel not configured." Same for #admin-alerts ([ALERT] (no
+          # channel)) and #admin-chat.
+          OPEN_TICKET_CH_ID:        ${{ secrets.OPEN_TICKET_CH_ID }}
+          ADMIN_ALERTS_CH_ID:       ${{ secrets.ADMIN_ALERTS_CH_ID }}
+          ADMIN_CHAT_CH_ID:         ${{ secrets.ADMIN_CHAT_CH_ID }}
+          PAYMENT_ADDRESS:          ${{ secrets.PAYMENT_ADDRESS }}
+          # Optional global buyer-DM inbox (V8 plan feature #5 — VIP auto-reply).
+          DM_INBOX_CH_ID:           ${{ secrets.DM_INBOX_CH_ID }}
           OWNER_IDS:                ${{ secrets.OWNER_IDS || secrets.OWNER_ID }}
           GH_TOKEN:                 ${{ secrets.GH_TOKEN || secrets.GITHUB_PAT }}
           GH_ADMIN_TOKEN:           ${{ secrets.GH_ADMIN_TOKEN }}
-          GITHUB_OWNER:             ${{ secrets.ALT_GITHUB_OWNER }}
+          # V8 bug-fix (plan #1): customer alt repos must be created in the
+          # WORKER GitHub accounts (round-robin). The worker secrets written by
+          # setup.py were never passed to the bot, so pick_worker() silently
+          # fell back to the main account (GH_ADMIN_TOKEN). Pass every worker
+          # credential form github_dispatch.get_workers() understands.
+          WORKER_TOKENS:            ${{ secrets.WORKER_TOKENS }}
+          WORKER_GITHUB_OWNERS:     ${{ secrets.WORKER_GITHUB_OWNERS }}
+          WORKER_TOKENS_LIST:       ${{ secrets.WORKER_TOKENS_LIST }}
+          WORKER_1_USER:            ${{ secrets.WORKER_1_USER }}
+          WORKER_1_TOKEN:           ${{ secrets.WORKER_1_TOKEN }}
+          WORKER_2_USER:            ${{ secrets.WORKER_2_USER }}
+          WORKER_2_TOKEN:           ${{ secrets.WORKER_2_TOKEN }}
+          WORKER_3_USER:            ${{ secrets.WORKER_3_USER }}
+          WORKER_3_TOKEN:           ${{ secrets.WORKER_3_TOKEN }}
+          # Fleet repos live under ALT_GITHUB_OWNER; fall back to the main
+          # login written by setup.py (REPO_OWNER) so GITHUB_OWNER is never
+          # empty and /run never fails with "GitHub control is not configured".
+          GITHUB_OWNER:             ${{ secrets.ALT_GITHUB_OWNER || secrets.REPO_OWNER }}
           CORE_REPO:                ${{ github.repository }}
           CONTROL_GIST_ID:          ${{ secrets.CONTROL_GIST_ID }}
           ALT_REPOS:                ${{ secrets.ALT_REPOS }}

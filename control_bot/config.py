@@ -79,6 +79,10 @@ CONTROL_CH_ID = _snowflake("CONTROL_CH_ID")
 DASHBOARD_CH_ID = _snowflake("DASHBOARD_CH_ID")
 LOG_CH_ID = _snowflake("LOG_CH_ID")
 DEALS_CH_ID = _snowflake("DEALS_CH_ID")
+# Optional GLOBAL #dm-inbox channel where alt runners forward buyer DMs.
+# Per-customer VIP forums also get their own dm-inbox thread (dm_thread_id in
+# customers.db); the VIP auto-reply watcher monitors both (V8 plan feature #5).
+DM_INBOX_CH_ID = _snowflake("DM_INBOX_CH_ID")
 
 # ---------- Authorized users ----------
 OWNER_IDS: set[int] = set()

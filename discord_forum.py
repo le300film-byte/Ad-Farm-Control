@@ -143,7 +143,11 @@ async def _collect_or_create_threads(
         ("deals", "deals"),
     ]
     if vip:
-        thread_map.insert(3, ("dm_inbox", "dm-inbox"))
+        # Key must be "dm" so the id lands in `dm_thread_id` — the column
+        # admin_activate persists. ("dm_inbox" produced a phantom
+        # `dm_inbox_thread_id` key and dm_thread_id was always 0, breaking
+        # the VIP DM auto-reply watcher — V8 plan feature #5.)
+        thread_map.insert(3, ("dm", "dm-inbox"))
 
     existing: dict[str, discord.Thread] = {}
     try:
@@ -245,7 +249,9 @@ async def create_customer_forum(
         ("deals", "deals"),
     ]
     if vip:
-        thread_map.insert(3, ("dm_inbox", "dm-inbox"))
+        # See _collect_or_create_threads: key "dm" → `dm_thread_id` (V8 plan
+        # feature #5 — the VIP DM auto-reply watcher reads this column).
+        thread_map.insert(3, ("dm", "dm-inbox"))
 
     for key, thread_name in thread_map:
         try:

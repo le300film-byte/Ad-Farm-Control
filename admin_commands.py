@@ -32,6 +32,32 @@ import customer_manager as cm
 from security import check_admin, is_admin
 
 
+def _remember_ticket_channel(channel) -> None:
+    """Persist the ticket channel id for this process AND across restarts.
+
+    V8 bug-fix (plan #2): the "❌ Ticket channel not configured." error fired
+    because ``OPEN_TICKET_CH_ID`` only exists as a repository secret — it is
+    read from the environment at runtime, and clicking the ticket panel button
+    could never work when the secret/env was missing.  Whenever an admin
+    explicitly points ``/admin ticket-panel`` (or ``/admin pin-policy``) at a
+    channel we now:
+
+    1. export it into ``os.environ`` so the current process resolves it, and
+    2. store it in ``customers.db`` meta (``open_ticket_ch_id``) which is
+       backed up to the private Gist and restored on every boot.
+    """
+    try:
+        ch_id = str(int(channel.id))
+    except Exception:
+        return
+    import os
+    os.environ["OPEN_TICKET_CH_ID"] = ch_id
+    try:
+        cm.set_meta("open_ticket_ch_id", ch_id)
+    except Exception as exc:
+        print(f"[TICKET] Could not persist open_ticket_ch_id in DB: {exc}")
+
+
 class AdminCog(commands.Cog):
     """Hidden admin panel (OWNER_IDS only)."""
 
@@ -62,13 +88,17 @@ class AdminCog(commands.Cog):
 
     async def _send_welcome_dm(self, user: discord.User, username: str) -> None:
         try:
-            from control_bot.policy import SETUP_VIDEO_URL
+            # V8 bug-fix (plan #3): the token walkthrough video link was
+            # removed entirely — no video will be produced. Text instructions
+            # live in docs/SETUP_GUIDE.md §9.
             await user.send(
                 f"🎉 **Welcome to AdFarm V8, {username}!**\n\n"
                 "Your account has been activated. Run `/setup` in your "
                 "`#control` thread to enter your alt tokens and channels. "
                 "Once set up, use `/run` to start your ad farm.\n\n"
-                f"🎥 **First time? Watch the 3-min token walkthrough:**\n{SETUP_VIDEO_URL}"
+                "📖 Need help finding your alt token? See the step-by-step "
+                "text guide in `docs/SETUP_GUIDE.md` (section 9) or open a "
+                "ticket with the 🎫 button in `#open-ticket`."
             )
         except Exception:
             pass
@@ -149,6 +179,24 @@ class AdminCog(commands.Cog):
             repos = list(existing.get("repos") or [])
             if not gh_account:
                 gh_account = (existing.get("github_account") or "").strip()
+            if repos and not gh_account:
+                # V8 bug-fix (plan #1): legacy records created before worker
+                # round-robin stored an empty github_account, which later made
+                # the timer engine call GitHub with `/repos//<name>` (404).
+                # Discover which configured account actually holds the repo and
+                # backfill it so cancels/syncs target the right owner.
+                try:
+                    from github_dispatch import discover_repo_owner
+                    discovered = await asyncio.to_thread(discover_repo_owner, repos[0])
+                except Exception:
+                    discovered = ""
+                if discovered:
+                    gh_account = discovered
+                    await inter.followup.send(
+                        f"🧭 Recovered GitHub owner for existing repo "
+                        f"`{repos[0]}` → `{gh_account}` (record backfilled).",
+                        ephemeral=True,
+                    )
             if repos:
                 await inter.followup.send(
                     f"♻️ Reusing {len(repos)} existing repo(s) for **{uname}** — "
@@ -157,6 +205,15 @@ class AdminCog(commands.Cog):
                 )
         if not repos and gh_account:
             # Explicit worker account: all alts live under it.
+            from github_dispatch import get_workers
+            known_workers = {w[0].strip().strip("/").lower() for w in get_workers() if w[0]}
+            if known_workers and gh_account.lower() not in known_workers:
+                await inter.followup.send(
+                    f"⚠️ `{gh_account}` is not one of the configured worker "
+                    f"accounts ({', '.join(sorted(known_workers))}). Repos will "
+                    "only be created if GH_ADMIN_TOKEN has access there.",
+                    ephemeral=True,
+                )
             for i in range(1, alts + 1):
                 repo_name = f"{uname.lower().replace(' ', '_')}_alt{i}"
                 try:
@@ -165,7 +222,8 @@ class AdminCog(commands.Cog):
                     )
                     repos.append(repo_name)
                     await inter.followup.send(
-                        f"✅ Created repo: [{repo_name}]({html_url})", ephemeral=True
+                        f"✅ Created repo: [{repo_name}]({html_url}) on `{gh_account}`",
+                        ephemeral=True,
                     )
                 except Exception as exc:
                     await inter.followup.send(
@@ -178,6 +236,33 @@ class AdminCog(commands.Cog):
             from github_dispatch import pick_worker, _norm_owner
             worker_user, worker_token = pick_worker()
             gh_account = _norm_owner(worker_user)
+            if not gh_account:
+                # V8 bug-fix (plan #1): customer alt repos must NEVER be
+                # created in the main account. An empty worker username means
+                # no worker GitHub accounts are configured — fail loudly with
+                # the exact remedy instead of silently provisioning under the
+                # main token (which also stored an empty github_account and
+                # broke later cancels/syncs).
+                msg = (
+                    "❌ **No worker GitHub accounts are configured** — refusing "
+                    f"to create {alts} alt repo(s) for **{uname}** in the main "
+                    "account.\n\n"
+                    "**Fix:** set the `WORKER_TOKENS` repository secret "
+                    "(`org1:token1,org2:token2`, fine-grained PATs per worker "
+                    "account) or `WORKER_1_USER`/`WORKER_1_TOKEN` … "
+                    "`WORKER_3_USER`/`WORKER_3_TOKEN`, then run this command "
+                    "again. Alternatively pass `github_account:<worker-org>` "
+                    "explicitly.\n"
+                    "(`setup.py` writes these secrets automatically when you "
+                    "register the 3 worker accounts.)"
+                )
+                await inter.followup.send(msg, ephemeral=True)
+                await self._audit(
+                    f"⛔ **Activation blocked** for `{uname}` (`{uid}`) — no "
+                    "worker GitHub accounts configured (WORKER_TOKENS missing); "
+                    "refused to create repos in the main account."
+                )
+                return
             for i in range(1, alts + 1):
                 repo_name = f"{uname.lower().replace(' ', '_')}_alt{i}"
                 try:
@@ -186,11 +271,13 @@ class AdminCog(commands.Cog):
                     )
                     repos.append(repo_name)
                     await inter.followup.send(
-                        f"✅ Created repo: [{repo_name}]({html_url})", ephemeral=True
+                        f"✅ Created repo: [{repo_name}]({html_url}) on worker `{gh_account}`",
+                        ephemeral=True,
                     )
                 except Exception as exc:
                     await inter.followup.send(
-                        f"⚠️ Repo `{repo_name}` creation failed: {exc}", ephemeral=True
+                        f"⚠️ Repo `{repo_name}` creation failed on worker "
+                        f"`{gh_account}`: {exc}", ephemeral=True
                     )
 
         # 2. Create/reuse the Discord forum (bug-fix E: never duplicated)
@@ -249,6 +336,7 @@ class AdminCog(commands.Cog):
         await inter.followup.send(
             f"🎉 **{uname}** has been activated!\n"
             f"• Days: **{days}**  • Alts: **{alts}**  • VIP: **{'✅' if vip else '❌'}**\n"
+            f"• GitHub account: `{gh_account or '(unknown)'}`\n"
             f"• Repos: `{repos}`\n"
             f"• Forum ID: `{forum_ids.get('forum_id', 'N/A')}`",
             ephemeral=True,
@@ -534,6 +622,7 @@ class AdminCog(commands.Cog):
                 ephemeral=True,
             )
             return
+        _remember_ticket_channel(ch)
         from control_bot.policy import pin_policy_in_channel
         ok = await pin_policy_in_channel(ch)
         await inter.response.send_message(
@@ -584,8 +673,16 @@ class AdminCog(commands.Cog):
             color=0x5865F2,
         )
         await ch.send(embed=embed, view=TicketPanelView())
+        # V8 bug-fix (plan #2): remember this channel as THE ticket channel so
+        # clicking "Open a Ticket" can create threads even when the
+        # OPEN_TICKET_CH_ID workflow secret was never set. Persisted in the
+        # environment (this process) and in customers.db meta (survives
+        # restarts/chunk handoffs via the Gist backup).
+        _remember_ticket_channel(ch)
         await inter.response.send_message(
-            f"✅ Ticket panel posted in {ch.mention}", ephemeral=True
+            f"✅ Ticket panel posted in {ch.mention} — ticket channel saved "
+            f"(id `{ch.id}`). New tickets will open threads here.",
+            ephemeral=True,
         )
 
     @admin_group.command(

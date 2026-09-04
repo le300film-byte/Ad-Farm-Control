@@ -238,9 +238,56 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
     return False, f"Control Gist HTTP {response.status_code}: {message}"
 
 
-def _auth_headers() -> dict:
+def _token_for_repo(repo: str) -> Optional[str]:
+    """Best token for a repo slug's OWNER (V8 bug-fix, plan #1).
+
+    Customer/alt repositories live in the WORKER GitHub accounts. The shared
+    control token (GH_TOKEN/GH_ADMIN_TOKEN — the main account) cannot dispatch
+    workflows, read runs, or manage secrets there, which produced the
+    ``GET /repos/<worker>/<repo>/actions/runs → HTTP 404`` failures. When the
+    slug's owner matches a configured worker account, that worker's
+    fine-grained PAT is used instead. Returns None when no worker matches
+    (callers fall back to ``config.GITHUB_TOKEN``).
+    """
+    slug = str(repo or "").strip()
+    if "/" not in slug:
+        return None
+    owner = slug.split("/")[0].strip().strip("/").lower()
+    if not owner:
+        return None
+    try:
+        # WORKER_TOKENS=org1:token1,org2:token2
+        raw = os.environ.get("WORKER_TOKENS", "").strip()
+        if raw:
+            for pair in raw.split(","):
+                pair = pair.strip()
+                if ":" not in pair:
+                    continue
+                org, tok = pair.split(":", 1)
+                if org.strip().lower() == owner and tok.strip():
+                    return tok.strip()
+        # WORKER_GITHUB_OWNERS + positional WORKER_TOKENS_LIST
+        owners = [x.strip() for x in os.environ.get("WORKER_GITHUB_OWNERS", "").split(",") if x.strip()]
+        tokens = [x.strip() for x in os.environ.get("WORKER_TOKENS_LIST", "").split(",") if x.strip()]
+        for idx, org in enumerate(owners):
+            if org.lower() == owner and idx < len(tokens) and tokens[idx]:
+                return tokens[idx]
+        # WORKER_N_USER / WORKER_N_TOKEN
+        for i in range(1, 4):
+            user = os.environ.get(f"WORKER_{i}_USER", "").strip()
+            tok = os.environ.get(f"WORKER_{i}_TOKEN", "").strip()
+            if user and tok and user.lower() == owner:
+                return tok
+    except Exception:
+        return None
+    return None
+
+
+def _auth_headers(repo: str = "") -> dict:
+    """Auth headers; worker-owned repo slugs use their worker PAT (plan #1)."""
+    token = (_token_for_repo(repo) if repo else None) or config.GITHUB_TOKEN
     return {
-        "Authorization": f"Bearer {config.GITHUB_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "discord-control-bot",
@@ -263,7 +310,7 @@ def repository_exists(repo: str) -> tuple[bool, str]:
     try:
         response = requests.get(
             f"{GH}/repos/{_repo_slug(repo)}",
-            headers=_auth_headers(),
+            headers=_auth_headers(_repo_slug(repo)),
             timeout=_HTTP_TIMEOUT,
         )
     except Exception as exc:
@@ -275,14 +322,19 @@ def repository_exists(repo: str) -> tuple[bool, str]:
     return False, f"Repository lookup returned HTTP {response.status_code}."
 
 
-def _run_gh_secret(args: list[str], value: str | None = None) -> tuple[bool, str]:
-    """Run gh secret operations without putting secret values in argv/logs."""
-    if not config.GITHUB_TOKEN:
+def _run_gh_secret(args: list[str], value: str | None = None, repo: str = "") -> tuple[bool, str]:
+    """Run gh secret operations without putting secret values in argv/logs.
+
+    ``repo`` selects the credential: worker-owned slugs authenticate with the
+    worker PAT so secrets/deletes work on customer repos (plan #1).
+    """
+    token = (_token_for_repo(repo) if repo else None) or config.GITHUB_TOKEN
+    if not token:
         return False, "GH_TOKEN is missing."
     if not shutil.which("gh"):
         return False, "GitHub CLI (gh) is not installed on the control runner."
     env = os.environ.copy()
-    env["GH_TOKEN"] = config.GITHUB_TOKEN
+    env["GH_TOKEN"] = token
     try:
         result = subprocess.run(
             ["gh", *args],
@@ -305,7 +357,8 @@ def set_repository_secret(repo: str, name: str, value: str) -> tuple[bool, str]:
     """Set a repository secret via stdin so the value is never in argv."""
     if not repo or not name or value is None:
         return False, "Repository, secret name, and value are required."
-    return _run_gh_secret(["secret", "set", name, "--repo", _repo_slug(repo)], value)
+    slug = _repo_slug(repo)
+    return _run_gh_secret(["secret", "set", name, "--repo", slug], value, repo=slug)
 
 
 def delete_repository_secret(repo: str, name: str) -> tuple[bool, str]:
@@ -316,20 +369,21 @@ def delete_repository_secret(repo: str, name: str) -> tuple[bool, str]:
     # Try GitHub REST API first
     try:
         url = f"{GH}/repos/{slug}/actions/secrets/{name}"
-        r = requests.delete(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        r = requests.delete(url, headers=_auth_headers(slug), timeout=_HTTP_TIMEOUT)
         if r.status_code in (204, 200, 404):
             return True, "Secret deleted."
     except Exception:
         pass
     # Fallback to gh CLI (note: gh secret delete does not take --yes)
-    return _run_gh_secret(["secret", "delete", name, "--repo", slug])
+    return _run_gh_secret(["secret", "delete", name, "--repo", slug], repo=slug)
 
 
 def delete_repository(repo: str) -> tuple[bool, str]:
     """Delete a repository only when an explicit owner command requested it."""
     if not repo:
         return False, "Repository is empty."
-    return _run_gh_secret(["repo", "delete", _repo_slug(repo), "--yes"])
+    slug = _repo_slug(repo)
+    return _run_gh_secret(["repo", "delete", slug, "--yes"], repo=slug)
 
 
 def dispatch_named_workflow(alt_id: int, workflow: str, inputs: dict | None = None) -> tuple[bool, str]:
@@ -340,10 +394,11 @@ def dispatch_named_workflow(alt_id: int, workflow: str, inputs: dict | None = No
     workflow = str(workflow or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", workflow):
         return False, "Workflow filename is invalid."
-    url = f"{GH}/repos/{_repo_slug(repo)}/actions/workflows/{workflow}/dispatches"
+    slug = _repo_slug(repo)
+    url = f"{GH}/repos/{slug}/actions/workflows/{workflow}/dispatches"
     payload = {"ref": "main", "inputs": inputs or {}}
     try:
-        response = requests.post(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+        response = requests.post(url, headers=_auth_headers(slug), json=payload, timeout=_HTTP_TIMEOUT)
     except Exception as exc:
         return False, f"Network error: {type(exc).__name__}: {exc}"
     if response.status_code == 204:
@@ -360,10 +415,11 @@ def dispatch_workflow(alt_id: int, inputs: dict) -> tuple[bool, str]:
     repo = _repo_for(alt_id)
     if not repo:
         return False, f"Alt {alt_id} has no repository mapped in ALT_REPOS."
-    url = f"{GH}/repos/{_repo_slug(repo)}/actions/workflows/{config.WORKFLOW_FILE}/dispatches"
+    slug = _repo_slug(repo)
+    url = f"{GH}/repos/{slug}/actions/workflows/{config.WORKFLOW_FILE}/dispatches"
     payload = {"ref": "main", "inputs": inputs}
     try:
-        r = requests.post(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+        r = requests.post(url, headers=_auth_headers(slug), json=payload, timeout=_HTTP_TIMEOUT)
     except Exception as e:
         return False, f"Network error: {type(e).__name__}: {e}"
     if r.status_code == 204:
@@ -386,9 +442,10 @@ def dispatch_workflow(alt_id: int, inputs: dict) -> tuple[bool, str]:
 
 
 def _fetch_latest_run_id(repo: str) -> Optional[int]:
-    url = f"{GH}/repos/{_repo_slug(repo)}/actions/runs?per_page=1"
+    slug = _repo_slug(repo)
+    url = f"{GH}/repos/{slug}/actions/runs?per_page=1"
     try:
-        r = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        r = requests.get(url, headers=_auth_headers(slug), timeout=_HTTP_TIMEOUT)
         if r.status_code == 200:
             runs = r.json().get("workflow_runs") or []
             if runs:
@@ -411,7 +468,7 @@ def cancel_workflow_run_by_id(run_id: int, repo: str | None = None) -> tuple[boo
         return False, "CORE_REPO is not configured."
     url = f"{GH}/repos/{slug}/actions/runs/{int(run_id)}/cancel"
     try:
-        r = requests.post(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        r = requests.post(url, headers=_auth_headers(slug), timeout=_HTTP_TIMEOUT)
     except Exception as e:
         return False, f"Network error: {e}"
     if r.status_code in (202, 204):
@@ -429,9 +486,10 @@ def cancel_run(alt_id: int) -> tuple[bool, str]:
     run_id = _fetch_latest_run_id(repo)
     if not run_id:
         return True, "No active workflow run found to cancel."
-    url = f"{GH}/repos/{_repo_slug(repo)}/actions/runs/{run_id}/cancel"
+    slug = _repo_slug(repo)
+    url = f"{GH}/repos/{slug}/actions/runs/{run_id}/cancel"
     try:
-        r = requests.post(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        r = requests.post(url, headers=_auth_headers(slug), timeout=_HTTP_TIMEOUT)
     except Exception as e:
         return False, f"Network error: {e}"
     if r.status_code in (202, 204):
@@ -445,9 +503,10 @@ def list_runs(alt_id: int, limit: int = 5) -> list[dict]:
     repo = _repo_for(alt_id)
     if not repo:
         return []
-    url = f"{GH}/repos/{_repo_slug(repo)}/actions/runs?per_page={limit}"
+    slug = _repo_slug(repo)
+    url = f"{GH}/repos/{slug}/actions/runs?per_page={limit}"
     try:
-        r = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        r = requests.get(url, headers=_auth_headers(slug), timeout=_HTTP_TIMEOUT)
         if r.status_code == 200:
             return r.json().get("workflow_runs") or []
     except Exception as e:
@@ -485,18 +544,24 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = False) -> tupl
     if os.environ.get("ALT_REPO_PRIVATE", "").lower() in ("1", "true"):
         private = True
 
+    # V8 bug-fix (plan #1): worker-owned slugs authenticate with the worker
+    # PAT — otherwise the org create fails and the fallback silently creates
+    # the repo in the MAIN account via /user/repos.
+    headers = _auth_headers(slug)
+
     # Try creating under org or user via REST API
     payload = {"name": repo_name, "private": private, "auto_init": True, "description": f"Ad Farm alt {repo_name}"}
     for url in (f"{GH}/orgs/{owner}/repos" if (owner and owner != config.GITHUB_OWNER) else f"{GH}/user/repos", f"{GH}/user/repos"):
         try:
-            r = requests.post(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+            r = requests.post(url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
             if r.status_code in (200, 201):
                 return True, slug
         except Exception:
             pass
-    if shutil.which("gh") and config.GITHUB_TOKEN:
+    gh_token = _token_for_repo(slug) or config.GITHUB_TOKEN
+    if shutil.which("gh") and gh_token:
         env = os.environ.copy()
-        env["GH_TOKEN"] = config.GITHUB_TOKEN
+        env["GH_TOKEN"] = gh_token
         visibility_flag = "--private" if private else "--public"
         res = subprocess.run(
             ["gh", "repo", "create", slug, visibility_flag, "--add-readme"],
@@ -583,10 +648,11 @@ def upload_repository_file(repo: str, file_path: str, content_bytes: bytes, mess
     slug = _repo_slug(repo)
     clean_path = file_path.lstrip("/")
     url = f"{GH}/repos/{slug}/contents/{clean_path}"
+    headers = _auth_headers(slug)
 
     sha = None
     try:
-        r_get = requests.get(url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
+        r_get = requests.get(url, headers=headers, timeout=_HTTP_TIMEOUT)
         if r_get.status_code == 200:
             sha = r_get.json().get("sha")
     except Exception as e:
@@ -600,7 +666,7 @@ def upload_repository_file(repo: str, file_path: str, content_bytes: bytes, mess
         payload["sha"] = sha
 
     try:
-        r_put = requests.put(url, headers=_auth_headers(), json=payload, timeout=_HTTP_TIMEOUT)
+        r_put = requests.put(url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
         if r_put.status_code in (200, 201):
             return True, f"File `{clean_path}` committed to `{slug}`."
         return False, f"HTTP {r_put.status_code}: {r_put.text[:200]}"

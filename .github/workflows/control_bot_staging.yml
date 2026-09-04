@@ -49,7 +49,20 @@ jobs:
           GUILD_ID:                 ${{ secrets.GUILD_ID }}
           OWNER_IDS:                ${{ secrets.OWNER_IDS || secrets.OWNER_ID }}
           GH_ADMIN_TOKEN:           ${{ secrets.GH_ADMIN_TOKEN }}
-          GITHUB_OWNER:             ${{ secrets.ALT_GITHUB_OWNER }}
+          # V8 bug-fix (plan #1): mirror production env — worker accounts and
+          # ticket channel must be visible to the staging smoke tests too.
+          WORKER_TOKENS:            ${{ secrets.WORKER_TOKENS }}
+          WORKER_GITHUB_OWNERS:     ${{ secrets.WORKER_GITHUB_OWNERS }}
+          WORKER_TOKENS_LIST:       ${{ secrets.WORKER_TOKENS_LIST }}
+          WORKER_1_USER:            ${{ secrets.WORKER_1_USER }}
+          WORKER_1_TOKEN:           ${{ secrets.WORKER_1_TOKEN }}
+          WORKER_2_USER:            ${{ secrets.WORKER_2_USER }}
+          WORKER_2_TOKEN:           ${{ secrets.WORKER_2_TOKEN }}
+          WORKER_3_USER:            ${{ secrets.WORKER_3_USER }}
+          WORKER_3_TOKEN:           ${{ secrets.WORKER_3_TOKEN }}
+          OPEN_TICKET_CH_ID:        ${{ secrets.OPEN_TICKET_CH_ID }}
+          ADMIN_ALERTS_CH_ID:       ${{ secrets.ADMIN_ALERTS_CH_ID }}
+          GITHUB_OWNER:             ${{ secrets.ALT_GITHUB_OWNER || secrets.REPO_OWNER }}
           CONTROL_GIST_ID:          ${{ secrets.CONTROL_GIST_ID }}
           ALT_REPOS:                ${{ secrets.ALT_REPOS }}
           ALT_DISCORD_IDS:          ${{ secrets.ALT_DISCORD_IDS }}

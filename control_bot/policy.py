@@ -10,7 +10,6 @@ TODO 0.4:
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import discord
@@ -22,10 +21,10 @@ import customer_manager as cm
 POLICY_VERSION = "v8-2026-09-03-1"
 WALLET_POLICY_REQUIRED = True
 
-SETUP_VIDEO_URL = os.environ.get(
-    "SETUP_VIDEO_URL",
-    "https://github.com/DarkKitty-w/adfarm-core-AI/blob/main/docs/TOKEN_EXTRACTION_GUIDE.md",
-)
+# V8 bug-fix (plan #3): the token walkthrough video was cancelled — there is
+# deliberately NO SETUP_VIDEO_URL / VIDEO_BUTTON_LABEL anymore. All video
+# links were removed from the welcome DM, /setup wizard, /getstarted and
+# /help. Text instructions live in docs/SETUP_GUIDE.md §9.
 
 POLICY_CARD = (
     "**📜 AdFarm V8 — Pre-Payment Policy Card**\n"
@@ -74,8 +73,8 @@ TOS_TEXT = (
     "- We reserve the right to refuse or terminate service for abusive use."
 )
 
-# A clean link/button label for the token-extraction walkthrough.
-VIDEO_BUTTON_LABEL = "🎥 Need help? Watch the 3-min video"
+# V8 bug-fix (plan #3): removed VIDEO_BUTTON_LABEL — no walkthrough video
+# will be produced; the token guide is text-only (docs/SETUP_GUIDE.md §9).
 
 
 def policy_card_embed() -> discord.Embed:
