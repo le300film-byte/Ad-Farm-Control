@@ -90,7 +90,7 @@ for uid in (_split("OWNER_IDS") or _split("OWNER_ID")):
     try:
         OWNER_IDS.add(int(uid))
     except ValueError:
-        pass
+        print(f"⚠️ config: ignoring non-numeric OWNER_IDS entry '{uid}'.")
 
 # Filled at runtime; alts only need the controller IDs from their own config.
 BOT_USER_ID = _snowflake("BOT_USER_ID")
@@ -117,7 +117,7 @@ for pair in _split("ALT_REPOS"):
         try:
             ALT_REPOS[int(k)] = v.strip()
         except ValueError:
-            pass
+            print(f"⚠️ config: ignoring malformed ALT_REPOS pair '{pair}' (expected id:repo).")
 
 # Alt -> Discord user ID, same 1:id format as ALT_REPOS.
 ALT_DISCORD_IDS: dict[int, int] = {}
@@ -127,7 +127,7 @@ for pair in _split("ALT_DISCORD_IDS"):
         try:
             ALT_DISCORD_IDS[int(k)] = int(v.strip())
         except ValueError:
-            pass
+            print(f"⚠️ config: ignoring malformed ALT_DISCORD_IDS pair '{pair}' (expected id:userid).")
 
 # Friendly alt names. The live ad_type from heartbeats determines seller/buyer
 # presentation; there is intentionally no static market-mode configuration.
@@ -138,7 +138,7 @@ for pair in _split("ALT_NAMES"):
         try:
             ALT_NAMES[int(k)] = v.strip()
         except ValueError:
-            pass
+            print(f"⚠️ config: ignoring malformed ALT_NAMES pair '{pair}' (expected id:name).")
 
 WORKFLOW_FILE = _env("WORKFLOW_FILE", "send_ads.yml")
 SELF_CHECK_WORKFLOW = _env("SELF_CHECK_WORKFLOW", "self_check.yml")

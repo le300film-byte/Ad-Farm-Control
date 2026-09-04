@@ -25,7 +25,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Callable, Literal, Optional
 
 import discord
 from discord import app_commands
@@ -33,13 +33,12 @@ from discord.ext import commands, tasks
 
 from . import config, github_api, sandbox
 from .alt_state import AltStateManager
+from .command_sync import format_sync_summary, sync_guild_commands
 from .persistence import ChannelRegistryStore
 from .dashboard import (
     build_all,
     build_single_alt_embed,
-    build_topology_embed,
     build_diagnose_embed,
-    build_analytics_embed,
     _status_dot,
 )
 
@@ -50,8 +49,7 @@ try:
     _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import customer_manager as _cm
     import security as _security
-    from security import check_admin as _check_admin_v8, is_admin as _is_admin_v8
-    from control_bot import policy as policy_mod
+    from security import is_admin as _is_admin_v8
     _V8_LOADED = True
 except Exception as _v8_import_err:
     print(f"[V8] Warning: V8 modules not fully loaded: {_v8_import_err}")
@@ -183,8 +181,8 @@ def _customer_owned_alt_ids(uid: Any) -> set[int]:
             for aid, fname in fleet_names.items():
                 if fname and fname == uname:
                     owned.add(int(aid))
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] _customer_owned_alt_ids: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return owned
 
 
@@ -239,8 +237,8 @@ def _customer_for_alt(alt_id: int) -> Optional[dict]:
                         uname = str(cred.get("username") or "").split("#")[0].strip().lower()
                         if uname and uname == alt_name:
                             return c
-                except Exception:
-                    pass
+                except Exception as _ignored_exc:
+                    print(f"[BOT] _customer_for_alt: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     except Exception:
         return None
     return None
@@ -312,8 +310,55 @@ class AltSelect(discord.ui.Select):
 
 
 # ----- Event: on_ready -----
+async def _load_admin_cog_once(bot_obj: "commands.Bot") -> None:
+    """Load the admin cog + register the /admin group — idempotently.
+
+    V8 bug-fix plan #3: /admin used to be loaded only after the first sync and
+    a second on_ready (gateway reconnect) re-ran the load, logging
+    `Admin cog warning: Command 'admin' already registered.` while leaving
+    admins staring at a missing command until the next restart. The cog now
+    loads *before* the first sync and the load is a no-op when already present.
+    """
+    import admin_commands as _ac
+    if bot_obj.get_cog("AdminCog") is None:
+        await _ac.setup(bot_obj)
+    print("[V8] ✅ Admin cog loaded.")
+
+
+async def _sync_and_hide(bot_obj: "commands.Bot") -> dict:
+    """The single command-sync path (shared with /admin sync-commands).
+
+    Copies globals into the control guild, syncs, and best-effort pushes
+    per-channel visibility so Discord itself shows only the commands that are
+    appropriate for each room (V8 bug-fix plan #1/#3).
+    """
+    guild = bot_obj.get_guild(config.GUILD_ID) if config.GUILD_ID else None
+    if config.GUILD_ID and guild is None:
+        print(f"⚠️  GUILD_ID={config.GUILD_ID} but bot isn't in that guild; using global sync.")
+    summary = await sync_guild_commands(bot_obj, guild)
+    if summary.get("mode") == "guild" and guild is not None:
+        print(f"🔗 Guild commands synced to '{guild.name}' ({guild.id})")
+    print(f"[CMD] {format_sync_summary(summary)}")
+    return summary
+
+
+_views_registered = False
+
+
+def _register_persistent_views() -> None:
+    """Register the persistent ticket panel view exactly once per process."""
+    global _views_registered
+    if _views_registered:
+        return
+    from control_bot.tickets import TicketPanelView
+    bot.add_view(TicketPanelView())
+    _views_registered = True
+
+
 @bot.event
 async def on_ready():
+    """Login/reconnect handler. Every step is idempotent (on_ready re-fires
+    after gateway reconnects)."""
     me = bot.user
     config.BOT_USER_ID = me.id
     print(f"✅ Logged in as {me} (id {me.id})")
@@ -321,25 +366,29 @@ async def on_ready():
         print("❌ OWNER_IDS is empty — control commands are disabled until it is configured.")
     if not config.GUILD_ID:
         print("⚠️  GUILD_ID not set — commands will be registered globally (up to 1h delay).")
-        # Global sync
-        await bot.tree.sync()
-        
-        # Register persistent ticket panel view
-        from control_bot.tickets import TicketPanelView
-        bot.add_view(TicketPanelView())
-    else:
-        guild = bot.get_guild(config.GUILD_ID)
-        if guild:
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-            print(f"🔗 Guild commands synced to '{guild.name}' ({guild.id})")
-        else:
-            print(f"⚠️  GUILD_ID={config.GUILD_ID} but bot isn't in that guild; using global sync.")
-            await bot.tree.sync()
-            
-            # Register persistent ticket panel view
-            from control_bot.tickets import TicketPanelView
-            bot.add_view(TicketPanelView())
+
+    # V8: initialize the customer DB and load the admin cog BEFORE the first
+    # sync so /admin appears for admins on this very sync (plan #3).
+    if _V8_LOADED:
+        try:
+            _cm.init_db()
+        except Exception as _e:
+            print(f"[V8] DB init warning: {_e}")
+        try:
+            await _load_admin_cog_once(bot)
+        except Exception as _e:
+            print(f"[V8] Admin cog warning: {_e}")
+
+    # One sync path for everything (guild + channel visibility), replacing the
+    # three copy-pasted sync blocks that used to live in here.
+    try:
+        await _sync_and_hide(bot)
+    except Exception as _e:
+        print(f"[CMD] Command sync warning: {type(_e).__name__}: {_e}")
+
+    # Persistent interaction views (registered once per process).
+    _register_persistent_views()
+
     # Start background tasks once; Discord can emit on_ready again after a
     # reconnect, and starting an already-running loop raises RuntimeError.
     if not refresh_dashboard.is_running():
@@ -356,14 +405,12 @@ async def on_ready():
             alt_id, reason="control startup", configured_ids=None,
         ))
 
-    # V8: restore DB from Gist, acquire startup lease, load admin cog,
-    # start subscription timer + operational monitors
+    # V8: restore DB from Gist, acquire startup lease, start subscription
+    # timer + operational monitors
     if _V8_LOADED:
-        try:
-            _cm.init_db()
-        except Exception as _e:
-            print(f"[V8] DB init warning: {_e}")
-        # 0.1 — Gist restore-on-startup + startup lock (run-ID lease)
+        # 0.1 — Gist restore-on-startup + startup lock (run-ID lease).
+        # A lost lease hard-exits the process (split-brain guard) — commands
+        # are already synced above, so the guild UX degrades gracefully.
         try:
             await _phase0_startup(bot)
         except Exception as _e:
@@ -375,32 +422,15 @@ async def on_ready():
             print("[V8] ✅ Subscription timer started.")
         except Exception as _e:
             print(f"[V8] Timer start warning: {_e}")
-        try:
-            import admin_commands as _ac
-            await _ac.setup(bot)
-            print("[V8] ✅ Admin cog loaded.")
-        except Exception as _e:
-            print(f"[V8] Admin cog warning: {_e}")
         # Phase 1.4 + Phase 2 monitors
         try:
             await _start_ops_monitors(bot)
         except Exception as _e:
             print(f"[V8] Ops monitor warning: {_e}")
-        # Re-sync to register the /admin command group
-        try:
-            if config.GUILD_ID:
-                guild = bot.get_guild(config.GUILD_ID)
-                if guild:
-                    bot.tree.copy_global_to(guild=guild)
-                    await bot.tree.sync(guild=guild)
-            else:
-                await bot.tree.sync()
-                
-            # Register persistent ticket panel view
-            from control_bot.tickets import TicketPanelView
-            bot.add_view(TicketPanelView())
-        except Exception as _e:
-            print(f"[V8] Post-cog sync warning: {_e}")
+        # V8 bug-fix plan #2: prune fleet alt mappings whose GitHub repository
+        # no longer exists so ghost "Alt N" health spam cannot come back.
+        # Fire-and-forget: startup latency and network errors must not block.
+        asyncio.create_task(_sweep_stale_fleet_alts())
 
 
 # ----- Phase 0 startup: Gist restore + lease + monitors -----
@@ -413,7 +443,7 @@ async def _phase0_startup(bot: "commands.Bot") -> None:
     """
     from gist_backup import (
         gist_configured, acquire_run_lease, register_alert_callback,
-        restore_db_from_gist, LAST_BACKUP, LAST_RESTORE,
+        restore_db_from_gist,
     )
     from control_bot import ops
 
@@ -461,7 +491,6 @@ async def _phase0_startup(bot: "commands.Bot") -> None:
             os._exit(1)  # hard abort: two writers would risk split-brain
 
     print(f"[V8] ✅ Startup lease acquired (run {run_id})")
-    _te_run_id = run_id
     import timer_engine as _te_mod
     _te_mod.set_run_id(run_id)
 
@@ -571,15 +600,19 @@ except Exception:
 
 
 # Role sets (V8 bug-fix F): slash commands are grouped by the viewer's tier so
-# /help and the interaction gate can apply one consistent rule per command.
-ROLE_ADMIN_COMMANDS = {"admin"}
-ROLE_VIP_COMMANDS = {"squad", "script", "vip"}
-ROLE_PUBLIC_COMMANDS = {"help", "getstarted"}
-ROLE_CUSTOMER_COMMANDS = {
-    "setup", "run", "stop", "pause", "resume", "tune", "channels",
-    "deals", "status", "reply", "refresh", "dashboard", "shutdown",
-    "alt", "renew", "pause-billing", "proofs",
-}
+# /help and the interaction gate apply one consistent rule per command. The
+# canonical definitions live in security.py (single source of truth shared by
+# /help filtering, the tier checks and the new channel gate, V8 bug-fix plan #1)
+# — these module-level aliases exist for back-compat with existing callers/tests.
+try:
+    from security import (  # noqa: F401  (re-exported for back-compat)
+        ADMIN_COMMANDS as ROLE_ADMIN_COMMANDS,
+        VIP_COMMANDS as ROLE_VIP_COMMANDS,
+        PUBLIC_COMMANDS as ROLE_PUBLIC_COMMANDS,
+        CUSTOMER_COMMANDS as ROLE_CUSTOMER_COMMANDS,
+    )
+except Exception:  # V8 modules unavailable → no tier filtering at all
+    ROLE_ADMIN_COMMANDS = ROLE_VIP_COMMANDS = ROLE_PUBLIC_COMMANDS = ROLE_CUSTOMER_COMMANDS = frozenset()
 
 
 def viewer_role(inter: discord.Interaction) -> str:
@@ -608,43 +641,76 @@ def viewer_role(inter: discord.Interaction) -> str:
             return "public"
 
 
-def commands_for_role(role: str) -> set[str]:
-    """Set of top-level command names visible to *role* (V8 bug-fix F)."""
-    if role == "admin":
-        return ROLE_ADMIN_COMMANDS | ROLE_VIP_COMMANDS | ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS
-    if role == "vip":
-        return ROLE_VIP_COMMANDS | ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS
-    if role == "customer":
-        return ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS
-    return set(ROLE_PUBLIC_COMMANDS)  # non-customers: /help + /getstarted only
+def commands_for_role(role: str) -> Optional[set[str]]:
+    """Top-level command names visible to *role* (V8 bug-fix F).
+
+    Delegates to the canonical tier model in ``security.allowed_commands_for_role``.
+    Returns ``None`` when the V8 modules are unavailable — callers treat that
+    as "no filtering" so a degraded deployment never shows a blank /help.
+    """
+    if _V8_LOADED:
+        try:
+            return set(_security.allowed_commands_for_role(role))
+        except Exception as exc:
+            print(f"[V8] role filter degraded ({type(exc).__name__}: {exc}); using fallback sets")
+            if role == "admin":
+                return set(ROLE_ADMIN_COMMANDS | ROLE_VIP_COMMANDS | ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS)
+            if role == "vip":
+                return set(ROLE_VIP_COMMANDS | ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS)
+            if role == "customer":
+                return set(ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS)
+            return set(ROLE_PUBLIC_COMMANDS)
+    return None  # no V8 stack → /help lists every registered command
+
+
+async def _ephemeral_reply(inter: discord.Interaction, msg: str) -> None:
+    """Send *msg* ephemerally via whichever response stage is still open."""
+    if inter.response.is_done():
+        await inter.followup.send(msg, ephemeral=True)
+    else:
+        await inter.response.send_message(msg, ephemeral=True)
 
 
 async def _cooldown_allowed(inter: discord.Interaction) -> bool:
     """Enforce the command cooldown; replies and returns False when hot."""
     cd = _on_cooldown(inter.user.id)
     if cd > 0:
-        msg = f"⏱️ Cooldown — wait {cd:.1f}s."
-        if inter.response.is_done():
-            await inter.followup.send(msg, ephemeral=True)
-        else:
-            await inter.response.send_message(msg, ephemeral=True)
+        await _ephemeral_reply(inter, f"⏱️ Cooldown — wait {cd:.1f}s.")
         return False
     return True
 
 
-async def _check_perms(inter: discord.Interaction, role: str = "owner") -> bool:
-    """Gate a slash command by *role* (V8 bug-fix F/J).
+async def _check_perms(
+    inter: discord.Interaction,
+    role: str = "owner",
+    command: Optional[str] = None,
+) -> bool:
+    """Gate a slash command by *role* (V8 bug-fix F/J) and channel context.
 
     role="owner"  → legacy behaviour: OWNER_IDS only (fail closed).
     role="customer" → admins OR active subscribers (subscription denial for
         everyone else — plan J).
     role="vip"    → admins OR active VIP subscribers.
+    command=<name> → additionally enforces the V8 channel-context policy
+        (plan #1): customer-tier commands are refused in public announcement
+        rooms, VIP-only rooms stay customer-safe, and bot owners bypass the
+        gate to keep operating from wherever setup requires. Denials use the
+        canonical "❌ This command is not available in this channel." message.
 
     The bot owner (config OWNER_IDS — the same allow-list security.py reads)
     always passes every role; the legacy cooldown keeps applying to owners.
     When the V8 modules are unavailable every role falls back to the legacy
     owner-only gate so deployments never open up accidentally.
     """
+    # Channel-context gate first (cheap, synchronous classification) so a
+    # wrong-room invocation never consumes the cooldown or hits the DB.
+    if command is not None and _V8_LOADED:
+        try:
+            if not await _security.enforce_channel_gate(inter, command):
+                return False
+        except AttributeError:
+            print("[V8] security.enforce_channel_gate missing; channel gate skipped.")
+
     # V8 role-aware gating.
     if _V8_LOADED and role in ("customer", "vip"):
         try:
@@ -666,11 +732,7 @@ async def _check_perms(inter: discord.Interaction, role: str = "owner") -> bool:
         # Non-owner on a customer command → the active-subscription denial
         # (never-customer case, V8 bug-fix J) is sent by the role gate above;
         # here we keep the legacy denial for non-V8 / owner-role paths.
-        msg = "🔒 You aren't authorized to run control commands."
-        if inter.response.is_done():
-            await inter.followup.send(msg, ephemeral=True)
-        else:
-            await inter.response.send_message(msg, ephemeral=True)
+        await _ephemeral_reply(inter, "🔒 You aren't authorized to run control commands.")
         return False
     if not await _cooldown_allowed(inter):
         return False
@@ -714,8 +776,8 @@ async def _hydrate_discord_state() -> None:
                         try:
                             async for m in thread.history(limit=10):
                                 messages.append(m)
-                        except Exception:
-                            pass
+                        except Exception as _ignored_exc:
+                            print(f"[BOT] _hydrate_discord_state: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         except Exception as exc:
             print(f"[STATE] Could not read channel {channel_id}: {type(exc).__name__}: {exc}")
             continue
@@ -1084,8 +1146,8 @@ class ChannelsView(discord.ui.View):
                 await asyncio.to_thread(github_api.set_repository_secret, repo, "CHANNEL_IDS", cids_csv)
             try:
                 asyncio.create_task(_send_control_wait_ack(self.alt_id, "!rescan", timeout=15))
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[BOT] _on_remove_channel: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         self._build_components()
         embed = self._build_embed()
         await inter.response.edit_message(embed=embed, view=self)
@@ -1206,8 +1268,8 @@ class FleetTuningView(discord.ui.View):
         try:
             asyncio.create_task(_send_control_wait_ack(self.alt_id, f"!policy {chosen_policy}", timeout=15))
             await _log_control(f"🛡️ Policy template **{chosen_policy.upper()}** dispatched to Alt {self.alt_id} from Fleet Tuning UI.")
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[BOT] _on_policy_select: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         await inter.response.edit_message(embed=self._build_embed(), view=self)
 
     async def _on_rescan(self, inter: discord.Interaction):
@@ -1618,6 +1680,74 @@ def _valid_repo_name(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?", value or ""))
 
 
+def _modal_value(item) -> str:
+    """Trimmed string value of a discord TextInput (or a raw string)."""
+    return str(getattr(item, "value", item) or "").strip()
+
+
+def _fleet_default_channels() -> list[str]:
+    """Fleet-level default channel IDs from CHANNEL_IDS (env or tuning JSON)."""
+    raw = os.environ.get("CHANNEL_IDS") or config._raw("CHANNEL_IDS")
+    return [c.strip() for c in (raw or "").split(",") if c.strip().isdigit()]
+
+
+def _resolve_new_alt_id(raw_aid: str) -> tuple[Optional[int], str]:
+    """Pick the alt slot for AltAddModal → ``(alt_id, error_text)``.
+
+    Explicit ids are validated against the 1–4 fleet window; when blank, the
+    first free slot wins. ``error_text`` is empty on success.
+    """
+    if raw_aid:
+        try:
+            alt_id = int(raw_aid)
+        except (TypeError, ValueError):
+            return None, "❌ Alt ID must be an integer between 1 and 4."
+    else:
+        free_ids = [i for i in (1, 2, 3, 4) if i not in state.alt_ids]
+        if not free_ids:
+            return None, "❌ All 4 alt slots are currently occupied. Remove one with `/alt action:remove` first."
+        alt_id = free_ids[0]
+    if alt_id not in {1, 2, 3, 4}:
+        return None, "❌ Alt ID must be between 1 and 4."
+    if alt_id in state.alt_ids:
+        return None, f"❌ Alt `{alt_id}` is already configured. Use `/alt action:update` to modify it."
+    return alt_id, ""
+
+
+def _resolve_fleet_repo(alt_id: int, detected_username: str, raw_repo: str) -> str:
+    """Repository slug for a new fleet alt (auto-created names round-robin)."""
+    if raw_repo:
+        return raw_repo if "/" in raw_repo else f"{config.GITHUB_OWNER}/{raw_repo}"
+    clean_slug_name = re.sub(r"[^a-zA-Z0-9_-]", "", detected_username.lower().replace(" ", "-")) or f"alt{alt_id}"
+    # V8 bug-fix (plan #1): auto-created alt repos round-robin onto
+    # the WORKER GitHub accounts — never the main account. github_api
+    # resolves the matching worker PAT for create/secret calls.
+    owner = _pick_fleet_repo_owner()
+    return f"{owner}/alt{alt_id}-{clean_slug_name}"
+
+
+def _resolve_inherited_channels(raw_channels: str) -> list[str]:
+    """Channel ids for a new alt: explicit list → fleet CHANNEL_IDS → a sibling.
+
+    Keeps new alts usable out of the box without hardcoding channel ids in
+    code: the fallbacks are read from the runtime configuration and the live
+    fleet state.
+    """
+    parsed = [c.strip() for c in raw_channels.split(",") if c.strip().isdigit()]
+    if parsed:
+        return parsed
+    parsed = _fleet_default_channels()
+    if parsed:
+        return parsed
+    for other_id in state.alt_ids:
+        o_alt = state.get(other_id)
+        if o_alt and o_alt.channels:
+            found = [str(c) for c in o_alt.channels.keys() if str(c).isdigit()]
+            if found:
+                return found
+    return []
+
+
 def _alt_registry_values(repos: dict[int, str], discord_ids: dict[int, int], names: dict[int, str]) -> dict[str, str]:
     """Build the aggregate core-secret values without including any token."""
     ids = sorted(set(repos) | set(discord_ids) | set(names))
@@ -1656,6 +1786,85 @@ def _apply_alt_registry(repos: dict[int, str], discord_ids: dict[int, int], name
     config.ALT_DISCORD_IDS.update(discord_ids)
     config.ALT_NAMES.clear()
     config.ALT_NAMES.update(names)
+
+
+def _registry_without(alts: list[int]) -> tuple[dict[int, str], dict[int, int], dict[int, str]]:
+    """Snapshot the live alt registries with *alts* removed."""
+    drop = {int(a) for a in alts}
+    repos = {aid: repo for aid, repo in dict(config.ALT_REPOS).items() if aid not in drop}
+    discord_ids = {aid: did for aid, did in dict(config.ALT_DISCORD_IDS).items() if aid not in drop}
+    names = {aid: nm for aid, nm in dict(config.ALT_NAMES).items() if aid not in drop}
+    return repos, discord_ids, names
+
+
+async def _drop_alts_from_everywhere(
+    alts: list[int],
+) -> tuple[bool, str]:
+    """Prune alt IDs from secrets, in-memory config, live state and the
+    persisted state file — the ONLY sanctioned way to retire an alt.
+
+    V8 bug-fix plan #2: alt removal used to touch some of these stores but not
+    all of them, so a "deleted" alt could resurface as a ghost (stale heartbeat
+    alerts, /alt listings) after a restart or from the JSON state snapshot.
+    Returns (persisted_ok, detail).
+    """
+    if not alts:
+        return True, "nothing to prune"
+    repos, discord_ids, names = _registry_without(alts)
+    persisted, detail = await _persist_alt_registry(repos, discord_ids, names)
+    if not persisted:
+        return False, detail
+    _apply_alt_registry(repos, discord_ids, names)
+    for alt_id in alts:
+        if state.get(alt_id):
+            state.remove_alt(alt_id)
+    return True, detail
+
+
+async def _sweep_stale_fleet_alts(*, prune: bool = True) -> dict:
+    """Verify every ALT_REPOS mapping still has a live GitHub repo (plan #2).
+
+    Repos deleted directly on GitHub (or left over from an old installation)
+    keep the fleet — and with it the health monitor, /alt and the startup
+    banner — talking about alts that no longer exist. This sweep runs once
+    after boot and removes only *confirmed* 404 mappings; any API hiccup is
+    logged and the entry is kept, so a rate limit can never delete a live alt.
+    """
+    summary: dict[str, Any] = {"checked": 0, "pruned": [], "kept": 0, "skipped": 0}
+    if not config.GITHUB_TOKEN or not config.ALT_REPOS:
+        summary["note"] = "no token or no fleet mapping to verify"
+        return summary
+    missing: list[int] = []
+    for alt_id, repo in sorted(dict(config.ALT_REPOS).items()):
+        try:
+            exists, detail = await asyncio.to_thread(github_api.repository_exists, repo)
+        except Exception as exc:
+            summary["skipped"] += 1
+            print(f"[SWEEP] repo check for alt {alt_id} (`{repo}`) failed: "
+                  f"{type(exc).__name__}: {exc} — keeping mapping.")
+            continue
+        summary["checked"] += 1
+        if exists:
+            summary["kept"] += 1
+        elif "not found" in str(detail).lower():
+            missing.append(int(alt_id))
+        else:
+            summary["skipped"] += 1
+            print(f"[SWEEP] alt {alt_id} (`{repo}`) unverifiable ({detail}) — keeping mapping.")
+    if not missing:
+        return summary
+    summary["pruned"] = missing
+    if not prune:
+        return summary
+    ok, detail = await _drop_alts_from_everywhere(missing)
+    text = (
+        f"🧹 **Fleet sweep** — {len(missing)} stale alt mapping(s) pruned: "
+        f"alts {', '.join(str(a) for a in missing)} (repositories deleted upstream). "
+        + ("Registry secrets updated." if ok else f"⚠️ Persist failed: {detail}")
+    )
+    print(f"[SWEEP] {text}")
+    await _log_control(text)
+    return summary
 
 
 async def _log_alt_add_event(alt_id: int, ok: bool, text: str, *, name: str = "Alt") -> None:
@@ -1722,11 +1931,14 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
     )
 
     async def on_submit(self, inter: discord.Interaction):
+        """Add a fleet alt: verify token → allocate slot → provision repo →
+        persist registry. (V8 cleanup: slot/repo/channel resolution split out
+        into the module-level ``_resolve_*`` helpers so each rule is reusable
+        and unit-testable.)"""
         if not _is_operator(inter):
             await inter.response.send_message("🔒 You aren't authorized to manage alts.", ephemeral=True)
             return
-        def value(item) -> str:
-            return str(getattr(item, "value", item) or "").strip()
+        value = _modal_value
         token = value(self.user_token)
         if not token:
             await _log_alt_add_event(0, False, "Alt add failed: user token is required.")
@@ -1745,27 +1957,11 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
         detected_username = str(profile.get("username") or "alt")
         detected_name = str(profile.get("global_name") or profile.get("username") or "alt")
 
-        # 2. Resolve Alt ID
-        raw_aid = value(self.alt_id)
-        if raw_aid:
-            try:
-                alt_id = int(raw_aid)
-            except (TypeError, ValueError):
-                await _log_alt_add_event(0, False, f"Alt add failed: invalid Alt ID '{raw_aid}'.")
-                return await inter.followup.send("❌ Alt ID must be an integer between 1 and 4.", ephemeral=True)
-        else:
-            free_ids = [i for i in (1, 2, 3, 4) if i not in state.alt_ids]
-            if not free_ids:
-                await _log_alt_add_event(0, False, "Alt add failed: all 4 alt slots are occupied.")
-                return await inter.followup.send("❌ All 4 alt slots are currently occupied. Remove one with `/alt action:remove` first.", ephemeral=True)
-            alt_id = free_ids[0]
-
-        if alt_id not in {1, 2, 3, 4}:
-            await _log_alt_add_event(0, False, f"Alt add failed: Alt ID {alt_id} is outside 1-4.")
-            return await inter.followup.send("❌ Alt ID must be between 1 and 4.", ephemeral=True)
-        if alt_id in state.alt_ids:
-            await _log_alt_add_event(0, False, f"Alt add failed: Alt {alt_id} already configured.")
-            return await inter.followup.send(f"❌ Alt `{alt_id}` is already configured. Use `/alt action:update` to modify it.", ephemeral=True)
+        # 2. Resolve Alt ID (explicit or first free slot, validated)
+        alt_id, alt_id_err = _resolve_new_alt_id(value(self.alt_id))
+        if alt_id is None:
+            await _log_alt_add_event(0, False, f"Alt add failed: {alt_id_err.lstrip('❌ ')}")
+            return await inter.followup.send(alt_id_err, ephemeral=True)
 
         # 3. Resolve Display Name & Discord User ID
         custom_name = value(self.name)
@@ -1775,33 +1971,9 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
         custom_did = value(getattr(self, "discord_user_id", None))
         did = custom_did if (custom_did and custom_did.isdigit()) else detected_did
 
-        # 4. Resolve Repository (auto-create if blank or missing)
-        raw_repo = value(self.repository)
-        if raw_repo:
-            repo = raw_repo if "/" in raw_repo else f"{config.GITHUB_OWNER}/{raw_repo}"
-        else:
-            clean_slug_name = re.sub(r"[^a-zA-Z0-9_-]", "", detected_username.lower().replace(" ", "-")) or f"alt{alt_id}"
-            # V8 bug-fix (plan #1): auto-created alt repos round-robin onto
-            # the WORKER GitHub accounts — never the main account. github_api
-            # resolves the matching worker PAT for create/secret calls.
-            owner = _pick_fleet_repo_owner()
-            repo = f"{owner}/alt{alt_id}-{clean_slug_name}"
-
-        # Resolve Advertising Channels (inherit from fleet if blank)
-        raw_channels = value(getattr(self, "channels", None))
-        parsed_channels = [c.strip() for c in raw_channels.split(",") if c.strip().isdigit()]
-        if not parsed_channels:
-            fleet_chs = os.environ.get("CHANNEL_IDS") or config._raw("CHANNEL_IDS")
-            if fleet_chs:
-                parsed_channels = [c.strip() for c in fleet_chs.split(",") if c.strip().isdigit()]
-            if not parsed_channels:
-                for other_id in state.alt_ids:
-                    o_alt = state.get(other_id)
-                    if o_alt and o_alt.channels:
-                        parsed_channels = [str(c) for c in o_alt.channels.keys() if str(c).isdigit()]
-                        if parsed_channels:
-                            break
-
+        # 4. Resolve repository + channels (auto-create/inherit when blank)
+        repo = _resolve_fleet_repo(alt_id, detected_username, value(self.repository))
+        parsed_channels = _resolve_inherited_channels(value(getattr(self, "channels", None)))
         channels_csv = ",".join(parsed_channels)
 
         # 5. Auto-create repo on GitHub, upload templates, and populate secrets
@@ -1864,8 +2036,7 @@ class AltUpdateModal(discord.ui.Modal):
         if not state.get(alt_id):
             await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
             return
-        def value(item) -> str:
-            return str(getattr(item, "value", item) or "").strip()
+        value = _modal_value
         old_repo = config.ALT_REPOS.get(alt_id, "")
         raw_repo = value(self.repository)
         repo = raw_repo or old_repo
@@ -2337,9 +2508,7 @@ async def _execute_run_dispatch(inter: discord.Interaction, values: dict[str, st
                 if active_chs:
                     break
     if not active_chs:
-        fleet_raw = os.environ.get("CHANNEL_IDS") or config._raw("CHANNEL_IDS")
-        if fleet_raw:
-            active_chs = [c.strip() for c in fleet_raw.split(",") if c.strip().isdigit()]
+        active_chs = _fleet_default_channels()
 
     ch1 = active_chs[0] if active_chs else ""
     ch2 = active_chs[1] if len(active_chs) > 1 else ""
@@ -2646,7 +2815,7 @@ async def _handle_simulate_listing(inter: discord.Interaction, alt: int, sample_
 
 @bot.tree.command(name="run", description="Launch Ad Run — pick alt, enter ad text, preview & confirm dispatch")
 async def cmd_run(inter: discord.Interaction):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="run"):
         return
     if not state.alt_ids:
         await inter.response.send_message(
@@ -2685,8 +2854,8 @@ async def cmd_getstarted(inter: discord.Interaction):
                 embed.set_footer(text="AdFarm V8 · /getstarted")
                 await inter.response.send_message(embed=embed, ephemeral=True)
                 return
-        except Exception:
-            pass  # DB hiccup → fall through to the full guide
+        except Exception as exc:
+            print(f"[BOT] /getstarted customer check skipped (DB hiccup): {type(exc).__name__}: {exc}")
     embed = discord.Embed(
         title="🚀 Get Started — V8 Ad Farm Quick-Start Guide",
         description=(
@@ -2776,8 +2945,8 @@ async def _run_script_sandbox(inter: discord.Interaction, script: str, *, execut
     await inter.followup.send(**send_kwargs)
     try:
         await _log_control(f"{'▶️' if execute else '🧪'} Script {label} completed: code={result.get('code')}, timed_out={result.get('timed_out')}.")
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] _run_script_sandbox: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 @bot.tree.command(name="script", description="Scripting — simulate dry-runs or execute Python in a sandbox")
@@ -2792,7 +2961,7 @@ async def _run_script_sandbox(inter: discord.Interaction, script: str, *, execut
     ]
 )
 async def cmd_script(inter: discord.Interaction, action: Literal["simulate", "run"], code: str):
-    if not await _check_perms(inter, role="vip"):
+    if not await _check_perms(inter, role="vip", command="script"):
         return
     await _run_script_sandbox(inter, code, execute=(action == "run"), label=action)
 
@@ -2800,7 +2969,7 @@ async def cmd_script(inter: discord.Interaction, action: Literal["simulate", "ru
 @bot.tree.command(name="shutdown", description="Shutdown — stop all alts and terminate the bot (requires SHUTDOWN)")
 @app_commands.describe(confirmation="Type SHUTDOWN to confirm")
 async def cmd_shutdown(inter: discord.Interaction, confirmation: str):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="shutdown"):
         return
     if str(confirmation or "").strip().upper() != "SHUTDOWN":
         return await inter.response.send_message("❌ Type `SHUTDOWN` exactly in the confirmation field to confirm shutdown.", ephemeral=True)
@@ -2836,14 +3005,14 @@ async def cmd_shutdown(inter: discord.Interaction, confirmation: str):
     await asyncio.sleep(min(config.SHUTDOWN_GRACE_SEC, 5))
     try:
         await bot.close()
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] cmd_shutdown: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 @bot.tree.command(name="stop", description="Stop Ad Run — sends stop command via Gist queue and cancels the GitHub Actions workflow (~30-45s).")
 @app_commands.describe(alt="Target alt ID to stop")
 async def cmd_stop(inter: discord.Interaction, alt: int):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="stop"):
         return
     a = state.get(alt)
     if not a:
@@ -2862,7 +3031,7 @@ async def cmd_stop(inter: discord.Interaction, alt: int):
 @bot.tree.command(name="pause", description="Pause Posting — temporarily halt ad delivery on all channels without stopping the GitHub runner.")
 @app_commands.describe(alt="Target alt ID to pause (or choose specific alt)")
 async def cmd_pause(inter: discord.Interaction, alt: int):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="pause"):
         return
     await _finish_dm_control(inter, alt, "!pause", "pause requested")
 
@@ -2870,7 +3039,7 @@ async def cmd_pause(inter: discord.Interaction, alt: int):
 @bot.tree.command(name="resume", description="Resume Posting — unpause ad delivery and restore the regular posting schedule.")
 @app_commands.describe(alt="Target alt ID to resume (or choose specific alt)")
 async def cmd_resume(inter: discord.Interaction, alt: int):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="resume"):
         return
     await _finish_dm_control(inter, alt, "!resume", "resume requested")
 
@@ -2916,7 +3085,7 @@ async def cmd_alt(
     kind: Optional[Literal["ALL", "ERROR", "DEAL", "CONTROL", "CHANNEL", "CAUTION", "DEBUG"]] = "ALL",
     search: Optional[str] = None,
 ):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="alt"):
         return
 
     # V8 bug-fix (plan #4): /alt must only ever show alts that belong to the
@@ -3043,7 +3212,7 @@ async def cmd_tune(
     runtime: Optional[Literal[6, 12, 18, 24, 48]] = None,
     image: Optional[discord.Attachment] = None,
 ):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="tune"):
         return
 
     has_params = any((policy, price, mode, message, interval, runtime, image))
@@ -3148,10 +3317,10 @@ async def _fetch_control_server_catalogue() -> list[dict[str, Any]]:
             if fetch_channels:
                 try:
                     channels = list(await fetch_channels())
-                except Exception:
+                except Exception as _ignored_exc:
                     # Cached channels are still useful when a transient API
                     # call fails; the caller logs the exact partial inventory.
-                    pass
+                    print(f"[BOT] _fetch_control_server_catalogue: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             rows = []
             for channel in channels:
                 channel_type = getattr(channel, "type", None)
@@ -3272,6 +3441,148 @@ def _set_channels_state(alt_id: int, cids: list[str], names: dict[str, str] | No
     return len(a_obj.channels) if a_obj else 0
 
 
+def _snapshot_channel_table(alt_id: int) -> tuple[list[str], dict[str, str]]:
+    """Current (ids, names) channel table of an alt — the rollback baseline."""
+    alt_obj = state.get(alt_id)
+    old_ids = list(alt_obj.channels.keys()) if alt_obj else []
+    old_names = {
+        str(key): str(raw.get("name") or "")
+        for key, raw in (alt_obj.channels.items() if alt_obj else [])
+        if isinstance(raw, dict)
+    }
+    return old_ids, old_names
+
+
+def _rollback_capable_update(alt_id: int, apply_fn: Callable[[], Any]):
+    """Build the ``update`` callback used by every mutating /channels action.
+
+    Local mutation → secret persistence; if the secret push fails, the local
+    table is rolled back so Discord state and the repository secret can never
+    diverge. Single source of the pattern previously copy-pasted three times
+    (V8 manager cleanup).
+    """
+    old_ids, old_names = _snapshot_channel_table(alt_id)
+
+    async def _update():
+        result = apply_fn()
+        if result is False:
+            raise RuntimeError("local channel state could not be persisted")
+        persist_ok, persist_msg = await _persist_channels_for_alt(alt_id)
+        if not persist_ok:
+            state.replace_channels(alt_id, old_ids, old_names)
+            raise RuntimeError(persist_msg)
+        return True
+
+    return _update
+
+
+async def _channels_action_list(inter: discord.Interaction, alt_id: int) -> None:
+    a_obj = state.get(alt_id)
+    if not a_obj:
+        return await _ephemeral_reply(inter, "❓ Unknown alt.")
+    rows = [f"`{cid}` {raw.get('name', '')}".rstrip() for cid, raw in list(a_obj.channels.items())[:100]]
+    text = f"**Channel table for {a_obj.name}** (`{len(a_obj.channels)}`):\n```\n" + "\n".join(rows) + "\n```"
+    return await inter.response.send_message(text[:4000], ephemeral=True)
+
+
+async def _channels_action_remove(inter: discord.Interaction, alt_id: int, cid: str) -> None:
+    a_obj = state.get(alt_id)
+    if not a_obj or cid not in a_obj.channels:
+        return await _ephemeral_reply(inter, f"❌ Channel `{cid}` is not in Alt {alt_id}'s table.")
+    old_ids, old_names = _snapshot_channel_table(alt_id)
+    remaining = [item for item in old_ids if item != cid]
+    await _finish_dm_control(
+        inter, alt_id, f"!setchannels {','.join(remaining) or 'clear'}",
+        f"channel `{cid}` removal queued",
+        update=_rollback_capable_update(
+            alt_id,
+            lambda: state.replace_channels(alt_id, remaining, old_names),
+        ),
+    )
+    await _log_control(
+        f"🗑️ Removed channel `{cid}` from Alt {alt_id} ({a_obj.name}); exact prior target count={len(old_ids)}."
+    )
+
+
+async def _channels_action_overwrite(inter: discord.Interaction, alt_id: int, cids: list[str]) -> None:
+    a_obj = state.get(alt_id)
+    if not a_obj:
+        return await _ephemeral_reply(inter, "❓ Unknown alt.")
+    old_ids, _ = _snapshot_channel_table(alt_id)
+    await _finish_dm_control(
+        inter, alt_id, f"!setchannels {','.join(cids)}",
+        f"channel table overwrite queued for `{len(cids)}` target(s)",
+        update=_rollback_capable_update(alt_id, lambda: state.replace_channels(alt_id, cids)),
+    )
+    await _log_control(
+        f"♻️ Alt {alt_id} ({a_obj.name}) channel table overwrite requested: "
+        f"old=[{','.join(old_ids) or 'none'}] new=[{','.join(cids)}]."
+    )
+
+
+async def _channels_action_refresh(inter: discord.Interaction, alt_id: int, action: str) -> None:
+    current_ids = list(state.get(alt_id).channels.keys()) if state.get(alt_id) else []
+
+    async def _refresh_and_persist():
+        result = await _reconcile_control_channels(
+            alt_id,
+            reason="refresh" if action == "refresh" else "rescan",
+            configured_ids=current_ids or None,
+        )
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error", "live channel inventory unavailable"))
+        return True
+
+    return await _finish_dm_control(
+        inter, alt_id, "!rescan",
+        "live channel inventory refreshed and durable registry reconciled",
+        update=_refresh_and_persist,
+    )
+
+
+async def _channels_action_add(inter: discord.Interaction, alt_id: int, cid: str, label: str) -> None:
+    return await _finish_dm_control(
+        inter, alt_id, f"!setchannel {cid}{(' ' + label) if label else ''}",
+        f"channel ID queued for remote validation: `{cid}`",
+        update=_rollback_capable_update(alt_id, lambda: state.set_channel(alt_id, cid, label)),
+    )
+
+
+async def _channels_action_replace(
+    inter: discord.Interaction, alt_id: int, old_id: str, new_id: str, label: str
+) -> None:
+    return await _finish_dm_control(
+        inter, alt_id, f"!replacechannel {old_id} {new_id}{(' ' + label) if label else ''}",
+        f"channel replacement queued for remote validation: `{old_id}` → `{new_id}`",
+        update=_rollback_capable_update(alt_id, lambda: state.replace_channel(alt_id, old_id, new_id, label)),
+    )
+
+
+async def _channels_action_reset_caution(inter: discord.Interaction, alt_id: int, cid: str) -> None:
+    specific = bool(cid and cid.lower() != "all")
+    target_cmd = f"!resetcaution {cid}" if cid else "!resetcaution all"
+    label = f"reset caution on channel {cid}" if specific else "reset caution on all channels"
+    return await _finish_dm_control(
+        inter, alt_id, target_cmd, label,
+        update=lambda: state.reset_caution(alt_id, cid if specific else None),
+    )
+
+
+def _parse_channel_overwrite_list(raw: str) -> tuple[Optional[list[str]], str]:
+    """Validate the comma-separated overwrite input → ``(cids, error_text)``.
+
+    Accepts both ASCII and full-width commas (users paste from Discord).
+    ``error_text`` is empty on success.
+    """
+    cids = [x.strip() for x in (raw or "").replace(",", ",").split(",") if x.strip()]
+    if not cids or not all(x.isdigit() for x in cids):
+        return None, "❌ Every channel ID must be numeric."
+    # V8 bug-fix M: the per-alt cap is 10 channels — enforced on overwrite too.
+    if len(cids) > _MAX_CHANNELS_PER_ALT:
+        return None, _channel_limit_message(_MAX_CHANNELS_PER_ALT)
+    return cids, ""
+
+
 @bot.tree.command(name="channels", description="Channel Manager — add, replace, remove, or refresh trading channels")
 @app_commands.describe(
     alt="Target alt ID",
@@ -3301,156 +3612,65 @@ async def cmd_channels(
     new_channel_id: Optional[str] = None,
     name: Optional[str] = "",
 ):
-    if not await _check_perms(inter, role="customer"):
+    """Channel Manager — validates input here, delegates to focused actions.
+
+    V8 manager cleanup: the 163-line mega-handler was decomposed per action and
+    the triple-duplicated "mutate → persist → rollback" closure became
+    :func:`_rollback_capable_update`.
+    """
+    if not await _check_perms(inter, role="customer", command="channels"):
         return
 
     chosen_alt = alt if (alt and alt in state.alt_ids) else (state.alt_ids[0] if state.alt_ids else 1)
 
     if action == "list":
-        a_obj = state.get(chosen_alt)
-        if not a_obj:
-            return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-        rows = [f"`{cid}` {raw.get('name', '')}".rstrip() for cid, raw in list(a_obj.channels.items())[:100]]
-        text = f"**Channel table for {a_obj.name}** (`{len(a_obj.channels)}`):\n```\n" + "\n".join(rows) + "\n```"
-        return await inter.response.send_message(text[:4000], ephemeral=True)
+        return await _channels_action_list(inter, chosen_alt)
 
     if action == "remove":
         if not channel_id or not channel_id.strip().isdigit():
-            return await inter.response.send_message("❌ A numeric `channel_id` is required to remove.", ephemeral=True)
-        cid = channel_id.strip()
-        a_obj = state.get(chosen_alt)
-        if not a_obj or cid not in a_obj.channels:
-            return await inter.response.send_message(f"❌ Channel `{cid}` is not in Alt {chosen_alt}'s table.", ephemeral=True)
-        old_ids = list(a_obj.channels.keys())
-        old_names = {str(key): str(raw.get("name") or "") for key, raw in a_obj.channels.items() if isinstance(raw, dict)}
-        async def _remove_and_persist():
-            if not state.replace_channels(chosen_alt, [item for item in old_ids if item != cid], old_names):
-                raise RuntimeError("local channel state could not be persisted")
-            persist_ok, persist_msg = await _persist_channels_for_alt(chosen_alt)
-            if not persist_ok:
-                # Do not leave local state divergent from the repository secret.
-                state.replace_channels(chosen_alt, old_ids, old_names)
-                raise RuntimeError(persist_msg)
-            return True
-        await _finish_dm_control(
-            inter, chosen_alt, f"!setchannels {','.join(item for item in old_ids if item != cid) or 'clear'}",
-            f"channel `{cid}` removal queued", update=_remove_and_persist,
-        )
-        await _log_control(f"🗑️ Removed channel `{cid}` from Alt {chosen_alt} ({a_obj.name}); exact prior target count={len(old_ids)}.")
-        return
+            return await _ephemeral_reply(inter, "❌ A numeric `channel_id` is required to remove.")
+        return await _channels_action_remove(inter, chosen_alt, channel_id.strip())
 
     if action == "overwrite":
         raw = (channel_id or "").strip()
         if not raw:
-            return await inter.response.send_message("❌ Provide a comma-separated list of channel IDs, e.g. `/channels alt:1 action:overwrite channel_id:111,222,333`.", ephemeral=True)
-        cids = [x.strip() for x in raw.replace(",", ",").split(",") if x.strip()]
-        if not cids or not all(x.isdigit() for x in cids):
-            return await inter.response.send_message("❌ Every channel ID must be numeric.", ephemeral=True)
-        # V8 bug-fix M: the per-alt cap is 10 channels — enforced on overwrite too.
-        if len(cids) > _MAX_CHANNELS_PER_ALT:
-            return await inter.response.send_message(
-                _channel_limit_message(_MAX_CHANNELS_PER_ALT), ephemeral=True
+            return await _ephemeral_reply(
+                inter,
+                "❌ Provide a comma-separated list of channel IDs, e.g. `/channels alt:1 action:overwrite channel_id:111,222,333`.",
             )
-        a_obj = state.get(chosen_alt)
-        if not a_obj:
-            return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
-        old_ids = list(a_obj.channels.keys())
-        old_names = {str(key): str(raw.get("name") or "") for key, raw in a_obj.channels.items() if isinstance(raw, dict)}
-
-        async def _apply_overwrite():
-            if not state.replace_channels(chosen_alt, cids):
-                raise RuntimeError("local channel state could not be persisted")
-            persist_ok, persist_msg = await _persist_channels_for_alt(chosen_alt)
-            if not persist_ok:
-                state.replace_channels(chosen_alt, old_ids, old_names)
-                raise RuntimeError(persist_msg)
-            return True
-
-        await _finish_dm_control(
-            inter, chosen_alt, f"!setchannels {','.join(cids)}",
-            f"channel table overwrite queued for `{len(cids)}` target(s)",
-            update=_apply_overwrite,
-        )
-        await _log_control(
-            f"♻️ Alt {chosen_alt} ({a_obj.name}) channel table overwrite requested: "
-            f"old=[{','.join(old_ids) or 'none'}] new=[{','.join(cids)}]."
-        )
-        return
+        cids, err = _parse_channel_overwrite_list(raw)
+        if cids is None:
+            return await _ephemeral_reply(inter, err)
+        return await _channels_action_overwrite(inter, chosen_alt, cids)
 
     if action in {"refresh", "rescan"}:
-        current_ids = list(state.get(chosen_alt).channels.keys()) if state.get(chosen_alt) else []
-        async def _refresh_and_persist():
-            result = await _reconcile_control_channels(
-                chosen_alt,
-                reason="refresh" if action == "refresh" else "rescan",
-                configured_ids=current_ids or None,
-            )
-            if not result.get("ok"):
-                raise RuntimeError(result.get("error", "live channel inventory unavailable"))
-            return True
-        return await _finish_dm_control(
-            inter, chosen_alt, "!rescan",
-            "live channel inventory refreshed and durable registry reconciled",
-            update=_refresh_and_persist,
-        )
+        return await _channels_action_refresh(inter, chosen_alt, action)
 
     if action == "add":
         if not channel_id or not channel_id.strip().isdigit():
-            return await inter.response.send_message("❌ Valid numeric `channel_id` is required to add a channel.", ephemeral=True)
+            return await _ephemeral_reply(inter, "❌ Valid numeric `channel_id` is required to add a channel.")
         cid = channel_id.strip()
         label = re.sub(r"[\r\n]", " ", (name or "").strip())[:80]
         a_obj = state.get(chosen_alt)
         old_ids = list(a_obj.channels.keys()) if a_obj else []
         # V8 bug-fix M: adding past the 10-channel per-alt cap is rejected.
         if len(old_ids) >= _MAX_CHANNELS_PER_ALT:
-            return await inter.response.send_message(
-                _channel_limit_message(_MAX_CHANNELS_PER_ALT), ephemeral=True
-            )
-        old_names = {str(key): str(raw.get("name") or "") for key, raw in (a_obj.channels.items() if a_obj else []) if isinstance(raw, dict)}
-        async def _update_and_persist():
-            state.set_channel(chosen_alt, cid, label)
-            persist_ok, persist_msg = await _persist_channels_for_alt(chosen_alt)
-            if not persist_ok:
-                state.replace_channels(chosen_alt, old_ids, old_names)
-                raise RuntimeError(persist_msg)
-            return True
-        return await _finish_dm_control(
-            inter, chosen_alt, f"!setchannel {cid}{(' ' + label) if label else ''}", f"channel ID queued for remote validation: `{cid}`",
-            update=_update_and_persist,
-        )
+            return await _ephemeral_reply(inter, _channel_limit_message(_MAX_CHANNELS_PER_ALT))
+        return await _channels_action_add(inter, chosen_alt, cid, label)
 
     elif action == "replace":
         if not channel_id or not new_channel_id or not channel_id.strip().isdigit() or not new_channel_id.strip().isdigit():
-            return await inter.response.send_message("❌ Both `channel_id` (old) and `new_channel_id` must be numeric.", ephemeral=True)
-        old_id = channel_id.strip()
-        new_id = new_channel_id.strip()
+            return await _ephemeral_reply(inter, "❌ Both `channel_id` (old) and `new_channel_id` must be numeric.")
         label = re.sub(r"[\r\n]", " ", (name or "").strip())[:80]
-        a_obj = state.get(chosen_alt)
-        old_ids = list(a_obj.channels.keys()) if a_obj else []
-        old_names = {str(key): str(raw.get("name") or "") for key, raw in (a_obj.channels.items() if a_obj else []) if isinstance(raw, dict)}
-        async def _replace_and_persist():
-            state.replace_channel(chosen_alt, old_id, new_id, label)
-            persist_ok, persist_msg = await _persist_channels_for_alt(chosen_alt)
-            if not persist_ok:
-                state.replace_channels(chosen_alt, old_ids, old_names)
-                raise RuntimeError(persist_msg)
-            return True
-        return await _finish_dm_control(
-            inter, chosen_alt, f"!replacechannel {old_id} {new_id}{(' ' + label) if label else ''}",
-            f"channel replacement queued for remote validation: `{old_id}` → `{new_id}`",
-            update=_replace_and_persist,
+        return await _channels_action_replace(
+            inter, chosen_alt, channel_id.strip(), new_channel_id.strip(), label
         )
 
     elif action == "reset_caution":
         cid = (channel_id or "").strip()
         if cid and not cid.isdigit() and cid.lower() != "all":
-            return await inter.response.send_message("❌ Channel ID must contain digits only, or leave blank / pass 'all'.", ephemeral=True)
-        target_cmd = f"!resetcaution {cid}" if cid else "!resetcaution all"
-        label = f"reset caution on channel {cid}" if (cid and cid.lower() != "all") else "reset caution on all channels"
-        return await _finish_dm_control(
-            inter, chosen_alt, target_cmd, label,
-            update=lambda: state.reset_caution(chosen_alt, cid if (cid and cid.lower() != "all") else None),
-        )
+            return await _ephemeral_reply(inter, "❌ Channel ID must contain digits only, or leave blank / pass 'all'.")
+        return await _channels_action_reset_caution(inter, chosen_alt, cid)
 
     # Default: Interactive Channels UI
     view = ChannelsView(owner_id=inter.user.id, alt_id=chosen_alt)
@@ -3480,7 +3700,7 @@ async def cmd_deals(
     keywords: Optional[str] = None,
     sample_listing: Optional[str] = None,
 ):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="deals"):
         return
 
     target_aid = alt if alt != 0 else (state.alt_ids[0] if state.alt_ids else 1)
@@ -3557,7 +3777,7 @@ async def cmd_squad(
     alt: Optional[int] = 0,
     value: Optional[str] = None,
 ):
-    if not await _check_perms(inter, role="vip"):
+    if not await _check_perms(inter, role="vip", command="squad"):
         return
 
     if action in (None, "overview", "list") and not squad_name:
@@ -3651,7 +3871,7 @@ async def cmd_squad(
 @bot.tree.command(name="status", description="Live Status — fleet-wide dashboard or single-alt diagnostic card")
 @app_commands.describe(alt="Target alt (or 0 for All alts)")
 async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="status"):
         return
     await _fresh_state()
     if alt == 0:
@@ -3663,7 +3883,7 @@ async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
 @bot.tree.command(name="reply", description="DM Relay — send a message through an alt account directly to a buyer's DM.")
 @app_commands.describe(alt="Alt ID to send from", user="Buyer Discord User ID (from #dm-inbox)", text="Message text to send (leave blank for multiline editor)")
 async def cmd_reply(inter: discord.Interaction, alt: Optional[int] = 1, user: Optional[str] = "", text: Optional[str] = None):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="reply"):
         return
     if not text:
         return await inter.response.send_modal(BuyerReplyModal(alt_id=alt or 1, user_id=user or ""))
@@ -3690,7 +3910,7 @@ async def cmd_reply(inter: discord.Interaction, alt: Optional[int] = 1, user: Op
 
 @bot.tree.command(name="refresh", description="Force Refresh — instantly poll latest GitHub workflow states and update the dashboard.")
 async def cmd_refresh(inter: discord.Interaction):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="refresh"):
         return
     await inter.response.defer(ephemeral=True)
     await _fresh_state()
@@ -3700,7 +3920,7 @@ async def cmd_refresh(inter: discord.Interaction):
 
 @bot.tree.command(name="dashboard", description="Dashboard — post a fresh live status snapshot (health, sent/errors, channels, deals) to #dashboard.")
 async def cmd_dashboard(inter: discord.Interaction):
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="dashboard"):
         return
     await inter.response.defer(ephemeral=True)
     await _fresh_state()
@@ -3863,6 +4083,14 @@ _COMMAND_GUIDE = {
         "This command reference — shows usage, arguments, and "
         "descriptions for every registered command."
     ),
+    "reset": (
+        "`/reset confirmation:RESET`",
+        "FACTORY RESET (admin only) — wipes every customer record, stored "
+        "alt credential, run state and the fleet ALT_REPOS/ALT_NAMES mapping "
+        "(core secrets included), then cancels active workflows. Use it after "
+        "deleting alt repos manually so no ghost alts resurface. Channels and "
+        "repos themselves are untouched."
+    ),
 }
 
 
@@ -3876,7 +4104,7 @@ async def cmd_help(inter: discord.Interaction):
     listed.
     """
     role = viewer_role(inter)
-    allowed = commands_for_role(role)
+    allowed = commands_for_role(role)  # None → no tier filtering (degraded V8)
 
     registered = {cmd.name: cmd for cmd in bot.tree.get_commands()}
 
@@ -3888,7 +4116,7 @@ async def cmd_help(inter: discord.Interaction):
         ("👥 Alt Management", ["alt"]),
         ("⭐ VIP Features", ["vip"]),
         ("💳 Billing & Proofs", ["renew", "pause-billing", "proofs"]),
-        ("🔧 Admin Panel", ["admin"]),
+        ("🔧 Admin Panel", ["admin", "reset"]),
         ("🖥️ System", ["script", "shutdown", "refresh", "dashboard"]),
     ]
 
@@ -3900,7 +4128,7 @@ async def cmd_help(inter: discord.Interaction):
             timestamp=datetime.now(timezone.utc),
         )
         for name in cmd_names:
-            if name not in allowed:
+            if allowed is not None and name not in allowed:
                 continue  # hide commands above the viewer's tier (bug-fix F)
             if name not in registered:
                 continue
@@ -3931,7 +4159,12 @@ async def cmd_help(inter: discord.Interaction):
                     "**How it works:** `/setup` → `/run` → farm posts 24/7 → "
                     "auto-renews every 48h while your subscription is active.\n\n"
                     "**Need help?** Run `/getstarted` for a step-by-step guide, "
-                    "or contact an admin in `#open-ticket`."
+                    "or contact an admin in `#open-ticket`.\n\n"
+                    "**Channels matter:** commands are channel-aware — customer "
+                    "commands run in your forum rooms (`#control`, `#dashboard`, …), "
+                    "VIP commands in `#dm-inbox`, `/admin` in the admin channels; "
+                    "public rooms like `#announcements` only host `/help` and "
+                    "`/getstarted`."
                 ),
                 color=0x5865F2,
                 timestamp=datetime.now(timezone.utc),
@@ -3952,7 +4185,7 @@ def make_alt_autocompleter(command_name: str = ""):
             # V8 bug-fix (plan #4): suggest only the alts visible to the
             # invoking user — customers never see other operators' alt names.
             _is_adm, visible = _visible_alt_ids(inter.user.id)
-            if command_name in ("status", "deals", "tune", "analytics", "canary"):
+            if command_name in ("status", "deals", "tune"):
                 out.append(app_commands.Choice(name="All alts (0)", value=0))
             for i in visible:
                 label = _alt_label(i)
@@ -4011,19 +4244,19 @@ for command_name, command in (
 ):
     try:
         command.autocomplete("alt")(make_alt_autocompleter(command_name))
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] <module>: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 try:
     cmd_squad.autocomplete("squad_name")(make_squad_autocompleter())
-except Exception:
-    pass
+except Exception as _ignored_exc:
+    print(f"[BOT] <module>: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 for param_name in ("channel_id", "new_channel_id"):
     try:
         cmd_channels.autocomplete(param_name)(make_channel_autocompleter())
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] <module>: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -4214,8 +4447,8 @@ async def _offer_alt_modal(inter: discord.Interaction, session: SetupSession, al
             "its token and channels.",
             view=view, ephemeral=True,
         )
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] _offer_alt_modal: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 async def _finalize_setup(inter: discord.Interaction, session: SetupSession) -> None:
@@ -4250,13 +4483,13 @@ async def _finalize_setup(inter: discord.Interaction, session: SetupSession) -> 
                     await inter.followup.send(
                         f"⚠️ GitHub secret upload failed: {exc}", ephemeral=True
                     )
-                except Exception:
-                    pass
+                except Exception as _ignored_exc:
+                    print(f"[BOT] _finalize_setup: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # 0.8: memory-clear hygiene — tokens must not linger in heap after upload.
     try:
         results.clear()
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] _finalize_setup: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     cm_events = getattr(_cm, "record_event", None)
     if cm_events:
         cm_events(uid, "setup_completed", {"alts": session.total})
@@ -4266,8 +4499,8 @@ async def _finalize_setup(inter: discord.Interaction, session: SetupSession) -> 
             "your ad farm.",
             ephemeral=True,
         )
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] _finalize_setup: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 @bot.tree.command(
@@ -4281,7 +4514,7 @@ async def cmd_setup(inter: discord.Interaction) -> None:
     Step 2: one modal per alt (token + channels), each validated before the
             next one is offered.
     """
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="setup"):
         return
     uid = str(inter.user.id)
     if _V8_LOADED:
@@ -4310,7 +4543,7 @@ async def cmd_setup(inter: discord.Interaction) -> None:
 # TODO 2.7 — /renew: open a pre-filled ticket
 @bot.tree.command(name="renew", description="Open a renewal ticket (pre-filled with your customer ID).")
 async def cmd_renew(inter: discord.Interaction) -> None:
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="renew"):
         return
     uid = str(inter.user.id)
     c = _cm.get_customer(uid) if _V8_LOADED else None
@@ -4342,8 +4575,8 @@ async def cmd_renew(inter: discord.Interaction) -> None:
                     f"Check <#{ticket_ch}> for details.",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[BOT] cmd_renew: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         await inter.response.send_message(
             "✅ Your renewal ticket was opened. An admin will confirm shortly "
             "(best-effort — no SLA).", ephemeral=True,
@@ -4358,7 +4591,7 @@ async def cmd_renew(inter: discord.Interaction) -> None:
 # TODO 3.4 — /pause-billing: pause + extend by requested days (admin approval)
 @bot.tree.command(name="pause-billing", description="Pause billing and extend your subscription (manual admin approval).")
 async def cmd_pause_billing(inter: discord.Interaction) -> None:
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="pause-billing"):
         return
     # V8 bug-fix (plan #2): same resolver chain as /renew (env → DB meta →
     # panel channel → guild name lookup).
@@ -4373,8 +4606,8 @@ async def cmd_pause_billing(inter: discord.Interaction) -> None:
                 "Expected admin action: extend subscription by the paused days.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[BOT] cmd_pause_billing: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # Also notify admins in #admin-alerts
     alert_ch_id = _os.environ.get("ADMIN_ALERTS_CH_ID", "")
     if alert_ch_id:
@@ -4385,8 +4618,8 @@ async def cmd_pause_billing(inter: discord.Interaction) -> None:
                 f"Check <#{ticket_ch}> for details.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[BOT] cmd_pause_billing: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     await inter.response.send_message(
         "✅ Pause-billing ticket opened. An admin will extend your subscription "
         "by the paused days after confirmation.", ephemeral=True,
@@ -4396,7 +4629,7 @@ async def cmd_pause_billing(inter: discord.Interaction) -> None:
 # TODO 3.3 — /proofs: opt-in anonymous proof sharing
 @bot.tree.command(name="proofs", description="Opt in to post redacted farm proof to the public channel.")
 async def cmd_proofs(inter: discord.Interaction) -> None:
-    if not await _check_perms(inter, role="customer"):
+    if not await _check_perms(inter, role="customer", command="proofs"):
         return
     from control_bot import proofs
     await inter.response.send_message(
@@ -4404,6 +4637,116 @@ async def cmd_proofs(inter: discord.Interaction) -> None:
         "alert wins are shared; your customer ID is **redacted** (e.g. `1234…`).",
         view=proofs.ProofsView(), ephemeral=True,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# V8 bug-fix plan #2 — /reset: factory-fresh state
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _reset_impact_summary() -> str:
+    """Count what a factory reset would destroy (for the confirmation prompt)."""
+    customers = alt_creds = fleet = 0
+    try:
+        customers = len(_cm.list_customers(active_only=False))
+    except Exception as exc:
+        print(f"[RESET] customer count unavailable: {type(exc).__name__}: {exc}")
+    try:
+        con = _cm._conn()
+        with con:
+            alt_creds = con.execute("SELECT COUNT(*) FROM alt_credentials").fetchone()[0]
+    except Exception as exc:
+        print(f"[RESET] credential count unavailable: {type(exc).__name__}: {exc}")
+    fleet = len(state.alt_ids)
+    return (
+        f"• **{customers}** customer record(s) — activations, subscriptions, forum links\n"
+        f"• **{alt_creds}** stored alt credential(s) (tokens + channels)\n"
+        f"• **{fleet}** fleet alt mapping(s) in ALT_REPOS/ALT_DISCORD_IDS (+ core secrets)\n"
+        f"• run-state, reminders, policy acks and the event ledger\n\n"
+        "Repos, forums and Discord channels are NOT deleted — only the bot's "
+        "memory of them. This cannot be undone from Discord; restore "
+        "customers.db from a numbered backup if you change your mind."
+    )
+
+
+@bot.tree.command(
+    name="reset",
+    description="FACTORY RESET — wipe every customer record and alt mapping (admin only).",
+)
+@app_commands.describe(confirmation="Type RESET to confirm this irreversible action")
+async def cmd_reset(inter: discord.Interaction, confirmation: Optional[str] = "") -> None:
+    """Clear all customer data + alt state with a typed confirmation.
+
+    V8 bug-fix plan #2: stale alt mappings survived repo deletions in the DB,
+    the in-memory state file and the ALT_REPOS secret. ``/reset`` wipes every
+    source in one auditable, confirmed action. Owner-only (fail closed).
+    """
+    if not await _check_perms(inter, command="reset"):
+        return
+    if str(confirmation or "").strip().upper() != "RESET":
+        await inter.response.send_message(
+            "⚠️ **Factory reset armed.** This will erase:\n" + _reset_impact_summary() +
+            "\n\nRe-run with `confirmation:RESET` to execute.",
+            ephemeral=True,
+        )
+        return
+    await inter.response.defer(ephemeral=True)
+    await _log_control(
+        f"🧨 **FACTORY RESET initiated by `{inter.user.display_name}`** (`{inter.user.id}`)."
+    )
+    # 1. Best-effort: stop every runner first so nothing keeps posting against
+    #    wiped configuration. Cancellation failures must not block the wipe.
+    stop_results = await asyncio.gather(
+        *(asyncio.to_thread(github_api.cancel_run, aid) for aid in list(state.alt_ids)),
+        return_exceptions=True,
+    )
+    canceled = sum(1 for r in stop_results if isinstance(r, tuple) and r[0])
+    for r in stop_results:
+        if isinstance(r, Exception):
+            print(f"[RESET] workflow cancel failed (ignored): {type(r).__name__}: {r}")
+
+    # 2. Customers DB (local file + write-through to the Gist).
+    counts: dict[str, int] = {}
+    try:
+        counts = _cm.reset_all_data()
+    except Exception as exc:
+        await inter.followup.send(
+            f"❌ **Reset aborted:** the database could not be cleared ({exc}). "
+            "No in-memory or secret changes were made.",
+            ephemeral=True,
+        )
+        return
+
+    # 3. Fleet registry: secrets, in-memory config, live state, persisted file.
+    registry_ok, registry_detail = True, "no fleet mapping configured"
+    if config.ALT_REPOS or config.ALT_DISCORD_IDS or config.ALT_NAMES:
+        registry_ok, registry_detail = await _drop_alts_from_everywhere(
+            sorted(set(config.ALT_REPOS) | set(config.ALT_DISCORD_IDS) | set(config.ALT_NAMES))
+        )
+
+    # 4. Process-local caches.
+    _cooldowns.clear()
+    _processed_webhook_ids.clear()
+    _unreachable_state_channels.clear()
+    if _V8_LOADED:
+        try:
+            _security.reload_channel_rules()
+        except Exception as exc:
+            print(f"[RESET] channel rules reload skipped: {type(exc).__name__}: {exc}")
+
+    lines = [
+        "🧹 **Factory reset complete.**",
+        f"• customers: {counts.get('customers', 0)} · alt credentials: {counts.get('alt_credentials', 0)} · "
+        f"runs: {counts.get('run_state', 0)} · events: {counts.get('events', 0)} removed",
+        f"• fleet alts un-mapped: {len(list(state.alt_ids))} remaining in live state",
+        f"• {canceled} active workflow(s) canceled",
+    ]
+    if registry_ok:
+        lines.append("• ALT_REPOS/ALT_NAMES/ALT_DISCORD_IDS core secrets cleared")
+    else:
+        lines.append(f"• ⚠️ Core registry secrets NOT cleared ({registry_detail}) — "
+                     "update them manually or mappings will return on next boot")
+    await inter.followup.send("\n".join(lines), ephemeral=True)
+    await _log_control("\n".join(lines))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -4436,7 +4779,7 @@ async def vip_autoreply(inter: discord.Interaction, message: Optional[str] = Non
     through the alt (via the `!reply` Gist control command) — at most once
     per buyer per cooldown window.
     """
-    if not await _check_perms(inter, role="vip"):
+    if not await _check_perms(inter, role="vip", command="vip"):
         return
     uid = str(inter.user.id)
     raw = str(message or "").strip()
@@ -4514,8 +4857,8 @@ async def vip_autoreply(inter: discord.Interaction, message: Optional[str] = Non
         )
     try:
         _cm.record_event(uid, "vip_autoreply_set", {"chars": len(raw)})
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] vip_autoreply: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     await inter.response.send_message(
         "✅ **VIP auto-reply saved!**\n"
         f"```{raw[:1000]}```\n"
@@ -4698,8 +5041,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                 msg = await channel.fetch_message(payload.message_id)
                 if msg:
                     await _handle_guild_webhook_message(msg, is_edit=True)
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[BOT] on_raw_message_edit: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 async def _handle_incoming_dm(message: discord.Message):
@@ -4760,31 +5103,25 @@ def _is_dm_inbox_message(message: discord.Message) -> bool:
                 dm_t = str(c.get("dm_thread_id") or "").strip()
                 if dm_t and dm_t != "0" and dm_t == str(ch_id):
                     return True
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[BOT] _is_dm_inbox_message: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return False
 
 
-async def _maybe_vip_autoreply(message: discord.Message) -> None:
-    """VIP DM auto-reply relay (V8 plan feature #5).
-
-    Fires on buyer-DM posts forwarded by an alt runner into a #dm-inbox.
-    The forwarded embed carries a ``/reply alt:N user:<buyer_id>`` quick-reply
-    field; we parse the target alt + buyer id from it, attribute the alt to
-    its owning customer, and — when that customer is an ACTIVE VIP with a
-    saved auto-reply — queue ``!reply <buyer> <text>`` through the control
-    Gist so the runner DMs the buyer from the alt account. Rate-limited to
-    one auto-reply per buyer per ``AUTOREPLY_COOLDOWN_SEC``.
-    """
-    if not _V8_LOADED:
-        return
+def _is_alt_self_echo(message: discord.Message) -> bool:
+    """True when the message is an echo of the alt's own DM (FORWARD_OWN_DMS)."""
     author_name = str(
         getattr(message.author, "name", "") or getattr(message.author, "display_name", "") or ""
     )
-    if author_name.lower().endswith("(alt)"):
-        return  # echo of the alt's own DM (FORWARD_OWN_DMS) — not a buyer DM
+    return author_name.lower().endswith("(alt)")
 
-    # Extract the fleet alt id and buyer uid from the forwarded DM embed.
+
+def _extract_forwarded_reply_target(message: discord.Message) -> tuple[Optional[int], str]:
+    """Parse ``(alt_id, buyer_uid)`` from a forwarded #dm-inbox embed.
+
+    Primary source: the ``/reply alt:N user:<buyer_id>`` quick-reply field;
+    fallback for the alt: the embed footer ("… Alt 2"). Missing buyer → ("",).
+    """
     alt_id: Optional[int] = None
     buyer_uid = ""
     for embed in getattr(message, "embeds", []) or []:
@@ -4802,19 +5139,20 @@ async def _maybe_vip_autoreply(message: discord.Message) -> None:
             fm = re.search(r"Alt\s+(\d+)", footer_text)
             if fm:
                 alt_id = int(fm.group(1))
-    if not buyer_uid:
-        return  # nothing we can relay to (no quick-reply field)
+    return alt_id, buyer_uid
 
-    # Attribute to a customer: by the inbox thread first, then by alt owner.
+
+def _attribute_inbox_message(ch_id: str, alt_id: Optional[int]) -> tuple[Optional[dict], Optional[int]]:
+    """Attribute an inbox post to ``(customer, alt_id)`` — thread first, alt next."""
     customer = None
-    ch_id = str(message.channel.id)
     try:
         for c in _cm.list_customers(active_only=True):
             dm_t = str(c.get("dm_thread_id") or "").strip()
             if dm_t and dm_t != "0" and dm_t == ch_id:
                 customer = c
                 break
-    except Exception:
+    except Exception as exc:
+        print(f"[AUTOREPLY] customer lookup failed: {type(exc).__name__}: {exc}")
         customer = None
     if alt_id is None and customer is not None:
         owned = _customer_owned_alt_ids(customer.get("discord_id"))
@@ -4822,6 +5160,51 @@ async def _maybe_vip_autoreply(message: discord.Message) -> None:
             alt_id = next(iter(owned))
     if customer is None and alt_id is not None:
         customer = _customer_for_alt(alt_id)
+    return customer, alt_id
+
+
+def _vip_autoreply_cooldown_ok(alt_id: int, buyer_uid: str) -> bool:
+    """Per-buyer rate limit — never spam a buyer who writes several messages.
+
+    Records the send timestamp as a side effect when allowed and prunes the
+    bookkeeping map past 5 000 entries (bounded memory, one process).
+    """
+    now = time.time()
+    key = (int(alt_id), str(buyer_uid))
+    if now - _autoreply_last_sent.get(key, 0.0) < AUTOREPLY_COOLDOWN_SEC:
+        return False
+    _autoreply_last_sent[key] = now
+    if len(_autoreply_last_sent) > 5000:
+        cutoff = now - AUTOREPLY_COOLDOWN_SEC
+        for k in [k for k, ts in _autoreply_last_sent.items() if ts < cutoff]:
+            _autoreply_last_sent.pop(k, None)
+    return True
+
+
+async def _maybe_vip_autoreply(message: discord.Message) -> None:
+    """VIP DM auto-reply relay (V8 plan feature #5).
+
+    Fires on buyer-DM posts forwarded by an alt runner into a #dm-inbox.
+    The forwarded embed carries a ``/reply alt:N user:<buyer_id>`` quick-reply
+    field; we parse the target alt + buyer id from it, attribute the alt to
+    its owning customer, and — when that customer is an ACTIVE VIP with a
+    saved auto-reply — queue ``!reply <buyer> <text>`` through the control
+    Gist so the runner DMs the buyer from the alt account. Rate-limited to
+    one auto-reply per buyer per ``AUTOREPLY_COOLDOWN_SEC``.
+
+    V8 cleanup: parsing/attribution/rate-limiting each live in a named,
+    individually-tested helper; this function only orchestrates.
+    """
+    if not _V8_LOADED:
+        return
+    if _is_alt_self_echo(message):
+        return  # echo of the alt's own DM — not a buyer DM
+
+    alt_id, buyer_uid = _extract_forwarded_reply_target(message)
+    if not buyer_uid:
+        return  # nothing we can relay to (no quick-reply field)
+
+    customer, alt_id = _attribute_inbox_message(str(message.channel.id), alt_id)
     if customer is None or alt_id is None:
         return
 
@@ -4832,21 +5215,13 @@ async def _maybe_vip_autoreply(message: discord.Message) -> None:
         if not _cm.is_active(uid):
             return
         text = _cm.get_autoreply(uid)
-    except Exception:
+    except Exception as exc:
+        print(f"[AUTOREPLY] eligibility check failed for `{uid}`: {type(exc).__name__}: {exc}")
         return
     if not text:
         return
-
-    # Per-buyer rate limit — never spam a buyer who writes several messages.
-    now = time.time()
-    key = (int(alt_id), buyer_uid)
-    if now - _autoreply_last_sent.get(key, 0.0) < AUTOREPLY_COOLDOWN_SEC:
+    if not _vip_autoreply_cooldown_ok(int(alt_id), buyer_uid):
         return
-    _autoreply_last_sent[key] = now
-    if len(_autoreply_last_sent) > 5000:
-        cutoff = now - AUTOREPLY_COOLDOWN_SEC
-        for k in [k for k, ts in _autoreply_last_sent.items() if ts < cutoff]:
-            _autoreply_last_sent.pop(k, None)
 
     ack = await _send_control_wait_ack(int(alt_id), f"!reply {buyer_uid} {text}", timeout=15)
     ok = ack.startswith(("🕒", "✅"))
@@ -4857,19 +5232,19 @@ async def _maybe_vip_autoreply(message: discord.Message) -> None:
     )
     try:
         state.append_log(int(alt_id), log_text, emoji="⭐", color=0xFEE75C, kind="CONTROL")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[AUTOREPLY] per-alt log append failed: {type(exc).__name__}: {exc}")
     try:
         await _log_control(log_text)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[AUTOREPLY] control-log relay failed: {type(exc).__name__}: {exc}")
     try:
         _cm.record_event(
             uid, "vip_autoreply_sent",
             {"alt": int(alt_id), "buyer_suffix": buyer_uid[-4:], "ok": bool(ok)},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[AUTOREPLY] event ledger write failed: {type(exc).__name__}: {exc}")
 
 
 async def _handle_guild_webhook_message(message: discord.Message, is_edit: bool = False):
@@ -4965,122 +5340,160 @@ def _parse_deal_message(alt_id: int, message: discord.Message):
     state.append_log(alt_id, f"{title or 'Deal alert'} {snippet[:300]}", emoji="📈", color=0x57F287, kind="DEAL")
 
 
-def _parse_dashboard_message(message: discord.Message):
-    """Extract live state from a structured heartbeat (old JSON or new embed)."""
-    # Keep compatibility with heartbeat messages written before the readable
-    # embed format was deployed.
-    raw = (message.content or "").strip()
+def _strip_code_fence(raw: str) -> str:
+    """Unwrap a ```json … ``` fenced message body (legacy heartbeats)."""
+    raw = (raw or "").strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
         raw = "\n".join(lines[1:])
         if raw.endswith("```"):
             raw = raw[:-3]
         raw = raw.strip()
-    if raw.startswith("{"):
-        try:
-            payload = json.loads(raw)
-            if isinstance(payload, dict) and (payload.get("heartbeat") or payload.get("type") == "heartbeat"):
-                alt_id = payload.get("alt_id") or _match_alt_name(payload.get("alt_name"))
-                if alt_id:
-                    state.update_from_heartbeat(alt_id, payload)
-        except Exception:
-            pass
+    return raw
+
+
+def _consume_json_heartbeat(raw: str) -> bool:
+    """Apply a legacy JSON heartbeat message; True when one was consumed.
+
+    Malformed JSON is logged and treated as "not a heartbeat" (the embed path
+    may still produce state), matching the old silent behaviour minus the
+    silence.
+    """
+    raw = _strip_code_fence(raw)
+    if not raw.startswith("{"):
+        return False
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"[STATE] malformed JSON heartbeat ignored: {exc}")
+        return False
+    if isinstance(payload, dict) and (payload.get("heartbeat") or payload.get("type") == "heartbeat"):
+        alt_id = payload.get("alt_id") or _match_alt_name(payload.get("alt_name"))
+        if alt_id:
+            try:
+                state.update_from_heartbeat(alt_id, payload)
+            except Exception as exc:
+                print(f"[STATE] legacy JSON heartbeat update failed for alt {alt_id}: "
+                      f"{type(exc).__name__}: {exc}")
+            return True
+    return False
+
+
+def _heartbeat_embed_scalar_field(key: str, name: str, value: str, payload: dict, channels: dict) -> None:
+    """One heartbeat embed field → payload/channel mutation (no I/O)."""
+    if key == "status":
+        m = re.search(r"\b(active|paused|caution|ip_pause|afk|stopped|error|offline|starting|queued)\b", value, re.I)
+        if m:
+            payload["status"] = m.group(1).lower()
+    elif key == "mode":
+        m = re.search(r"\b(sell|buy)\b", value, re.I)
+        if m:
+            payload["ad_type"] = m.group(1).lower()
+    elif key == "rate":
+        m = re.search(r"(\d+(?:\.\d{1,2})?)", value)
+        if m:
+            payload["rate"] = float(m.group(1))
+    elif key in {"cadence", "interval"}:
+        m = re.search(r"(\d+)\s*m?", value)
+        if m:
+            payload["interval_min"] = int(m.group(1))
+    elif key == "activity":
+        for label, target in (("sent", "total_sent"), ("errors", "total_errors"), ("skips", "total_skips")):
+            m = re.search(rf"{label}:?\s*`?(\d+)", value, re.I)
+            if m:
+                payload[target] = int(m.group(1))
+    elif key == "deals":
+        m = re.search(r"(\d+)", value)
+        if m:
+            payload["deal_alerts"] = int(m.group(1))
+    elif key == "keywords":
+        payload["deal_keywords"] = [x.strip() for x in value.split(",") if x.strip() and x.lower() != "none configured"]
+    elif key == "scanner":
+        payload["deal_scan_enabled"] = value.casefold().startswith("on")
+        m = re.search(r"edge\s*\$?(\d+(?:\.\d+)?)", value, re.I)
+        if m:
+            payload["deal_alert_delta"] = float(m.group(1))
+    elif key == "uptime":
+        m = re.search(r"(\d+(?:\.\d+)?)\s*min", value, re.I)
+        if m:
+            payload["uptime_sec"] = float(m.group(1)) * 60
+    elif key == "channels":
+        m = re.search(r"(\d+)\s*/\s*(\d+)", value)
+        if m:
+            payload["active_channels"], payload["total_channels"] = int(m.group(1)), int(m.group(2))
+    elif key == "message":
+        payload["message_preview"] = value[:120]
+    elif key in {"latest issue", "latest error"}:
+        payload["last_error"] = value[:300]
+    elif key == "warnings":
+        payload["warnings"] = [x for x in value.splitlines() if x.strip()]
+    elif key.startswith("channel:"):
+        match_cid = re.search(r"channel:\s*(\d+)", name, re.I)
+        if match_cid:
+            cid = match_cid.group(1)
+            ch_name = cid
+            if "· #" in name:
+                ch_name = name.split("· #", 1)[1].strip() or cid
+            sent = re.search(r"sent\s*`?(\d+)", value, re.I)
+            errors = re.search(r"errors\s*`?(\d+)", value, re.I)
+            slow = re.search(r"slowmode\s*`?(\d+)", value, re.I)
+            last = re.search(r"last\s+<t:(\d+):", value, re.I)
+            channels[cid] = {
+                "name": ch_name[:80],
+                "sent": int(sent.group(1)) if sent else 0,
+                "errors": int(errors.group(1)) if errors else 0,
+                "slowmode": int(slow.group(1)) if slow else 0,
+                "alive": "alive" in value.casefold(),
+                "last_post": int(last.group(1)) if last else 0,
+            }
+
+
+def _consume_embed_heartbeat(embed) -> bool:
+    """Apply one 💓-Heartbeat embed to live state. True when consumed."""
+    title = getattr(embed, "title", "") or ""
+    if not title.lower().startswith("💓 heartbeat"):
+        return False
+    try:
+        alt_id = None
+        footer = getattr(embed, "footer", None)
+        footer_text = getattr(footer, "text", "") if footer else ""
+        match = re.search(r"alt[_\s-]?(\d+)", footer_text, re.I)
+        if match:
+            alt_id = int(match.group(1))
+        if alt_id is None:
+            alt_id = _match_alt_name(title)
+        if not alt_id:
+            return False
+        payload = {"heartbeat": True, "type": "heartbeat", "alt_id": alt_id}
+        channels: dict = {}
+        for field in embed.fields or []:
+            name = str(getattr(field, "name", "") or "").strip()
+            value = str(getattr(field, "value", "") or "").strip()
+            _heartbeat_embed_scalar_field(name.casefold(), name, value, payload, channels)
+        if channels:
+            payload["channels"] = channels
+            max_ch_post = max((int(ch.get("last_post") or 0) for ch in channels.values()), default=0)
+            if max_ch_post > 0:
+                payload["last_post_ts"] = max_ch_post
+        state.update_from_heartbeat(alt_id, payload)
+        return True
+    except Exception as exc:
+        # A malformed optional field must not discard the rest of a live
+        # heartbeat or crash the bot's event loop.
+        print(f"[STATE] heartbeat embed field parse skipped: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _parse_dashboard_message(message: discord.Message):
+    """Extract live state from a structured heartbeat (old JSON or new embed).
+
+    Kept compatible with heartbeat messages written before the readable embed
+    format was deployed. V8 cleanup: split into _consume_* helpers per format.
+    """
+    # Legacy JSON format first; readable embeds may refine further.
+    _consume_json_heartbeat(message.content or "")
     for embed in message.embeds:
-        title = getattr(embed, "title", "") or ""
-        if not title.lower().startswith("💓 heartbeat"):
-            continue
-        try:
-            alt_id = None
-            footer = getattr(embed, "footer", None)
-            footer_text = getattr(footer, "text", "") if footer else ""
-            match = re.search(r"alt[_\s-]?(\d+)", footer_text, re.I)
-            if match:
-                alt_id = int(match.group(1))
-            if alt_id is None:
-                alt_id = _match_alt_name(title)
-            if not alt_id:
-                continue
-            payload = {"heartbeat": True, "type": "heartbeat", "alt_id": alt_id}
-            channels = {}
-            for field in embed.fields or []:
-                name = str(getattr(field, "name", "") or "").strip()
-                value = str(getattr(field, "value", "") or "").strip()
-                key = name.casefold()
-                if key == "status":
-                    m = re.search(r"\b(active|paused|caution|ip_pause|afk|stopped|error|offline|starting|queued)\b", value, re.I)
-                    if m:
-                        payload["status"] = m.group(1).lower()
-                elif key == "mode":
-                    m = re.search(r"\b(sell|buy)\b", value, re.I)
-                    if m:
-                        payload["ad_type"] = m.group(1).lower()
-                elif key == "rate":
-                    m = re.search(r"(\d+(?:\.\d{1,2})?)", value)
-                    if m:
-                        payload["rate"] = float(m.group(1))
-                elif key in {"cadence", "interval"}:
-                    m = re.search(r"(\d+)\s*m?", value)
-                    if m:
-                        payload["interval_min"] = int(m.group(1))
-                elif key == "activity":
-                    for label, target in (("sent", "total_sent"), ("errors", "total_errors"), ("skips", "total_skips")):
-                        m = re.search(rf"{label}:?\s*`?(\d+)", value, re.I)
-                        if m:
-                            payload[target] = int(m.group(1))
-                elif key == "deals":
-                    m = re.search(r"(\d+)", value)
-                    if m:
-                        payload["deal_alerts"] = int(m.group(1))
-                elif key == "keywords":
-                    payload["deal_keywords"] = [x.strip() for x in value.split(",") if x.strip() and x.lower() != "none configured"]
-                elif key == "scanner":
-                    payload["deal_scan_enabled"] = value.casefold().startswith("on")
-                    m = re.search(r"edge\s*\$?(\d+(?:\.\d+)?)", value, re.I)
-                    if m:
-                        payload["deal_alert_delta"] = float(m.group(1))
-                elif key == "uptime":
-                    m = re.search(r"(\d+(?:\.\d+)?)\s*min", value, re.I)
-                    if m:
-                        payload["uptime_sec"] = float(m.group(1)) * 60
-                elif key == "channels":
-                    m = re.search(r"(\d+)\s*/\s*(\d+)", value)
-                    if m:
-                        payload["active_channels"], payload["total_channels"] = int(m.group(1)), int(m.group(2))
-                elif key == "message":
-                    payload["message_preview"] = value[:120]
-                elif key in {"latest issue", "latest error"}:
-                    payload["last_error"] = value[:300]
-                elif key == "warnings":
-                    payload["warnings"] = [x for x in value.splitlines() if x.strip()]
-                elif key.startswith("channel:"):
-                    match_cid = re.search(r"channel:\s*(\d+)", name, re.I)
-                    if match_cid:
-                        cid = match_cid.group(1)
-                        ch_name = cid
-                        if "· #" in name:
-                            ch_name = name.split("· #", 1)[1].strip() or cid
-                        sent = re.search(r"sent\s*`?(\d+)", value, re.I)
-                        errors = re.search(r"errors\s*`?(\d+)", value, re.I)
-                        slow = re.search(r"slowmode\s*`?(\d+)", value, re.I)
-                        last = re.search(r"last\s+<t:(\d+):", value, re.I)
-                        channels[cid] = {
-                            "name": ch_name[:80],
-                            "sent": int(sent.group(1)) if sent else 0,
-                            "errors": int(errors.group(1)) if errors else 0,
-                            "slowmode": int(slow.group(1)) if slow else 0,
-                            "alive": "alive" in value.casefold(),
-                            "last_post": int(last.group(1)) if last else 0,
-                        }
-            if channels:
-                payload["channels"] = channels
-                max_ch_post = max((int(ch.get("last_post") or 0) for ch in channels.values()), default=0)
-                if max_ch_post > 0:
-                    payload["last_post_ts"] = max_ch_post
-            state.update_from_heartbeat(alt_id, payload)
-        except Exception:
-            # A malformed optional field must not discard the rest of a live
-            # heartbeat or crash the bot's event loop.
-            continue
+        _consume_embed_heartbeat(embed)
 
 
 def _parse_log_message(alt_id: int, message: discord.Message):
@@ -5150,8 +5563,8 @@ def _parse_log_message(alt_id: int, message: discord.Message):
         if m:
             try:
                 a.total_sent = max(a.total_sent, int(m.group(1)))
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[BOT] _parse_log_message: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 def _try_parse_heartbeat(alt_id: int, body: str):
@@ -5162,8 +5575,8 @@ def _try_parse_heartbeat(alt_id: int, body: str):
         payload = json.loads(body)
         if isinstance(payload, dict) and payload.get("type") == "heartbeat":
             state.update_from_heartbeat(alt_id, payload)
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[BOT] _try_parse_heartbeat: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 def _match_alt_name(name: str) -> int | None:
@@ -5312,12 +5725,12 @@ async def _refresh_dashboard_now():
             _dash_message = await ch.send(embeds=embeds[:10], view=view)
             try:
                 Path(config.DASHBOARD_MSG_ID_FILE).write_text(str(_dash_message.id))
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[BOT] _refresh_dashboard_now: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             try:
                 await _dash_message.pin()
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[BOT] _refresh_dashboard_now: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         else:
             await _dash_message.edit(embeds=embeds[:10], view=view)
     except Exception as e:
@@ -5353,14 +5766,13 @@ async def fleet_health_check():
         if not a:
             continue
         is_stale = (a.last_heartbeat_ts <= 0) or (now - max(a.last_heartbeat_ts, a.last_post_ts) > config.OFFLINE_AFTER_SEC)
-        workflow_active = a.workflow_status in {"queued", "in_progress"} or a.workflow_conclusion in {"", "pending"}
         if not is_stale:
             continue
         if not hydrated:
             try:
                 await asyncio.to_thread(github_api.refresh_all_run_statuses, state)
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[BOT] fleet_health_check: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             hydrated = True
         # Try to re-connect the transport. If the runner died, the Gist/DM ack
         # tells us immediately; otherwise a running sender polls it within 45s.
@@ -5378,8 +5790,8 @@ async def fleet_health_check():
             state.record_causal_event(aid, "auto_recovery_failed", "Heartbeat recovery probe did not confirm", details=ack)
         try:
             await _log_control(f"🩺 [HEALTH] {detail}")
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[BOT] fleet_health_check: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 async def _log_control(text: str):
@@ -5407,7 +5819,7 @@ def run():
         print("⚠️  GH_TOKEN not set — /run and /stop will not work.")
     if not config.GITHUB_OWNER or not config.ALT_REPOS:
         print("⚠️  GITHUB_OWNER / ALT_REPOS not set — /run will fail.")
-    print(f"[V8] Control bot starting — continuous runtime mode (no session limit).")
+    print("[V8] Control bot starting — continuous runtime mode (no session limit).")
     print(f"Alt mapping: {config.ALT_REPOS}")
     print(f"Discord IDs: {config.ALT_DISCORD_IDS}")
     # V8: initialise the SQLite DB before the gateway connects

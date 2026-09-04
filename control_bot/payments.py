@@ -48,7 +48,6 @@ def record_ticket_message(discord_id: str, content: str, thread_id: str = "") ->
 
 def activation_template(customer: dict[str, Any], tx_hash: str = "") -> str:
     """One-click `/admin activate` command pre-filled from the ticket."""
-    uid = customer.get("discord_id", "")
     days = max(1, int(float(customer.get("expiry_date", 0) or 0) - time.time()) // 86400) or 30
     alts = int(customer.get("alt_count", 1) or 1)
     vip = bool(customer.get("vip"))

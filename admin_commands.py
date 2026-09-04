@@ -14,8 +14,13 @@ Commands:
   /admin repos              – List every repo across all worker accounts
                               (customer, alt, status) — V8 bug-fix K
   /admin repo sync          – Push latest send_ads.py to all repos
-  /admin repo delete        – Delete one customer repo (confirm: DELETE)
-                              — V8 bug-fix L
+  /admin repo delete        – Delete one customer repo (confirm: DELETE),
+                              pruning it from customer records AND the fleet
+                              ALT_REPOS mapping/state — V8 bug-fix L + #2
+  /admin sweep-alts         – Verify fleet mappings vs GitHub, prune dead
+                              alts (404-confirmed only) — V8 bug-fix plan #2
+  /admin sync-commands      – Force command sync + channel visibility
+                              without a restart — V8 bug-fix plan #3
   /admin logs @User         – View a customer's recent log thread
 """
 from __future__ import annotations
@@ -29,7 +34,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import customer_manager as cm
-from security import check_admin, is_admin
+from security import check_admin
 
 
 def _remember_ticket_channel(channel) -> None:
@@ -56,6 +61,203 @@ def _remember_ticket_channel(channel) -> None:
         cm.set_meta("open_ticket_ch_id", ch_id)
     except Exception as exc:
         print(f"[TICKET] Could not persist open_ticket_ch_id in DB: {exc}")
+
+
+def _alt_repo_plan(uname: str, alts: int) -> list[str]:
+    """Deterministic alt-repo naming for one activation."""
+    safe = uname.lower().replace(" ", "_")
+    return [f"{safe}_alt{i}" for i in range(1, max(1, int(alts)) + 1)]
+
+
+async def _no_workers_refusal(
+    inter: discord.Interaction,
+    uname: str,
+    uid: str,
+    alts: int,
+    audit,
+) -> None:
+    """Tell the admin (and the audit log) why activation was blocked.
+
+    V8 bug-fix (plan #1): customer alt repos must NEVER be created in the
+    main account. An empty worker username means no worker GitHub accounts
+    are configured — fail loudly with the exact remedy instead of silently
+    provisioning under the main token (which also stored an empty
+    github_account and broke later cancels/syncs).
+    """
+    msg = (
+        "❌ **No worker GitHub accounts are configured** — refusing "
+        f"to create {alts} alt repo(s) for **{uname}** in the main "
+        "account.\n\n"
+        "**Fix:** set the `WORKER_TOKENS` repository secret "
+        "(`org1:token1,org2:token2`, fine-grained PATs per worker "
+        "account) or `WORKER_1_USER`/`WORKER_1_TOKEN` … "
+        "`WORKER_3_USER`/`WORKER_3_TOKEN`, then run this command "
+        "again. Alternatively pass `github_account:<worker-org>` "
+        "explicitly.\n"
+        "(`setup.py` writes these secrets automatically when you "
+        "register the 3 worker accounts.)"
+    )
+    await inter.followup.send(msg, ephemeral=True)
+    await audit(
+        f"⛔ **Activation blocked** for `{uname}` (`{uid}`) — no "
+        "worker GitHub accounts configured (WORKER_TOKENS missing); "
+        "refused to create repos in the main account."
+    )
+
+
+async def _create_repos_on_owner(
+    inter: discord.Interaction,
+    repo_names: list[str],
+    owner: str,
+    token: str | None,
+    owner_label: str,
+) -> list[str]:
+    """Create each repo via provision_alt_repo; report per-repo results.
+
+    ``owner_label`` only affects the follow-up message text (worker vs.
+    explicit account), keeping the loop itself single-sourced.
+    """
+    from github_dispatch import provision_alt_repo
+    created: list[str] = []
+    for repo_name in repo_names:
+        try:
+            args = (owner, repo_name) if token is None else (owner, repo_name, token)
+            html_url = await asyncio.to_thread(provision_alt_repo, *args)
+            created.append(repo_name)
+            await inter.followup.send(
+                f"✅ Created repo: [{repo_name}]({html_url}) on {owner_label}",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(
+                f"⚠️ Repo `{repo_name}` creation failed on {owner_label}: {exc}",
+                ephemeral=True,
+            )
+    return created
+
+
+async def _provision_activation_repos(
+    inter: discord.Interaction,
+    *,
+    existing: dict | None,
+    uname: str,
+    uid: str,
+    alts: int,
+    github_account: str,
+    audit,
+) -> tuple[list[str], str, bool]:
+    """Resolve/create the customer's alt repos (activation step 1).
+
+    Reuses existing repos when present (bug-fix D/E: re-activation never
+    duplicates), honors an explicit ``github_account``, otherwise round-
+    robins ONE worker for the whole customer (bug-fix C: repos and the stored
+    owner always agree). Returns ``(repos, github_account, proceed)``.
+    """
+    from github_dispatch import discover_repo_owner, get_workers, pick_worker, _norm_owner
+
+    repos: list[str] = []
+    gh_account = (github_account or "").strip().strip("/").strip()
+
+    # 1a. Reuse what the customer already has; backfill a legacy empty owner.
+    if existing and existing.get("repos"):
+        repos = list(existing.get("repos") or [])
+        if not gh_account:
+            gh_account = (existing.get("github_account") or "").strip()
+        if repos and not gh_account:
+            # V8 bug-fix (plan #1): legacy records created before worker
+            # round-robin stored an empty github_account, which later made
+            # the timer engine call GitHub with `/repos//<name>` (404).
+            # Discover which configured account actually holds the repo and
+            # backfill it so cancels/syncs target the right owner.
+            try:
+                discovered = await asyncio.to_thread(discover_repo_owner, repos[0])
+            except Exception as exc:
+                print(f"[ACTIVATE] repo owner discovery failed: {type(exc).__name__}: {exc}")
+                discovered = ""
+            if discovered:
+                gh_account = discovered
+                await inter.followup.send(
+                    f"🧭 Recovered GitHub owner for existing repo "
+                    f"`{repos[0]}` → `{gh_account}` (record backfilled).",
+                    ephemeral=True,
+                )
+        if repos:
+            await inter.followup.send(
+                f"♻️ Reusing {len(repos)} existing repo(s) for **{uname}** — "
+                f"`{repos}`",
+                ephemeral=True,
+            )
+            return repos, gh_account, True
+
+    repo_names = _alt_repo_plan(uname, alts)
+
+    # 1b. Explicit worker account: all alts live under it.
+    if not repos and gh_account:
+        known_workers = {w[0].strip().strip("/").lower() for w in get_workers() if w[0]}
+        if known_workers and gh_account.lower() not in known_workers:
+            await inter.followup.send(
+                f"⚠️ `{gh_account}` is not one of the configured worker "
+                f"accounts ({', '.join(sorted(known_workers))}). Repos will "
+                "only be created if GH_ADMIN_TOKEN has access there.",
+                ephemeral=True,
+            )
+        repos = await _create_repos_on_owner(
+            inter, repo_names, gh_account, None, f"`{gh_account}`"
+        )
+        return repos, gh_account, True
+
+    # 1c. Round-robin worker selection — ONE worker per customer so every alt
+    #     repo + the stored github_account stay consistent (bug-fix C).
+    worker_user, worker_token = pick_worker()
+    gh_account = _norm_owner(worker_user)
+    if not gh_account:
+        await _no_workers_refusal(inter, uname, uid, alts, audit)
+        return [], "", False
+    repos = await _create_repos_on_owner(
+        inter, repo_names, worker_user, worker_token, f"worker `{gh_account}`"
+    )
+    return repos, gh_account, True
+
+
+def _existing_forum_ids(existing: dict) -> dict[str, int]:
+    """Coerce a legacy customer record's forum ids into the create shape."""
+    out: dict[str, int] = {}
+    for key in ("forum_id", "control_thread_id", "dashboard_thread_id",
+                "logs_thread_id", "dm_thread_id", "deals_thread_id"):
+        raw = str(existing.get(key, "") or "")
+        out[key] = int(raw) if raw.isdigit() else 0
+    return out
+
+
+async def _ensure_customer_forum(
+    inter: discord.Interaction,
+    user,
+    uname: str,
+    *,
+    vip: bool,
+    existing: dict | None,
+) -> dict[str, int]:
+    """Create (or keep) the customer's private forum (activation step 2).
+
+    Bug-fix E: never duplicates an existing forum; falls back to the stored
+    ids when no guild is available (e.g. DM-invoked activation).
+    """
+    forum_ids: dict[str, int] = {}
+    if inter.guild:
+        try:
+            from discord_forum import create_customer_forum
+            admin_role = discord.utils.get(inter.guild.roles, name="Admin")
+            forum_ids = await create_customer_forum(
+                inter.guild, inter.guild.me, user,
+                display_name=uname, vip=vip, admin_role=admin_role,
+            )
+        except Exception as exc:
+            await inter.followup.send(
+                f"⚠️ Forum creation failed: {exc}", ephemeral=True
+            )
+    if not forum_ids and existing:
+        forum_ids = _existing_forum_ids(existing)
+    return forum_ids
 
 
 class AdminCog(commands.Cog):
@@ -98,10 +300,14 @@ class AdminCog(commands.Cog):
                 "Once set up, use `/run` to start your ad farm.\n\n"
                 "📖 Need help finding your alt token? See the step-by-step "
                 "text guide in `docs/SETUP_GUIDE.md` (section 9) or open a "
-                "ticket with the 🎫 button in `#open-ticket`."
+                "ticket with the 🎫 button in `#open-ticket`.\n\n"
+                "⚠️ Commands are channel-aware: customer commands belong in your "
+                "forum rooms (`#control`, `#dashboard`, …) — `/help` and "
+                "`/getstarted` work anywhere."
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # A closed DM is expected for users with DMs disabled — log, don't crash.
+            print(f"[ACTIVATE] welcome DM to `{username}` failed: {type(exc).__name__}: {exc}")
 
     # ── /admin group ─────────────────────────────────────────────────────────
 
@@ -161,151 +367,34 @@ class AdminCog(commands.Cog):
         vip: bool = False,
         github_account: str = "",
     ) -> None:
+        """Onboard (or re-activate) a customer: repos → forum → DB → welcome.
+
+        V8 cleanup: the 190-line body was decomposed into three focused,
+        individually-testable helpers (``_provision_activation_repos``,
+        ``_ensure_customer_forum``, ``_no_workers_refusal``); this function is
+        now just the orchestrator the /admin docs describe.
+        """
         if not await check_admin(inter):
             return
         await inter.response.defer(ephemeral=True)
 
         uid = str(user.id)
         uname = user.display_name
-
         existing = cm.get_customer(uid)
 
         # 1. GitHub repos — REUSE what the customer already has (bug-fix D/E):
         #    re-activating must never create duplicate repos or forums.
-        repos: list[str] = []
-        gh_account = github_account.strip().strip("/").strip()
-        from github_dispatch import provision_alt_repo
-        if existing and existing.get("repos"):
-            repos = list(existing.get("repos") or [])
-            if not gh_account:
-                gh_account = (existing.get("github_account") or "").strip()
-            if repos and not gh_account:
-                # V8 bug-fix (plan #1): legacy records created before worker
-                # round-robin stored an empty github_account, which later made
-                # the timer engine call GitHub with `/repos//<name>` (404).
-                # Discover which configured account actually holds the repo and
-                # backfill it so cancels/syncs target the right owner.
-                try:
-                    from github_dispatch import discover_repo_owner
-                    discovered = await asyncio.to_thread(discover_repo_owner, repos[0])
-                except Exception:
-                    discovered = ""
-                if discovered:
-                    gh_account = discovered
-                    await inter.followup.send(
-                        f"🧭 Recovered GitHub owner for existing repo "
-                        f"`{repos[0]}` → `{gh_account}` (record backfilled).",
-                        ephemeral=True,
-                    )
-            if repos:
-                await inter.followup.send(
-                    f"♻️ Reusing {len(repos)} existing repo(s) for **{uname}** — "
-                    f"`{repos}`",
-                    ephemeral=True,
-                )
-        if not repos and gh_account:
-            # Explicit worker account: all alts live under it.
-            from github_dispatch import get_workers
-            known_workers = {w[0].strip().strip("/").lower() for w in get_workers() if w[0]}
-            if known_workers and gh_account.lower() not in known_workers:
-                await inter.followup.send(
-                    f"⚠️ `{gh_account}` is not one of the configured worker "
-                    f"accounts ({', '.join(sorted(known_workers))}). Repos will "
-                    "only be created if GH_ADMIN_TOKEN has access there.",
-                    ephemeral=True,
-                )
-            for i in range(1, alts + 1):
-                repo_name = f"{uname.lower().replace(' ', '_')}_alt{i}"
-                try:
-                    html_url = await asyncio.to_thread(
-                        provision_alt_repo, gh_account, repo_name
-                    )
-                    repos.append(repo_name)
-                    await inter.followup.send(
-                        f"✅ Created repo: [{repo_name}]({html_url}) on `{gh_account}`",
-                        ephemeral=True,
-                    )
-                except Exception as exc:
-                    await inter.followup.send(
-                        f"⚠️ Repo `{repo_name}` creation failed: {exc}", ephemeral=True
-                    )
-        elif not repos:
-            # Round-robin worker selection — but pick ONE worker for the whole
-            # customer so every alt repo + the stored github_account stay
-            # consistent (bug-fix C: never store an empty/ambiguous owner).
-            from github_dispatch import pick_worker, _norm_owner
-            worker_user, worker_token = pick_worker()
-            gh_account = _norm_owner(worker_user)
-            if not gh_account:
-                # V8 bug-fix (plan #1): customer alt repos must NEVER be
-                # created in the main account. An empty worker username means
-                # no worker GitHub accounts are configured — fail loudly with
-                # the exact remedy instead of silently provisioning under the
-                # main token (which also stored an empty github_account and
-                # broke later cancels/syncs).
-                msg = (
-                    "❌ **No worker GitHub accounts are configured** — refusing "
-                    f"to create {alts} alt repo(s) for **{uname}** in the main "
-                    "account.\n\n"
-                    "**Fix:** set the `WORKER_TOKENS` repository secret "
-                    "(`org1:token1,org2:token2`, fine-grained PATs per worker "
-                    "account) or `WORKER_1_USER`/`WORKER_1_TOKEN` … "
-                    "`WORKER_3_USER`/`WORKER_3_TOKEN`, then run this command "
-                    "again. Alternatively pass `github_account:<worker-org>` "
-                    "explicitly.\n"
-                    "(`setup.py` writes these secrets automatically when you "
-                    "register the 3 worker accounts.)"
-                )
-                await inter.followup.send(msg, ephemeral=True)
-                await self._audit(
-                    f"⛔ **Activation blocked** for `{uname}` (`{uid}`) — no "
-                    "worker GitHub accounts configured (WORKER_TOKENS missing); "
-                    "refused to create repos in the main account."
-                )
-                return
-            for i in range(1, alts + 1):
-                repo_name = f"{uname.lower().replace(' ', '_')}_alt{i}"
-                try:
-                    html_url = await asyncio.to_thread(
-                        provision_alt_repo, worker_user, repo_name, worker_token
-                    )
-                    repos.append(repo_name)
-                    await inter.followup.send(
-                        f"✅ Created repo: [{repo_name}]({html_url}) on worker `{gh_account}`",
-                        ephemeral=True,
-                    )
-                except Exception as exc:
-                    await inter.followup.send(
-                        f"⚠️ Repo `{repo_name}` creation failed on worker "
-                        f"`{gh_account}`: {exc}", ephemeral=True
-                    )
+        repos, gh_account, proceed = await _provision_activation_repos(
+            inter, existing=existing, uname=uname, uid=uid, alts=alts,
+            github_account=github_account, audit=self._audit,
+        )
+        if not proceed:
+            return
 
         # 2. Create/reuse the Discord forum (bug-fix E: never duplicated)
-        forum_ids: dict[str, int] = {}
-        if inter.guild:
-            try:
-                from discord_forum import create_customer_forum
-                bot_member = inter.guild.me
-                # Find an admin role if one exists
-                admin_role = discord.utils.get(inter.guild.roles, name="Admin")
-                forum_ids = await create_customer_forum(
-                    inter.guild, bot_member, user,
-                    display_name=uname, vip=vip, admin_role=admin_role,
-                )
-            except Exception as exc:
-                await inter.followup.send(
-                    f"⚠️ Forum creation failed: {exc}", ephemeral=True
-                )
-        if not forum_ids and existing:
-            # No guild/forum available — keep any previously stored ids.
-            forum_ids = {
-                "forum_id": int(existing["forum_id"]) if str(existing.get("forum_id", "") or "").isdigit() else 0,
-                "control_thread_id": int(existing["control_thread_id"]) if str(existing.get("control_thread_id", "") or "").isdigit() else 0,
-                "dashboard_thread_id": int(existing["dashboard_thread_id"]) if str(existing.get("dashboard_thread_id", "") or "").isdigit() else 0,
-                "logs_thread_id": int(existing["logs_thread_id"]) if str(existing.get("logs_thread_id", "") or "").isdigit() else 0,
-                "dm_thread_id": int(existing["dm_thread_id"]) if str(existing.get("dm_thread_id", "") or "").isdigit() else 0,
-                "deals_thread_id": int(existing["deals_thread_id"]) if str(existing.get("deals_thread_id", "") or "").isdigit() else 0,
-            }
+        forum_ids = await _ensure_customer_forum(
+            inter, user, uname, vip=vip, existing=existing
+        )
 
         # 3. Store customer record
         cm.add_customer(
@@ -327,12 +416,11 @@ class AdminCog(commands.Cog):
         # 4. Send welcome DM
         await self._send_welcome_dm(user, uname)
 
-        # 5. Audit log
+        # 5. Audit log + summary reply
         await self._audit(
             f"✅ **Activated** `{uname}` (`{uid}`) — {days}d, {alts} alt(s), "
             f"VIP={'yes' if vip else 'no'}, repos={repos}"
         )
-
         await inter.followup.send(
             f"🎉 **{uname}** has been activated!\n"
             f"• Days: **{days}**  • Alts: **{alts}**  • VIP: **{'✅' if vip else '❌'}**\n"
@@ -534,13 +622,33 @@ class AdminCog(commands.Cog):
                     cm.update_repos(c["discord_id"], repos)
                     removed_from = c.get("discord_username", c["discord_id"])
                     break
+            # V8 bug-fix plan #2: a deleted repo must vanish from EVERY alt
+            # state source — including the fleet ALT_REPOS mapping, live
+            # state and the persisted state file — otherwise /alt and the
+            # health monitor keep reporting a ghost "Alt N" forever.
+            fleet_note = ""
+            if repo_name:
+                base = repo_name.strip("/").split("/")[-1].lower()
+                from control_bot import config as _cfg
+                from control_bot.bot import _drop_alts_from_everywhere
+                stale = [
+                    int(alt_id) for alt_id, repo in dict(_cfg.ALT_REPOS).items()
+                    if str(repo).strip().strip("/").split("/")[-1].lower() == base
+                ]
+                if stale:
+                    ok, detail = await _drop_alts_from_everywhere(stale)
+                    fleet_note = (
+                        f"\nAlso pruned fleet alt mapping(s) {stale} (repo no longer exists)."
+                        if ok else f"\n⚠️ Fleet registry prune failed: {detail}"
+                    )
             await self._audit(
                 f"🗑️ **Repo deleted** `{owner}/{repo_name}` by "
                 f"`{inter.user.display_name}` (confirmation: DELETE)"
             )
             await inter.followup.send(
                 f"🗑️ **Deleted `{owner}/{repo_name}`.**"
-                + (f"\nRemoved from customer **{removed_from}**'s record." if removed_from else ""),
+                + (f"\nRemoved from customer **{removed_from}**'s record." if removed_from else "")
+                + fleet_note,
                 ephemeral=True,
             )
             return
@@ -796,6 +904,67 @@ class AdminCog(commands.Cog):
         await self._audit("🔐 Worker token verification run by " f"`{inter.user.display_name}`")
         await inter.followup.send("\n".join(lines), ephemeral=True)
 
+    # /admin sync-commands — V8 bug-fix plan #3: force a guild command sync
+    # (and re-apply channel visibility) without waiting for a restart.
+    @admin_group.command(
+        name="sync-commands",
+        description="Force command sync + channel visibility now (no restart needed).",
+    )
+    async def admin_sync_commands(self, inter: discord.Interaction) -> None:
+        if not await check_admin(inter):
+            return
+        await inter.response.defer(ephemeral=True)
+        from control_bot.command_sync import format_sync_summary, sync_guild_commands
+        try:
+            summary = await sync_guild_commands(self.bot)
+        except Exception as exc:
+            await self._audit(
+                f"⚠️ Command sync failed (requested by `{inter.user.display_name}`): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            await inter.followup.send(
+                f"❌ Command sync failed: `{type(exc).__name__}: {exc}`", ephemeral=True
+            )
+            return
+        await self._audit(
+            f"🔗 **Commands re-synced** by `{inter.user.display_name}` — "
+            f"{format_sync_summary(summary)}"
+        )
+        await inter.followup.send(f"🔗 {format_sync_summary(summary)}", ephemeral=True)
+
+    # /admin sweep-alts — V8 bug-fix plan #2: on-demand verification that every
+    # fleet ALT_REPOS mapping still has a live repository; prunes confirmed
+    # ghosts (404 only — API hiccups are kept).
+    @admin_group.command(
+        name="sweep-alts",
+        description="Verify fleet ALT_REPOS against GitHub and prune dead mappings.",
+    )
+    @app_commands.describe(dry_run="Preview only — do not remove anything")
+    async def admin_sweep_alts(
+        self, inter: discord.Interaction, dry_run: bool = False
+    ) -> None:
+        if not await check_admin(inter):
+            return
+        await inter.response.defer(ephemeral=True)
+        from control_bot.bot import _sweep_stale_fleet_alts
+        summary = await _sweep_stale_fleet_alts(prune=not dry_run)
+        text = (
+            f"🧹 Fleet sweep: checked {summary.get('checked', 0)}, kept "
+            f"{summary.get('kept', 0)}, skipped {summary.get('skipped', 0)}"
+        )
+        pruned = summary.get("pruned") or []
+        if pruned:
+            text += f", {'would prune' if dry_run else 'pruned'} alts {pruned}"
+        else:
+            text += " — no stale mappings found"
+        if summary.get("note"):
+            text += f" ({summary['note']})"
+        await self._audit(
+            f"🧹 **Fleet sweep** by `{inter.user.display_name}` "
+            f"({'dry-run' if dry_run else 'live'}): {text}"
+        )
+        await inter.followup.send(text, ephemeral=True)
+
     # /admin logs
     @admin_group.command(
         name="logs",
@@ -827,11 +996,25 @@ class AdminCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot) -> None:
-    """Called by bot.load_extension() to register this cog."""
-    cog = AdminCog(bot)
-    # Register audit log channel from env
+    """Register the admin cog + its /admin command group — idempotently.
+
+    V8 bug-fix plan #3: on_ready can fire again after a gateway reconnect and
+    used to re-run this setup, producing the noisy (and /admin-delaying)
+    `Admin cog warning: Command 'admin' already registered.` Both the cog
+    registry and the command tree are now checked before (re-)registering, so
+    repeated loads are a no-op.
+    """
     import os
-    ch_id = int(os.environ.get("AUDIT_LOG_CH_ID", "0") or "0")
-    cog._audit_ch_id = ch_id or None
-    bot.tree.add_command(cog.admin_group)
-    await bot.add_cog(cog)
+    cog = bot.get_cog("AdminCog")
+    if cog is None:
+        cog = AdminCog(bot)
+        # Register audit log channel from env
+        ch_id = int(os.environ.get("AUDIT_LOG_CH_ID", "0") or "0")
+        cog._audit_ch_id = ch_id or None
+        await bot.add_cog(cog)
+    if bot.tree.get_command("admin") is None:
+        try:
+            bot.tree.add_command(cog.admin_group)
+        except discord.app_commands.CommandAlreadyRegistered:
+            print("[ADMIN] /admin group already registered — reusing it.")
+    return None

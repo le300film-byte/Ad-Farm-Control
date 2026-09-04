@@ -855,13 +855,13 @@ def api(method, url, retries=3, referer=None, files_mp=None, json_body=None,
             # F-26: feed response into proactive rate limiter
             try:
                 _RATELIMITER.update(url, r)
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] api: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             if multipart_request and files_mp is not None:
                 try:
                     files_mp.close()
-                except Exception:
-                    pass
+                except Exception as _ignored_exc:
+                    print(f"[SENDER] api: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                 files_mp = None
         except Exception as e:
             short = url.split("/api/")[-1][:60] if "/api/" in url else url[-40:]
@@ -911,7 +911,8 @@ def api(method, url, retries=3, referer=None, files_mp=None, json_body=None,
                 dbg(f"[API] 5xx on multipart upload (HTTP {r.status_code}), NOT retrying (would create text-only duplicate)")
                 if files_mp is not None:
                     try: files_mp.close()
-                    except Exception: pass
+                    except Exception as _exc:
+                        log(f"[API] multipart upload handle close failed: {_exc}", kind="DEBUG")
                 return r
             backoff = 3 * attempt + random.uniform(0, 2)
             log(f"   🔄 DISCORD SERVER ERROR {r.status_code} (attempt {attempt}/{retries}) → retrying in {backoff:.1f}s")
@@ -921,8 +922,8 @@ def api(method, url, retries=3, referer=None, files_mp=None, json_body=None,
         if files_mp is not None:
             try:
                 files_mp.close()
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] api: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         return r
     return _fake_err_response(0, "max retries exceeded")
 
@@ -999,8 +1000,8 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
                                 tid = str(resp_data.get("channel_id") or resp_data.get("thread_id") or "")
                                 if tid:
                                     _buyer_forum_threads[str(buyer_key)] = tid
-                        except Exception:
-                            pass
+                        except Exception as _ignored_exc:
+                            print(f"[SENDER] send_webhook: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                     return True
                 # If thread_id failed with 400 or 404 (thread deleted or archived, or text channel mode), fall back to standard POST
                 if thread_id and r.status_code in (400, 404):
@@ -1019,8 +1020,8 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
                                     tid = str(resp_data.get("channel_id") or "")
                                     if tid:
                                         _buyer_forum_threads[str(buyer_key)] = tid
-                            except Exception:
-                                pass
+                            except Exception as _ignored_exc:
+                                print(f"[SENDER] send_webhook: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                         return True
                     # If forum thread_name failed on a plain text channel
                     if r2.status_code == 400 and "thread_name" in payload:
@@ -1513,8 +1514,8 @@ def load_blocked_from_gist():
                 for k, v in scores_data.items():
                     try:
                         _variation_scores[k] = max(0, int(v))
-                    except (TypeError, ValueError):
-                        pass
+                    except (TypeError, ValueError) as _ignored_exc:
+                        print(f"[SENDER] load_blocked_from_gist: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         log(f"📚 Loaded {len(loaded)} blocked variations and {len(_variation_scores)} survival scores from gist")
     except Exception as e:
         log(f"⚠️ Failed to load gist blocklist: {type(e).__name__}: {e}")
@@ -1594,8 +1595,8 @@ def _record_strike(text, cid, mid):
         log("   flagged, not the text. Stopping to avoid burning the alt further.")
         try:
             save_blocked_to_gist(force=True)
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] _record_strike: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         log("   Cancel the run, age the alt more (24h+), switch proxy/IP, and retry.")
         send_log_webhook(
             f"🛑 **SAFETY STOP** `{consec}` consecutive deletions — account/IP flagged. Aborting."
@@ -1708,7 +1709,8 @@ class RateLimiter:
                 b = self._buckets.setdefault(bkey, {"remaining": 999, "reset_at": now, "limit": 999})
                 if remaining_h is not None:
                     try: b["remaining"] = int(remaining_h)
-                    except Exception: pass
+                    except Exception as _exc:
+                        log(f"[API] rate-limit remaining header unparsable ({remaining_h!r}): {_exc}", kind="DEBUG")
                 if reset_h is not None:
                     try:
                         rv = float(reset_h)
@@ -1724,7 +1726,8 @@ class RateLimiter:
                         b["reset_at"] = now + 5
                 if limit_h is not None:
                     try: b["limit"] = int(limit_h)
-                    except Exception: pass
+                    except Exception as _exc:
+                        log(f"[API] rate-limit cap header unparsable ({limit_h!r}): {_exc}", kind="DEBUG")
                 if r.status_code == 429:
                     try:
                         j = r.json()
@@ -1834,8 +1837,8 @@ def _record_verification(cid, mid, survived):
                             "description": (f"Channel `{cid}` has had {streak} consecutive surviving posts. "
                                             "Normal cadence, images, reactions, and edits may resume."),
                         })
-                    except Exception:
-                        pass
+                    except Exception as _ignored_exc:
+                        print(f"[SENDER] _record_verification: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         else:
             _channel_caution_survives[cid] = 0
             fails = sum(1 for v in hist if not v)
@@ -1853,8 +1856,8 @@ def _record_verification(cid, mid, survived):
                                         f"anti-spam. Throttling to {CAUTION_INTERVAL_MULT:.1f}× interval, "
                                         f"text-only, no reactions/edits until {CAUTION_EXIT_STREAK} posts survive."),
                     })
-                except Exception:
-                    pass
+                except Exception as _ignored_exc:
+                    print(f"[SENDER] _record_verification: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # Do not acquire _state_lock recursively: verification runs in a
     # background thread and _reset_consecutive_deletions takes that lock.
     if survived:
@@ -2006,8 +2009,8 @@ def _apply_registry_targets(result: dict) -> None:
             if "slowmode" in record:
                 try:
                     _slowmodes_ref[cid] = max(0, int(record["slowmode"]))
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as _ignored_exc:
+                    print(f"[SENDER] _apply_registry_targets: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             if _stats_ref is not None and cid not in _stats_ref:
                 _stats_ref[cid] = {"sent": 0, "errors": 0, "skipped": 0,
                                    "cooldown": 0, "img": 0, "txt": 0, "edits": 0}
@@ -2283,8 +2286,8 @@ def _poll_reactions(cid, mid, emoji_url, trusted_only, timeout):
                         seen_confirm.add(uid)
                         if not trusted_only or uid in trusted_only:
                             return "confirm"
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] _poll_reactions: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         # Check ❌
         try:
             r = api("GET",
@@ -2299,8 +2302,8 @@ def _poll_reactions(cid, mid, emoji_url, trusted_only, timeout):
                         seen_reject.add(uid)
                         if not trusted_only or uid in trusted_only:
                             return "reject"
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] _poll_reactions: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         # Sleep in short chunks so panic/stop can interrupt
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -2344,8 +2347,8 @@ def confirm_channel(new_cid, channel_name, old_cid, timeout=60):
                 f"https://discord.com/api/v9/channels/{new_cid}/messages/{mid}/reactions/{emo_enc}/@me",
                 referer=ref, json_body={}, retries=1)
             time.sleep(0.4)
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] confirm_channel: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # Poll for reaction
     outcome = _poll_reactions(new_cid, mid, "%E2%9C%85", CONFIRM_USER_IDS, timeout)
     # Best-effort: edit the confirmation message to show outcome
@@ -2360,8 +2363,8 @@ def confirm_channel(new_cid, channel_name, old_cid, timeout=60):
             final_text = prefix + f"\n\n⏰ **TIMEOUT** ({timeout}s) — channel skipped."
         api("PATCH", f"https://discord.com/api/v9/channels/{new_cid}/messages/{mid}",
             referer=ref, json_body={"content": final_text}, retries=1)
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SENDER] confirm_channel: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return {"confirm": "confirmed", "reject": "rejected"}.get(outcome, "timeout")
 
 def try_channel_discovery(old_cid, context):
@@ -2424,8 +2427,8 @@ def try_channel_discovery(old_cid, context):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "description": f"#{new_name} (`{new_cid}`) replaces `{old_cid}`. Posting resumed.",
             })
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] try_channel_discovery: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         # Fetch fresh channel info (slowmode)
         try:
             info = get_channel_info(new_cid)
@@ -2465,8 +2468,8 @@ def try_channel_discovery(old_cid, context):
                     idx = CHANNEL_IDS.index(old_cid)
                     CHANNEL_IDS[idx] = new_cid
                 CHANNEL_IDS = list(dict.fromkeys(CHANNEL_IDS))
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] try_channel_discovery: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         return new_cid
     elif outcome == "rejected":
         log(f"   ⏭️  [DISC] Channel '#{ch_name}' REJECTED — skipping.")
@@ -2540,10 +2543,10 @@ def _process_image(raw_bytes, original_name):
                             if isinstance(p, tuple):
                                 jittered = tuple(max(0, min(255, c + random.randint(-1, 1))) for c in p[:3]) + p[3:]
                                 px[x, y] = jittered
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as _ignored_exc:
+                            print(f"[SENDER] _process_image: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
+                except Exception as _ignored_exc:
+                    print(f"[SENDER] _process_image: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             if ext in (".jpg", ".jpeg"):
                 if im.mode in ("RGBA", "P", "LA"):
                     im = im.convert("RGB")
@@ -2648,8 +2651,8 @@ def get_channel_info(cid):
             _guild_id_cache[cid] = gid
             _channel_id_to_guild[cid] = gid
             return j
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SENDER] get_channel_info: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return None
 
 def ack_channel(cid, last_msg_id):
@@ -2661,8 +2664,8 @@ def ack_channel(cid, last_msg_id):
             f"https://discord.com/api/v9/channels/{cid}/messages/{last_msg_id}/ack",
             referer=ref, json_body={"token": None}, retries=1)
         dbg(f"✔️ ack #{cid} @ {last_msg_id}")
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SENDER] ack_channel: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 def get_last_messages(cid, limit=5, force_refresh=False):
     url = f"https://discord.com/api/v9/channels/{cid}/messages?limit={limit}"
@@ -2675,8 +2678,8 @@ def get_last_messages(cid, limit=5, force_refresh=False):
             data = r.json()
             if isinstance(data, list):
                 return data
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SENDER] get_last_messages: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return None
 
 def am_i_last(cid, my_id):
@@ -2734,8 +2737,8 @@ def _calculate_chat_velocity(cid, msgs):
             res = (velocity, mult)
             _channel_velocity[cid] = res
             return res
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SENDER] _calculate_chat_velocity: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     res = (5.0, 1.0)
     _channel_velocity[cid] = res
     return res
@@ -2848,12 +2851,12 @@ def read_channel(cid, limit=15):
     if msgs:
         try:
             ack_channel(cid, msgs[0].get("id"))
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] read_channel: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         try:
             _calculate_chat_velocity(cid, msgs)
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] read_channel: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # F-13: passive deal scan (ZERO extra API calls — msgs already fetched).
     if DEAL_SCAN_ENABLED and cid in CHANNEL_IDS:
         try:
@@ -3012,8 +3015,8 @@ def parse_market_listing(text, target_keywords=None):
                             vol_val = v_num
                             volume_str = f"{v_num:g}"
                         break
-                    except Exception:
-                        pass
+                    except Exception as _ignored_exc:
+                        print(f"[SENDER] parse_market_listing: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
             detected_rate = None
 
@@ -3041,8 +3044,8 @@ def parse_market_listing(text, target_keywords=None):
                         calc_rate = total_p / (vol_val / 1000.0)
                         if 0.10 <= calc_rate <= 20.0:
                             detected_rate = round(calc_rate, 2)
-                    except Exception:
-                        pass
+                    except Exception as _ignored_exc:
+                        print(f"[SENDER] parse_market_listing: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
             if detected_rate is not None and 0.10 <= detected_rate <= 20.0:
                 return {
@@ -3122,8 +3125,8 @@ def _send_deal_alert(cid, seller, price, ref_rate, profit_margin, snippet, jump_
                 else:
                     volume_str = f"{v_num:g}"
                 break
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] _send_deal_alert: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     rate_display = f"**${price:.2f}/1k**"
     if volume_str:
@@ -3275,8 +3278,8 @@ def _lookup_egress():
             payload = json.loads(raw.decode("utf-8", errors="replace"))
             if isinstance(payload, dict):
                 return payload
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] _fetch_json: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
         # Fallback for local environments where curl is unavailable. An
         # explicit proxy handler keeps the lookup on the same configured route.
@@ -3362,7 +3365,8 @@ def _ip_health_monitor():
                                         f"IP: `{ip}`\nISP: `{org}`\nCountry: `{country or '?'}`\n"
                                         f"All public activity PAUSED {IP_HEALTH_PAUSE_MIN:.0f} min."),
                     })
-                except Exception: pass
+                except Exception as _exc:
+                    log(f"[SECURITY] ip-pause notification embed send failed: {_exc}", kind="CAUTION")
         else:
             with _ip_health_lock:
                 if was_bad:
@@ -3416,7 +3420,8 @@ def _panic_trigger(reason="remote"):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "description": f"Stopped by remote command: **{reason}**. Clean shutdown in progress.",
         })
-    except Exception: pass
+    except Exception as _exc:
+        log(f"[CONTROL] stop-notification embed send failed (stop still queued): {_exc}", kind="CAUTION")
 
 def _panic_checker_loop():
     while not _panic_event.is_set() and not _stop_event.is_set():
@@ -3953,8 +3958,8 @@ def _sync_control_gist(force=False):
                     _runtime_message = _apply_rate_to_message(
                         _runtime_message or MESSAGE, nr
                     )
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] _sync_control_gist: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         if data.get("ad_type") in ("sell", "buy"):
             _runtime_ad_type = data["ad_type"]
         if isinstance(data.get("message"), str) and data["message"]:
@@ -3972,8 +3977,8 @@ def _sync_control_gist(force=False):
                 delta = float(data["deal_alert_delta"])
                 if math.isfinite(delta) and 0 <= delta <= 5:
                     _runtime_deal_delta = delta
-            except (TypeError, ValueError, OverflowError):
-                pass
+            except (TypeError, ValueError, OverflowError) as _ignored_exc:
+                print(f"[SENDER] _sync_control_gist: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         # Apply commands queued by the official control bot. A stop command
         # from an older run must not kill a newly started workflow.
         command_id = str(data.get("command_id") or "")
@@ -4279,16 +4284,16 @@ class GatewayThread(threading.Thread):
         try:
             if self._ws:
                 self._ws.close()
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] stop: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     def _get_gateway_url(self):
         try:
             r = SESSION.get("https://discord.com/api/v9/gateway", timeout=10)
             if r.status_code == 200:
                 return r.json().get("url", "wss://gateway.discord.gg")
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] _get_gateway_url: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         return "wss://gateway.discord.gg"
 
     def _send(self, payload):
@@ -4378,8 +4383,8 @@ class GatewayThread(threading.Thread):
                             info = get_channel_info(cid)
                             if info:
                                 _dm_channel_cache[cid] = info
-                        except Exception:
-                            pass
+                        except Exception as _ignored_exc:
+                            print(f"[SENDER] _bg_fetch: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                     threading.Thread(target=_bg_fetch, daemon=True).start()
             if ctype != 1:
                 return
@@ -4401,8 +4406,8 @@ class GatewayThread(threading.Thread):
                     # Still check for /panic overlap
                     try:
                         _handle_panic_dm(author.get("id"), content)
-                    except Exception:
-                        pass
+                    except Exception as _ignored_exc:
+                        print(f"[SENDER] _handle_dm: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                     return
             # Incoming DM from a buyer → pause public activity + forward
             if not is_me:
@@ -4417,21 +4422,21 @@ class GatewayThread(threading.Thread):
                 # F-32: check for /panic command from trusted users
                 try:
                     _handle_panic_dm(author.get("id"), content)
-                except Exception:
-                    pass
+                except Exception as _ignored_exc:
+                    print(f"[SENDER] _handle_dm: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                 # Forward off-thread so webhook POST doesn't block heartbeats
                 def _fwd():
                     try:
                         forward_dm_message(cid, author, content, attachments, is_me=False)
-                    except Exception:
-                        pass
+                    except Exception as _ignored_exc:
+                        print(f"[SENDER] _fwd: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                 threading.Thread(target=_fwd, daemon=True).start()
             elif FORWARD_OWN_DMS:
                 def _fwd_me():
                     try:
                         forward_dm_message(cid, author, content, attachments, is_me=True)
-                    except Exception:
-                        pass
+                    except Exception as _ignored_exc:
+                        print(f"[SENDER] _fwd_me: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                 threading.Thread(target=_fwd_me, daemon=True).start()
         except Exception as e:
             self.dbg(f"_handle_dm error: {type(e).__name__}: {e}")
@@ -4585,14 +4590,14 @@ class GatewayThread(threading.Thread):
                     cid = d.get("id")
                     if ctype == 1 and cid:
                         _dm_channel_cache[cid] = d
-                except Exception:
-                    pass
+                except Exception as _ignored_exc:
+                    print(f"[SENDER] _connect_once: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
         hb_stop.set()
         try:
             self._ws.close()
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] _connect_once: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         # F-29: If we sent IDENTIFY but never got READY, flag new-location gate.
         if not got_ready and self._identify_sent_at > 0:
             elapsed = time.time() - self._identify_sent_at
@@ -4649,8 +4654,8 @@ def start_gateway():
                                    "the same WARP/proxy IP, approve the new-location email/modal, then re-run."),
                 })
                 time.sleep(2)
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] start_gateway: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             sys.exit(2)
         else:
             log(f"⚠️ Gateway still connecting after {ready_wait}s — continuing in background. Presence may appear shortly.")
@@ -4693,8 +4698,8 @@ def send_typing(cid, text):
         ref = f"https://discord.com/channels/{_guild_id_cache.get(cid,'@me')}/{cid}"
         api("POST", f"https://discord.com/api/v9/channels/{cid}/typing",
             referer=ref, json_body={}, retries=1)
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SENDER] send_typing: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # Small mid-typing hesitation 8% of the time (like pausing to think).
     dur = typing_duration(text)
     if random.random() < 0.08 and dur > 3:
@@ -4768,8 +4773,8 @@ def send_message(cid, text, img=None):
         if mp is not None:
             try:
                 mp.close()
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] send_message: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     if r.status_code == 200:
         try:
             msg = r.json()
@@ -5049,8 +5054,8 @@ class _KeepaliveSleep:
             if CONTROL_GIST_ID and GIST_TOKEN and time.time() - self.last_gist_poll >= 15:
                 try:
                     _sync_control_gist()
-                except Exception:
-                    pass
+                except Exception as _ignored_exc:
+                    print(f"[SENDER] sleep: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                 self.last_gist_poll = time.time()
             if public_activity_allowed() and time.time() - self.last_ping >= 270:
                 keepalive()
@@ -5095,8 +5100,8 @@ def maybe_react(cid, msgs, my_id):
         if r.status_code in (204, 200):
             snip = (m.get("content") or "").replace("\n", " ")[:25]
             log(f"   👌 #{cid}: reacted {emo} to recent msg → \"{snip}...\"")
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SENDER] maybe_react: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 # --------------------------------------------------------------------------- #
 # IP + country check                                                          #
@@ -6066,8 +6071,8 @@ def main():
                     len(active_channels), len(CHANNEL_IDS), set(active_channels),
                     ch_names, slowmodes, last_sent, my_last_msg_id, is_shutdown=True))
                 time.sleep(1.5)
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] main: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         save_blocked_to_gist(force=True)
         _print_stats(start, total_sent, total_err, total_skip,
                      total_distractions, total_img, total_edits, stats)
@@ -6090,8 +6095,8 @@ def main():
                     len(active_channels), len(CHANNEL_IDS), set(active_channels),
                     ch_names, slowmodes, last_sent, my_last_msg_id, is_shutdown=True))
                 time.sleep(1.5)
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[SENDER] main: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         save_blocked_to_gist(force=True)
         _print_stats(start, total_sent, total_err, total_skip,
                      total_distractions, total_img, total_edits, stats)
@@ -6107,8 +6112,8 @@ def main():
         )
         try:
             save_blocked_to_gist(force=True)
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] main: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         _print_stats(start, total_sent, total_err, total_skip,
                      total_distractions, total_img, total_edits, stats)
         if _gw_thread is not None:
@@ -6171,8 +6176,8 @@ if __name__ == "__main__":
         _CHROME_VER = _CHROME_VERSION_FALLBACK
         try:
             SESSION.cookies.set("locale", DISCORD_LOCALE, domain="discord.com")
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[SENDER] <module>: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         self_test()
     else:
         main()

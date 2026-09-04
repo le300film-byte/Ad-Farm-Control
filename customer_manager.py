@@ -107,8 +107,8 @@ def _after_write(reason: str) -> None:
         from gist_backup import enqueue_backup, gist_configured
         if gist_configured():
             enqueue_backup(reason)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[DB] write-through backup unavailable ({reason}): {type(exc).__name__}: {exc}")
 
 
 def init_db() -> None:
@@ -211,6 +211,70 @@ def backup_db() -> str:
     shutil.copy2(src, dest)
     print(f"[DB] Backup created: {dest}")
     return str(dest)
+
+
+#: Tables emptied by a factory reset (schema/meta rows are preserved).
+_RESET_TABLES = (
+    "customers",
+    "reminder_sent",
+    "policy_acks",
+    "events",
+    "alt_credentials",
+    "run_state",
+)
+
+#: Meta keys removed on factory reset — these cache resolved Discord channel
+#: ids and alt state for the CURRENT installation; the schema_version key is
+#: deliberately kept so restored copies stay version-tagged.
+_RESET_META_KEYS = ("open_ticket_ch_id",)
+
+
+def reset_all_data() -> dict[str, int]:
+    """Wipe every customer record for a factory-fresh state (V8 bug-fix plan #2).
+
+    Clears customers, stored alt credentials/tokens, run state, reminder and
+    policy acknowledgement ledgers, the event ledger, and installation meta
+    caches — the schema itself is left intact so the bot keeps running without
+    a restart. A timestamped local backup is taken first and the emptied DB is
+    pushed through the normal write-through backup so the *cleared* state is
+    what gets restored on the next chunk boot (a reset that only lived for
+    one chunk would defeat the purpose).
+
+    Returns ``{table: rows_deleted}`` including a ``"meta"`` entry.
+    """
+    backup_db()
+    counts: dict[str, int] = {}
+    with _conn() as con:
+        for table in _RESET_TABLES:
+            try:
+                n = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+                con.execute(f"DELETE FROM {table}")
+            except sqlite3.OperationalError:
+                # Table absent on a partially-migrated DB — nothing to clear.
+                n = 0
+            counts[table] = n
+        placeholders = ",".join("?" * len(_RESET_META_KEYS))
+        if _RESET_META_KEYS:
+            cur = con.execute(f"DELETE FROM meta WHERE key IN ({placeholders})", _RESET_META_KEYS)
+            counts["meta"] = cur.rowcount or 0
+        else:
+            counts["meta"] = 0
+        # V8 bug-fix plan #2: the reset itself belongs in the event ledger so
+        # the audit trail survives its own wipe.
+        record_event_in(con, "system", "factory_reset", {
+            "customers": counts.get("customers", 0),
+            "alt_credentials": counts.get("alt_credentials", 0),
+        })
+    _after_write("factory_reset")
+    return counts
+
+
+def record_event_in(con: sqlite3.Connection, discord_id: str, event: str, payload: Any = None) -> None:
+    """Append an event using an open connection (reset hook)."""
+    con.execute(
+        "INSERT INTO events (discord_id, event, ts, payload) VALUES (?,?,?,?)",
+        (str(discord_id), event, time.time(), json.dumps(payload or {})),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -535,10 +599,7 @@ def has_policy_ack(discord_id: str, version: str = "") -> bool:
 
 def record_event(discord_id: str, event: str, payload: Optional[dict[str, Any]] = None) -> None:
     with _conn() as con:
-        con.execute(
-            "INSERT INTO events (discord_id, event, ts, payload) VALUES (?,?,?,?)",
-            (discord_id or "", event, time.time(), json.dumps(payload or {})),
-        )
+        record_event_in(con, discord_id or "", event, payload)
 
 
 def get_events(

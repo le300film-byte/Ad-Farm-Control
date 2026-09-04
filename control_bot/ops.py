@@ -16,8 +16,6 @@ Contains:
 from __future__ import annotations
 
 import asyncio
-import csv
-import io
 import json
 import os
 import threading
@@ -25,7 +23,6 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-import discord
 
 import customer_manager as cm
 
@@ -196,8 +193,8 @@ def rss_snapshot() -> dict[str, float]:
                 if line.startswith("VmRSS:"):
                     kb = float(line.split()[1])
                     return {"rss_bytes": kb * 1024, "ts": time.time()}
-    except (OSError, ValueError, IndexError):
-        pass
+    except (OSError, ValueError, IndexError) as _ignored_exc:
+        print(f"[OPS] rss_snapshot: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return {"rss_bytes": 0.0, "ts": time.time()}
 
 
@@ -328,8 +325,8 @@ def enqueue_async_alert(text: str) -> None:
         return
     try:
         _alert_queue.put_nowait(text)
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[OPS] enqueue_async_alert: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 def ensure_alert_queue() -> asyncio.Queue:

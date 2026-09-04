@@ -58,8 +58,8 @@ def _pre_exec(limits: dict[str, Any]):
         for limit, value in limits.items():
             try:
                 resource.setrlimit(limit, value)
-            except (OSError, ValueError, resource.error):
-                pass
+            except (OSError, ValueError, resource.error) as _ignored_exc:
+                print(f"[SANDBOX] _apply: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return _apply
 
 
@@ -144,8 +144,8 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     except (OSError, ProcessLookupError):
         try:
             proc.terminate()
-        except OSError:
-            pass
+        except OSError as _ignored_exc:
+            print(f"[SANDBOX] _kill_process_group: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     try:
         proc.wait(timeout=1.5)
     except subprocess.TimeoutExpired:
@@ -154,8 +154,8 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         except (OSError, ProcessLookupError):
             try:
                 proc.kill()
-            except OSError:
-                pass
+            except OSError as _ignored_exc:
+                print(f"[SANDBOX] _kill_process_group: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 def run_script(

@@ -134,8 +134,8 @@ async def pin_policy_in_channel(channel: Any, extra: str = "") -> bool:
         )
         try:
             await msg.pin()
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[POLICY] pin_policy_in_channel: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         return True
     except Exception as exc:
         print(f"[POLICY] pin failed: {exc}")

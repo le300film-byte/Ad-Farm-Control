@@ -143,10 +143,10 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
                     "deal_keywords", "deal_scan_enabled", "deal_alert_delta",
                     "paused", "rate", "interval_min", "policy_template", "ad_type", "message"
                 }})
-    except Exception:
+    except Exception as _ignored_exc:
         # The PATCH below remains authoritative; inability to read an old
         # optional setting must not prevent a command from being queued.
-        pass
+        print(f"[GH-API] queue_control_command: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     payload.update({
         "alt_id": int(alt_id),
         "command_id": uuid.uuid4().hex,
@@ -162,8 +162,8 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
     elif command in ("setprice", "price", "rate"):
         try:
             payload["rate"] = float(args.strip())
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[GH-API] queue_control_command: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     elif command in ("setmode", "mode"):
         if args.lower().strip() in {"sell", "buy"}:
             payload["ad_type"] = args.lower().strip()
@@ -175,15 +175,15 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
             val = int(args.strip())
             if val in (3, 5):
                 payload["interval_min"] = val
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[GH-API] queue_control_command: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     elif command in ("setruntime", "runtime"):
         try:
             val = int(args.strip())
             if val in (6, 12, 18, 24, 48):
                 payload["runtime_hours"] = val
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[GH-API] queue_control_command: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     elif command == "policy":
         if args.lower().strip() in {"stealth", "aggressive", "peak_hour", "balanced"}:
             payload["policy_template"] = args.lower().strip()
@@ -211,8 +211,8 @@ def queue_control_command(alt_id: int, text: str) -> tuple[bool, str]:
             value = float(args.strip())
             if 0 <= value <= 5:
                 payload["deal_alert_delta"] = value
-        except (TypeError, ValueError, OverflowError):
-            pass
+        except (TypeError, ValueError, OverflowError) as _ignored_exc:
+            print(f"[GH-API] queue_control_command: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     started = time.perf_counter()
     try:
         response = requests.patch(
@@ -372,8 +372,8 @@ def delete_repository_secret(repo: str, name: str) -> tuple[bool, str]:
         r = requests.delete(url, headers=_auth_headers(slug), timeout=_HTTP_TIMEOUT)
         if r.status_code in (204, 200, 404):
             return True, "Secret deleted."
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[GH-API] delete_repository_secret: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # Fallback to gh CLI (note: gh secret delete does not take --yes)
     return _run_gh_secret(["secret", "delete", name, "--repo", slug], repo=slug)
 
@@ -556,8 +556,8 @@ def create_alt_repository(repo_slug_or_name: str, private: bool = False) -> tupl
             r = requests.post(url, headers=headers, json=payload, timeout=_HTTP_TIMEOUT)
             if r.status_code in (200, 201):
                 return True, slug
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[GH-API] create_alt_repository: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     gh_token = _token_for_repo(slug) or config.GITHUB_TOKEN
     if shutil.which("gh") and gh_token:
         env = os.environ.copy()
@@ -599,8 +599,8 @@ def provision_alt_repository_files_and_secrets(repo: str, user_token: str, chann
                 r_raw = requests.get(raw_url, headers=_auth_headers(), timeout=_HTTP_TIMEOUT)
                 if r_raw.status_code == 200:
                     content = r_raw.content
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[GH-API] provision_alt_repository_files_and_secrets: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         if content:
             upload_repository_file(slug, rel_path, content, message=f"bootstrap: install {rel_path}")
 
@@ -619,8 +619,8 @@ def provision_alt_repository_files_and_secrets(repo: str, user_token: str, chann
                     if cids:
                         resolved_channels = ",".join(cids)
                         break
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[GH-API] provision_alt_repository_files_and_secrets: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     # Clone common secrets from environment or config
     common_secrets = [

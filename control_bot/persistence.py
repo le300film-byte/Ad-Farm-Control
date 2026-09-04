@@ -65,8 +65,8 @@ class JsonStateStore:
                 if temp_name:
                     try:
                         os.unlink(temp_name)
-                    except OSError:
-                        pass
+                    except OSError as _ignored_exc:
+                        print(f"[STATE] save: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     def update(self, mutator: Callable[[dict[str, Any]], Any]) -> tuple[bool, Any]:
         """Load, mutate, and atomically save one document under one lock."""

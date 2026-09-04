@@ -72,24 +72,24 @@ class ReminderTracker:
         self._cache.add((str(key[0]), int(key[1])))
         try:
             cm.mark_reminder_sent(key[0], int(key[1]))
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[TIMER] add: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     def discard(self, key: tuple[str, int]) -> None:
         self._load()
         self._cache.discard((str(key[0]), int(key[1])))
         try:
             cm.clear_reminder_sent(key[0])
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[TIMER] discard: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     def clear(self) -> None:
         self._cache.clear()
         self._loaded = True
         try:
             cm.clear_reminder_sent()
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[TIMER] clear: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     def __contains__(self, key: tuple[str, int]) -> bool:
         self._load()
@@ -181,8 +181,8 @@ async def run_shutdown_for_customer(discord_id: str) -> None:
                 print(f"[TIMER] Cancelled {n} run(s) for {owner}/{repo}")
             except Exception as exc:
                 print(f"[TIMER] Could not cancel runs for {owner}/{repo}: {exc}")
-    except ImportError:
-        pass
+    except ImportError as _ignored_exc:
+        print(f"[TIMER] run_shutdown_for_customer: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     # 2. Deactivate in DB
     cm.deactivate_customer(discord_id)
@@ -344,7 +344,6 @@ async def auto_redispatch_loop_once() -> int:
             continue
         try:
             from control_bot import github_api
-            repo = github_api._repo_for(int(st.get("alt_index") or 1))
             runs = github_api.list_runs(int(st.get("alt_index") or 1), limit=1)
             status = str((runs[0].get("status") if runs else "") or "")
             conclusion = str((runs[0].get("conclusion") if runs else "") or "")

@@ -9,7 +9,6 @@ Uses discord.py 2.x APIs.
 """
 from __future__ import annotations
 
-import asyncio
 import os as _os
 from typing import Any, Optional
 
@@ -494,8 +493,8 @@ async def assert_forum_owner(inter: discord.Interaction, customer: dict[str, Any
             await inter.response.send_message(
                 "🔒 Could not verify forum ownership; ask an admin.", ephemeral=True
             )
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[FORUM] assert_forum_owner: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
         return False
 
 

@@ -6,6 +6,7 @@ channel IDs at startup via ``wire(bot)``.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Any, Callable, Optional
@@ -76,10 +77,9 @@ def register_sync_alert_sink() -> Callable[[str], None]:
     def _sink(message: str) -> None:
         print(f"[ALERT-SYNC] {message}")
         try:
-            import asyncio
             asyncio.run_coroutine_threadsafe(post_admin_alert(message), _LOOP)
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[ALERT] _sink: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return _sink
 
 

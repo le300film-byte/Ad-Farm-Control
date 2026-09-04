@@ -313,8 +313,8 @@ def _checkpoint(db_path: Path) -> None:
     con = sqlite3.connect(str(db_path))
     try:
         con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as _ignored_exc:
+        print(f"[GIST] _checkpoint: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     finally:
         con.close()
 
@@ -350,8 +350,8 @@ def _verify_db(data: bytes) -> tuple[bool, str]:
     finally:
         try:
             os.unlink(tmp)
-        except OSError:
-            pass
+        except OSError as _ignored_exc:
+            print(f"[GIST] _verify_db: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
 
 # ── write-through backup ───────────────────────────────────────────────────
@@ -543,8 +543,8 @@ def restore_db_from_gist() -> dict[str, Any]:
                 if tmp:
                     try:
                         os.unlink(tmp)
-                    except OSError:
-                        pass
+                    except OSError as _ignored_exc:
+                        print(f"[GIST] restore_db_from_gist: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             result = {"ok": True, "source": label, "revision": cand.get("revision"),
                       "at": time.time(), "sha256": digest, "bytes": len(data)}
             LAST_RESTORE = result

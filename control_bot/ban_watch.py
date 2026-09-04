@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any, Optional
+from typing import Any
 
 import discord
 
@@ -109,12 +109,12 @@ async def handle_ban_message(
         try:
             ch = bot.get_channel(int(logs_thread)) or await bot.fetch_channel(int(logs_thread))
             await ch.send(
-                f"🚫 **BAN DETECTED** — alt marked banned. Old repo renamed to "
+                "🚫 **BAN DETECTED** — alt marked banned. Old repo renamed to "
                 "*_BANNED_<timestamp>*, replacement repo provisioned. Time credit "
                 "applied per policy."
             )
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[BANWATCH] handle_ban_message: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return True
 
 

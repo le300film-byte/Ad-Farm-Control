@@ -114,8 +114,8 @@ class AltStateManager:
                     rate = float(raw.get("rate"))
                     if math.isfinite(rate) and 0 < rate <= 20:
                         alt.rate = rate
-                except (TypeError, ValueError, OverflowError):
-                    pass
+                except (TypeError, ValueError, OverflowError) as _ignored_exc:
+                    print(f"[STATE] _load_persistent_configuration: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
                 for field_name, valid in (("interval_min", {3, 5}), ("runtime_hours", {0, 6, 12, 18, 24, 48})):
                     try:
                         value = int(raw.get(field_name))
@@ -143,8 +143,8 @@ class AltStateManager:
                     delta = float(raw.get("deal_alert_delta"))
                     if math.isfinite(delta) and 0 <= delta <= 5:
                         alt.deal_alert_delta = delta
-                except (TypeError, ValueError, OverflowError):
-                    pass
+                except (TypeError, ValueError, OverflowError) as _ignored_exc:
+                    print(f"[STATE] _load_persistent_configuration: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     def _persistent_snapshot_locked(self) -> dict[str, Any]:
         """Return the non-secret, restart-safe portion of the current state."""
@@ -282,8 +282,8 @@ class AltStateManager:
                     rate = float(payload["rate"])
                     if math.isfinite(rate):
                         alt.rate = rate
-                except (TypeError, ValueError, OverflowError):
-                    pass
+                except (TypeError, ValueError, OverflowError) as _ignored_exc:
+                    print(f"[STATE] update_from_heartbeat: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             alt.rate_currency = self._text_value(payload, "rate_currency", alt.rate_currency, 30)
             alt.message_preview = self._text_value(payload, "message_preview", alt.message_preview, 120)
             for field_name in ("interval_min", "runtime_hours"):
@@ -333,8 +333,8 @@ class AltStateManager:
                     delta = float(payload["deal_alert_delta"])
                     if math.isfinite(delta) and 0 <= delta <= 5:
                         alt.deal_alert_delta = delta
-                except (TypeError, ValueError, OverflowError):
-                    pass
+                except (TypeError, ValueError, OverflowError) as _ignored_exc:
+                    print(f"[STATE] update_from_heartbeat: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             if isinstance(payload.get("log_counts"), dict):
                 alt.log_counts = {
                     str(key)[:40]: self._int_value(value)
@@ -394,8 +394,8 @@ class AltStateManager:
                     value = float(rate)
                     if math.isfinite(value):
                         alt.rate = value
-                except (TypeError, ValueError, OverflowError):
-                    pass
+                except (TypeError, ValueError, OverflowError) as _ignored_exc:
+                    print(f"[STATE] set_run_config: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             if isinstance(message, str):
                 alt.message_preview = message[:120]
             effective_interval = interval_min if interval_min is not None else interval
@@ -425,8 +425,8 @@ class AltStateManager:
                     value = float(delta)
                     if math.isfinite(value) and 0 <= value <= 5:
                         alt.deal_alert_delta = value
-                except (TypeError, ValueError, OverflowError):
-                    pass
+                except (TypeError, ValueError, OverflowError) as _ignored_exc:
+                    print(f"[STATE] set_deal_config: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
             self._persist_locked()
 
     def set_error(self, alt_id: int, text: str) -> None:

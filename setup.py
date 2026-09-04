@@ -186,8 +186,8 @@ def check_gh_cli() -> str:
                 ["gh", "auth", "refresh", "-s", "repo,workflow,gist,admin:org"],
                 timeout=60,
             )
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SETUP] check_gh_cli: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     return token
 
@@ -217,8 +217,8 @@ def get_core_repo() -> str:
             # Parse owner/repo from URL
             parts = url.rstrip("/").rstrip(".git").split("/")
             return f"{parts[-2]}/{parts[-1]}"
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SETUP] get_core_repo: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # Fallback: ask the user
     return _prompt("GitHub repository (owner/repo)", default="")
 
@@ -671,8 +671,8 @@ def create_backup_gist(gh_token: str, core_repo: str) -> Optional[str]:
             if existing_id:
                 _ok(f"Using existing Gist: {existing_id}")
                 return existing_id
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[SETUP] create_backup_gist: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     
     # Create new gist
     body = {

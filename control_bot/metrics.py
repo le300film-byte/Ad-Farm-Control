@@ -13,7 +13,6 @@ from typing import Any
 import customer_manager as cm
 
 from . import alerts
-from . import ops
 
 ALERT_SURVIVAL_DAYS = 7.0
 ALERT_CHURN_PCT = 30.0

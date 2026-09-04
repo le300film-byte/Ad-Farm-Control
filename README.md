@@ -3,6 +3,10 @@
 > **V8 (2026-09-03):** Full enterprise upgrade with multi-customer management,
 > subscription timers, VIP tier, admin panel, and 24/7 continuous bot runtime.
 > **One-command setup with 3-worker architecture.**
+> **V8 bug-fix round:** every command is now channel-aware (public/customer/vip/admin
+> tiers per channel + synced slash-command visibility), the fleet registry self-heals
+> via `/admin sweep-alts`, `/reset` performs a factory wipe, and ~150 silent
+> `except: pass` handlers across the codebase now log instead of swallowing.
 
 This repository contains the canonical V8 sender and official control-bot
 source for a GitHub Actions deployment. V8 transforms the bot from a single-operator
@@ -112,6 +116,31 @@ git add . && git commit -m '🚀 V8 setup' && git push origin main
 | `/admin verify-tokens` | Audit worker tokens |
 | `/admin expiry-alerts` | Dry-run reminder path |
 | `/admin activate-template @User` | Pre-filled activation command |
+| `/admin sync-commands` | Re-register the slash-command tree and re-apply channel visibility (run after deploys or channel renames) |
+| `/admin sweep-alts` | Probe every `ALT_REPOS` entry against GitHub and prune confirmed-404 ghost alts from state, DB and repo secrets |
+| `/reset confirm:RESET` | Owner-only factory reset: DB rows, backup files, control state, fleet registry + secrets (keeps user accounts/settings/repos intact) |
+
+### Channel Policy (bug-fix round)
+Slash commands are gated by *where* they are invoked — channel role decides the
+tier ceiling, the per-command tier must fit inside it (owners bypass the channel
+check entirely):
+
+| Tier | Commands | Default channels (name match, case-insensitive) |
+|------|----------|--------------------------------------------------|
+| public | `/help`, `/getstarted` | `welcome-about`, `pricing-plans`, `announcements` |
+| customer | `/setup` `/run` `/stop` `/pause` `/resume` `/tune` `/channels` `/deals` `/status` `/reply` `/refresh` `/dashboard` `/shutdown` `/alt` `/renew` `/pause-billing` `/proofs` | `control`, `dashboard`, `farm-logs`, `deals`, `open-ticket`, `tickets` |
+| vip | `/squad` `/script` `/vip` | `dm-inbox` |
+| admin | `/admin …`, `/reset` | `admin-commands`, `admin-alerts`, `admin-chat`, `audit-logs` |
+
+Override via env with channel IDs **or** names (comma-separated):
+`PUBLIC_CHANNELS`, `CUSTOMER_CHANNELS`, `VIP_CHANNELS`, `ADMIN_CHANNELS`,
+and `CUSTOMER_HUB_MARKER` (pattern that marks a customer's own hub room as
+customer-tier anywhere). Unclassified channels allow **public tier only**.
+On startup (and after `/admin sync-commands`) the guild is switched to
+**private registration** so commands only exist where allowed — one API call
+per command, and a human-readable summary is written to `#control` and the
+log channel. `CUSTOMER_GUILD_ID=0` (self-serve servers) skips guild-wide
+registration entirely, so every slash command stays invisible by design.
 
 ### Customer Commands (active subscription required)
 `/setup`, `/run`, `/stop`, `/pause`, `/resume`, `/alt`, `/tune`, `/channels`,

@@ -68,8 +68,8 @@ def token_for_owner(owner: str = "") -> str:
             tokens = [x.strip() for x in os.environ.get("WORKER_TOKENS_LIST", "").split(",") if x.strip()]
             if idx < len(tokens) and tokens[idx]:
                 return tokens[idx]
-        except ValueError:
-            pass
+        except ValueError as _ignored_exc:
+            print(f"[DISPATCH] token_for_owner: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return _admin_token()
 
 
@@ -251,8 +251,9 @@ def create_repo(
         ):
             print(f"[DISPATCH] Repo {owner}/{repo} already exists — reusing it.")
             return {**existing, "reused": True}
-    except RuntimeError:
-        pass  # repo does not exist yet → create below
+    except RuntimeError as exc:
+        # Intentional fall-through: a 404 from the probe means "create below".
+        print(f"[DISPATCH] existing-repo probe found nothing ({exc}); falling through to create path.")
     # Organisation vs. personal account
     try:
         _request("GET", f"/orgs/{quote(owner)}", token=token)
@@ -299,8 +300,8 @@ def discover_repo_owner(repo: str) -> str:
         main_owner = _resolve_owner("")
         if repo_exists(main_owner, repo):
             return main_owner
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[DISPATCH] discover_repo_owner: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return ""
 
 
@@ -617,8 +618,8 @@ def upload_file(
             token=token,
         )
         sha = existing.get("sha")
-    except RuntimeError:
-        pass
+    except RuntimeError as _ignored_exc:
+        print(f"[DISPATCH] upload_file: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     body: dict[str, Any] = {
         "message": commit_message,
@@ -688,8 +689,8 @@ def cancel_workflow_runs(
                 expected_statuses=(202,),
             )
             cancelled += 1
-        except RuntimeError:
-            pass
+        except RuntimeError as _ignored_exc:
+            print(f"[DISPATCH] cancel_workflow_runs: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     return cancelled
 
 

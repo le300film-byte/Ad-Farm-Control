@@ -51,8 +51,8 @@ def resolve_ticket_channel_candidates(guild: Optional[discord.Guild] = None,
     try:
         import customer_manager as cm
         _add(cm.get_meta("open_ticket_ch_id", ""))
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[TICKET] resolve_ticket_channel_candidates: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
     # 3. Channel the panel button was clicked in
     _add(panel_channel_id)
     # 4. Guild lookup by name
@@ -334,8 +334,8 @@ async def create_ticket_thread(
     # Add the customer to the thread
     try:
         await thread.add_user(inter.user)
-    except Exception:
-        pass
+    except Exception as _ignored_exc:
+        print(f"[TICKET] create_ticket_thread: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     # Add all members with Admin role
     admin_role = discord.utils.get(guild.roles, name="Admin")
@@ -343,8 +343,8 @@ async def create_ticket_thread(
         for member in admin_role.members:
             try:
                 await thread.add_user(member)
-            except Exception:
-                pass
+            except Exception as _ignored_exc:
+                print(f"[TICKET] create_ticket_thread: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     # Build the ticket embed
     embed = discord.Embed(
@@ -377,8 +377,8 @@ async def create_ticket_thread(
                 await alert_ch.send(admin_role.mention, embed=alert_embed)
             else:
                 await alert_ch.send(embed=alert_embed)
-        except Exception:
-            pass
+        except Exception as _ignored_exc:
+            print(f"[TICKET] create_ticket_thread: ignored {type(_ignored_exc).__name__}: {_ignored_exc}")  # silent-failure cleanup (V8 plan #4)
 
     # Confirm to customer
     await inter.response.send_message(
