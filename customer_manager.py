@@ -29,6 +29,38 @@ from typing import Any, Generator, Optional
 DB_PATH = os.environ.get("CUSTOMERS_DB", "customers.db")
 BACKUP_SUFFIX = ".backup"
 
+# V8 bug-fix M: hard cap on how many trading channels one alt may hold.  The
+# /setup wizard and /channels handler both enforce this limit.
+MAX_CHANNELS_PER_ALT = 10
+
+
+def channel_limit_message(limit: int = MAX_CHANNELS_PER_ALT) -> str:
+    """Canonical over-limit denial text (V8 bug-fix M)."""
+    return (
+        f"❌ Maximum {limit} channels per alt. "
+        "Remove one before adding a new one."
+    )
+
+
+def enforce_channel_limit(
+    current_count: int,
+    adding: int = 1,
+    limit: int = MAX_CHANNELS_PER_ALT,
+) -> tuple[bool, str]:
+    """Check whether *adding* channels to an alt with *current_count* channels
+    stays within the per-alt *limit*.
+
+    Returns ``(True, "")`` when allowed and ``(False, message)`` with the
+    canonical V8 denial text otherwise.
+    """
+    try:
+        total = int(current_count) + int(adding)
+    except (TypeError, ValueError):
+        total = MAX_CHANNELS_PER_ALT + 1
+    if total > int(limit):
+        return False, channel_limit_message(limit)
+    return True, ""
+
 # If set, alt tokens are obfuscated with this key before storage (XOR+base64).
 TOKEN_VAULT_KEY = os.environ.get("TOKEN_VAULT_KEY", "").strip()
 STORE_ALT_TOKENS = os.environ.get("STORE_ALT_TOKENS_IN_DB", "1").strip().lower() in {"1", "true", "yes", "on"}

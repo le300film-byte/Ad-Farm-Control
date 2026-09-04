@@ -139,15 +139,28 @@ async def _guarded(
         # Admins bypass customer/VIP checks
         return await func(*call_args, **call_kwargs)
 
+    # Admins always bypass the customer/VIP gates (documented contract):
+    # they control the bot and are not necessarily customers themselves.
+    if is_admin(uid):
+        return await func(*call_args, **call_kwargs)
+
     # Non-admin path: customer must exist and be active
     if not is_active_customer(uid_str):
         # Could be expired or never a customer
         from customer_manager import get_customer  # type: ignore
-        c = get_customer(uid_str)
+        try:
+            c = get_customer(uid_str)
+        except Exception:
+            c = None  # DB hiccup → fail closed with the subscription denial
         if c is not None and not c["active"]:
             await _deny(inter, "❌ Your subscription has expired. Contact an admin to renew.")
         else:
-            await _deny(inter, "❌ You are not authorized to use this command.")
+            # V8 bug-fix J: non-customers must see the subscription message.
+            await _deny(
+                inter,
+                "❌ You do not have an active subscription. "
+                "You are not authorized to use this command.",
+            )
         return
 
     if vip_only and not is_vip_customer(uid_str):
@@ -174,15 +187,26 @@ async def check_admin(inter: discord.Interaction) -> bool:
 
 
 async def check_active(inter: discord.Interaction) -> bool:
+    """Active-customer gate; admins (OWNER_IDS) always pass."""
+    if is_admin(inter.user.id):
+        return True
     uid_str = str(inter.user.id)
     if is_active_customer(uid_str):
         return True
     from customer_manager import get_customer  # type: ignore
-    c = get_customer(uid_str)
+    try:
+        c = get_customer(uid_str)
+    except Exception:
+        c = None  # DB hiccup → fail closed with the subscription denial
     if c is not None and not c["active"]:
         await _deny(inter, "❌ Your subscription has expired. Contact an admin to renew.")
     else:
-        await _deny(inter, "❌ You are not authorized to use this command.")
+        # V8 bug-fix J: non-customers get the active-subscription message.
+        await _deny(
+            inter,
+            "❌ You do not have an active subscription. "
+            "You are not authorized to use this command.",
+        )
     return False
 
 
@@ -194,6 +218,28 @@ async def check_vip(inter: discord.Interaction) -> bool:
         "❌ This feature requires VIP. Run /admin activate @User vip:true to upgrade.",
     )
     return False
+
+
+async def check_customer_access(inter: discord.Interaction, *, vip_only: bool = False) -> bool:
+    """V8 role gate shared by the customer-facing slash commands.
+
+    Resolution order (V8 bug-fixes F & J):
+      1. Admins (OWNER_IDS) always pass — they control the bot.
+      2. Everyone else needs an ACTIVE subscription (non-customers and
+         expired customers get the canonical denial messages).
+      3. With ``vip_only=True`` the caller must additionally be a VIP
+         customer (powers /squad and /script).
+
+    Returns True when the command may proceed, False after an ephemeral denial
+    was already sent.
+    """
+    if is_admin(inter.user.id):
+        return True
+    if not await check_active(inter):
+        return False
+    if vip_only:
+        return await check_vip(inter)
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────

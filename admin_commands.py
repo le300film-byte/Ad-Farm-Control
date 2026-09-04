@@ -6,11 +6,16 @@ They are hidden from users who are not admins.
 Commands:
   /admin list               – Show all active customers
   /admin activate @User days alts vip
-                            – Onboard a new customer
+                            – Onboard a new customer (reuses existing
+                              repos + forum; never duplicates them)
   /admin extend @User days  – Extend a subscription
   /admin deactivate @User   – Shut down and lock a customer
   /admin shutdown all       – Emergency kill-switch for all customers
+  /admin repos              – List every repo across all worker accounts
+                              (customer, alt, status) — V8 bug-fix K
   /admin repo sync          – Push latest send_ads.py to all repos
+  /admin repo delete        – Delete one customer repo (confirm: DELETE)
+                              — V8 bug-fix L
   /admin logs @User         – View a customer's recent log thread
 """
 from __future__ import annotations
@@ -73,6 +78,11 @@ class AdminCog(commands.Cog):
     admin_group = app_commands.Group(
         name="admin",
         description="V8 admin panel (owner-only)",
+        # V8 bug-fix F: hide /admin from everyone who lacks the Administrator
+        # permission in the guild (Discord-side visibility).  The OWNER_IDS
+        # allow-list is still enforced in every subcommand via check_admin.
+        default_permissions=discord.Permissions(administrator=True),
+        guild_only=True,
     )
 
     # /admin list
@@ -128,17 +138,49 @@ class AdminCog(commands.Cog):
         uid = str(user.id)
         uname = user.display_name
 
-        # 1. Create GitHub repos
+        existing = cm.get_customer(uid)
+
+        # 1. GitHub repos — REUSE what the customer already has (bug-fix D/E):
+        #    re-activating must never create duplicate repos or forums.
         repos: list[str] = []
-        gh_account = github_account.strip()
+        gh_account = github_account.strip().strip("/").strip()
         from github_dispatch import provision_alt_repo
-        if not gh_account:
-            # Use round-robin worker selection for new customer repos
-            from github_dispatch import pick_worker
+        if existing and existing.get("repos"):
+            repos = list(existing.get("repos") or [])
+            if not gh_account:
+                gh_account = (existing.get("github_account") or "").strip()
+            if repos:
+                await inter.followup.send(
+                    f"♻️ Reusing {len(repos)} existing repo(s) for **{uname}** — "
+                    f"`{repos}`",
+                    ephemeral=True,
+                )
+        if not repos and gh_account:
+            # Explicit worker account: all alts live under it.
             for i in range(1, alts + 1):
                 repo_name = f"{uname.lower().replace(' ', '_')}_alt{i}"
                 try:
-                    worker_user, worker_token = pick_worker()
+                    html_url = await asyncio.to_thread(
+                        provision_alt_repo, gh_account, repo_name
+                    )
+                    repos.append(repo_name)
+                    await inter.followup.send(
+                        f"✅ Created repo: [{repo_name}]({html_url})", ephemeral=True
+                    )
+                except Exception as exc:
+                    await inter.followup.send(
+                        f"⚠️ Repo `{repo_name}` creation failed: {exc}", ephemeral=True
+                    )
+        elif not repos:
+            # Round-robin worker selection — but pick ONE worker for the whole
+            # customer so every alt repo + the stored github_account stay
+            # consistent (bug-fix C: never store an empty/ambiguous owner).
+            from github_dispatch import pick_worker, _norm_owner
+            worker_user, worker_token = pick_worker()
+            gh_account = _norm_owner(worker_user)
+            for i in range(1, alts + 1):
+                repo_name = f"{uname.lower().replace(' ', '_')}_alt{i}"
+                try:
                     html_url = await asyncio.to_thread(
                         provision_alt_repo, worker_user, repo_name, worker_token
                     )
@@ -151,7 +193,7 @@ class AdminCog(commands.Cog):
                         f"⚠️ Repo `{repo_name}` creation failed: {exc}", ephemeral=True
                     )
 
-        # 2. Create Discord forum
+        # 2. Create/reuse the Discord forum (bug-fix E: never duplicated)
         forum_ids: dict[str, int] = {}
         if inter.guild:
             try:
@@ -167,6 +209,16 @@ class AdminCog(commands.Cog):
                 await inter.followup.send(
                     f"⚠️ Forum creation failed: {exc}", ephemeral=True
                 )
+        if not forum_ids and existing:
+            # No guild/forum available — keep any previously stored ids.
+            forum_ids = {
+                "forum_id": int(existing["forum_id"]) if str(existing.get("forum_id", "") or "").isdigit() else 0,
+                "control_thread_id": int(existing["control_thread_id"]) if str(existing.get("control_thread_id", "") or "").isdigit() else 0,
+                "dashboard_thread_id": int(existing["dashboard_thread_id"]) if str(existing.get("dashboard_thread_id", "") or "").isdigit() else 0,
+                "logs_thread_id": int(existing["logs_thread_id"]) if str(existing.get("logs_thread_id", "") or "").isdigit() else 0,
+                "dm_thread_id": int(existing["dm_thread_id"]) if str(existing.get("dm_thread_id", "") or "").isdigit() else 0,
+                "deals_thread_id": int(existing["deals_thread_id"]) if str(existing.get("deals_thread_id", "") or "").isdigit() else 0,
+            }
 
         # 3. Store customer record
         cm.add_customer(
@@ -293,22 +345,119 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    # /admin repo sync
+    # /admin repos — V8 bug-fix K: inventory across ALL worker accounts
+    @admin_group.command(
+        name="repos",
+        description="List every repo across all worker accounts (customer, alt, status).",
+    )
+    async def admin_repos(self, inter: discord.Interaction) -> None:
+        if not await check_admin(inter):
+            return
+        await inter.response.defer(ephemeral=True)
+        from github_dispatch import list_all_repos
+        customers = cm.list_customers(active_only=False)
+        entries = await asyncio.to_thread(list_all_repos, customers)
+        if not entries:
+            await inter.followup.send("📭 No repos found on any worker account.", ephemeral=True)
+            return
+        lines = ["```", f"{'REPO':<38} {'OWNER':<20} {'CUSTOMER':<18} {'ALT':>3}  STATUS"]
+        lines.append("-" * 88)
+        for e in sorted(entries, key=lambda x: (x.get("owner", ""), x.get("repo", ""))):
+            repo = e.get("repo", "") or f"(listing failed: {e.get('error', '')})"
+            status = str(e.get("status", "?")).upper()
+            lines.append(
+                f"{repo:<38} {str(e.get('owner', ''))[:19]:<20} "
+                f"{str(e.get('customer', ''))[:17]:<18} {e.get('alt', 0):>3}  {status}"
+            )
+        lines.append("```")
+        await self._audit(
+            f"📦 **Repo inventory** viewed by `{inter.user.display_name}` — "
+            f"{len(entries)} repo(s)."
+        )
+        await inter.followup.send(
+            f"📦 **{len(entries)}** repo(s) across worker accounts:\n" + "\n".join(lines),
+            ephemeral=True,
+        )
+
+    # /admin repo sync|delete — V8 bug-fix L: delete a repo from Discord with
+    # an explicit `DELETE` confirmation (accident guard).
     @admin_group.command(
         name="repo",
-        description="Sync the latest send_ads.py to all customer repos.",
+        description="Repo actions: sync sender to all repos, or delete one repo (confirm:DELETE).",
     )
-    @app_commands.describe(action="Action to perform (sync)")
+    @app_commands.describe(
+        action="Action to perform (sync | delete)",
+        repo_name="Repo to delete (required when action=delete)",
+        confirmation="Type DELETE to confirm deleting the repo",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="🔄 Sync — push latest sender to all repos", value="sync"),
+        app_commands.Choice(name="🗑️ Delete — permanently delete one customer repo", value="delete"),
+    ])
     async def admin_repo(
-        self, inter: discord.Interaction, action: str = "sync"
+        self,
+        inter: discord.Interaction,
+        action: str = "sync",
+        repo_name: str = "",
+        confirmation: str = "",
     ) -> None:
         if not await check_admin(inter):
             return
-        if action.lower() != "sync":
+        action = (action or "sync").lower()
+        if action not in ("sync", "delete"):
             await inter.response.send_message(
-                "ℹ️ Available actions: `sync`", ephemeral=True
+                "ℹ️ Available actions: `sync`, `delete`", ephemeral=True
             )
             return
+
+        if action == "delete":
+            # V8 bug-fix L — safety: the operator must type DELETE.
+            repo_name = (repo_name or "").strip().strip("/").strip()
+            if not repo_name:
+                await inter.response.send_message(
+                    "❌ Pass the repo to delete: `/admin repo action:delete repo_name:<name> "
+                    "confirmation:DELETE`",
+                    ephemeral=True,
+                )
+                return
+            if (confirmation or "").strip().upper() != "DELETE":
+                await inter.response.send_message(
+                    f"⚠️ **Deleting `{repo_name}` is irreversible.** Type "
+                    "`confirmation:DELETE` to confirm.",
+                    ephemeral=True,
+                )
+                return
+            await inter.response.defer(ephemeral=True)
+            customers = cm.list_customers(active_only=False)
+            from github_dispatch import delete_customer_repo
+            res = await asyncio.to_thread(delete_customer_repo, repo_name, customers)
+            if not res.get("ok"):
+                await inter.followup.send(
+                    f"❌ Repo `{repo_name}` could not be deleted: {res.get('error', 'unknown error')}",
+                    ephemeral=True,
+                )
+                return
+            owner = res.get("owner", "")
+            # Keep the customer record in sync (remove the repo from repos[]).
+            removed_from = ""
+            for c in customers:
+                repos = [r for r in (c.get("repos") or []) if r.strip().strip("/") != repo_name]
+                if len(repos) != len(c.get("repos") or []):
+                    cm.update_repos(c["discord_id"], repos)
+                    removed_from = c.get("discord_username", c["discord_id"])
+                    break
+            await self._audit(
+                f"🗑️ **Repo deleted** `{owner}/{repo_name}` by "
+                f"`{inter.user.display_name}` (confirmation: DELETE)"
+            )
+            await inter.followup.send(
+                f"🗑️ **Deleted `{owner}/{repo_name}`.**"
+                + (f"\nRemoved from customer **{removed_from}**'s record." if removed_from else ""),
+                ephemeral=True,
+            )
+            return
+
+        # action == sync (existing behaviour)
         await inter.response.defer(ephemeral=True)
         customers = cm.list_customers(active_only=False)
         from github_dispatch import sync_sender_to_all_repos

@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import random
+import re
 import time
 from typing import Any, Optional
 from urllib.error import HTTPError
@@ -97,6 +98,52 @@ def get_workers() -> list[tuple[str, str]]:
 
 _worker_index = 0
 
+# Cache of {token: login} so resolving the "main account" owner for an empty
+# owner string costs at most one GET /user per token.
+_LOGIN_CACHE: dict[str, str] = {}
+
+
+def _norm_owner(owner: str) -> str:
+    """Return *owner* stripped of whitespace and surrounding slashes.
+
+    V8 bug-fix C: owners coming from env vars, DB records or CLI input often
+    carry trailing/leading slashes (``darkkitty_alt1/``) or whitespace; URL
+    paths built from them then contain ``//`` or an empty segment
+    (``/repos//reponame`` → HTTP 404).  Normalising here guarantees repo paths
+    never contain double slashes.
+    """
+    return (owner or "").strip().strip("/").strip()
+
+
+def _norm_repo(repo: str) -> str:
+    """Return *repo* stripped of whitespace and surrounding slashes."""
+    return (repo or "").strip().strip("/").strip()
+
+
+def _resolve_owner(owner: str, token: Optional[str] = None) -> str:
+    """Return a non-empty URL-safe owner login.
+
+    When *owner* is empty (the "main account" fallback), the owner is resolved
+    to the authenticated token's login so URLs like ``/repos//name`` (double
+    slash / empty segment, V8 bug-fix C) can never be constructed.
+    """
+    owner = _norm_owner(owner)
+    if owner:
+        return owner
+    token = token or _admin_token()
+    cached = _LOGIN_CACHE.get(token)
+    if cached:
+        return cached
+    me = _request("GET", "/user", token=token)
+    login = str((me or {}).get("login") or "").strip()
+    if not login:
+        raise RuntimeError(
+            "Cannot resolve the GitHub owner: the token's /user response has "
+            "no login. Refusing to build a repo URL with an empty owner."
+        )
+    _LOGIN_CACHE[token] = login
+    return login
+
 
 def pick_worker() -> tuple[str, str]:
     """Pick the next worker account in round-robin order.
@@ -162,8 +209,12 @@ def _request(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def repo_exists(owner: str, repo: str, token: Optional[str] = None) -> bool:
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
+    tok = token or token_for_owner(owner)
     try:
-        _request("GET", f"/repos/{quote(owner)}/{quote(repo)}", token=token or token_for_owner(owner))
+        owner = _resolve_owner(owner, tok)
+        _request("GET", f"/repos/{quote(owner)}/{quote(repo)}", token=tok)
         return True
     except RuntimeError:
         return False
@@ -175,13 +226,33 @@ def create_repo(
     private: bool = False,
     token: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Create a GitHub repository under *owner*.
+    """Create a GitHub repository under *owner* (idempotent).
 
     Phase 0.2 (TODO): customer repos are PUBLIC (``private=False``) — public
     repositories unlock free GitHub Actions minutes.  Pass ``private=True``
     explicitly only when a founder opts a customer into private repos.
+
+    V8 bug-fix D: the repo is first checked with ``GET /repos/{owner}/{repo}``
+    and simply *reused* when it already exists — provisioning never fails with
+    ``422: name already exists on this account`` and never creates duplicates.
     """
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
+    # Reuse: an existing repo (e.g. left over from a previous activation or a
+    # concurrent provisioning) is returned instead of raising 422.  A GET
+    # response only counts as "already exists" when it carries repository
+    # fields (id/full_name/name) — this keeps unrelated GET mocks honest.
+    try:
+        existing = _request("GET", f"/repos/{quote(owner)}/{quote(repo)}", token=token)
+        if isinstance(existing, dict) and existing and (
+            "id" in existing or "full_name" in existing or "name" in existing
+        ):
+            print(f"[DISPATCH] Repo {owner}/{repo} already exists — reusing it.")
+            return {**existing, "reused": True}
+    except RuntimeError:
+        pass  # repo does not exist yet → create below
     # Organisation vs. personal account
     try:
         _request("GET", f"/orgs/{quote(owner)}", token=token)
@@ -210,7 +281,10 @@ def soft_delete_repo(owner: str, repo: str, token: Optional[str] = None) -> dict
     customer cannot keep running while the 24h undo window is open.  Call
     :func:`delete_repo` only after the window has elapsed.
     """
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     new_name = f"{repo}_DELETED_{int(time.time())}"
     _request(
         "PATCH",
@@ -228,16 +302,24 @@ def soft_delete_repo(owner: str, repo: str, token: Optional[str] = None) -> dict
 
 def disable_workflow(owner: str, repo: str, workflow_file: str, token: Optional[str] = None) -> None:
     """Disable a workflow file (avoids the repo being active during quarantine)."""
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
+    token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     _request(
         "PUT",
         f"/repos/{quote(owner)}/{quote(repo)}/actions/workflows/{quote(workflow_file)}/disable",
-        token=token or token_for_owner(owner),
+        token=token,
         expected_statuses=(204,),
     )
 
 
 def delete_repo(owner: str, repo: str, token: Optional[str] = None) -> bool:
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
+    token = token or token_for_owner(owner)
     try:
+        owner = _resolve_owner(owner, token)
         _request("DELETE", f"/repos/{quote(owner)}/{quote(repo)}", token=token)
         return True
     except RuntimeError:
@@ -258,7 +340,10 @@ def enable_repo_secret_protection(owner: str, repo: str, token: Optional[str] = 
     best-effort — a 404/403 means the token lacks admin scope and the runbook
     tells operators to enable it org-wide (V8_RUNBOOKS.md §2.2).
     """
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     res: dict[str, Any] = {"ok": False, "attempts": []}
     try:
         _request(
@@ -292,7 +377,9 @@ def enable_repo_secret_protection(owner: str, repo: str, token: Optional[str] = 
 
 def enable_org_secret_protection(owner: str, token: Optional[str] = None) -> dict[str, Any]:
     """Enable secret scanning + push protection org-wide (best-effort)."""
+    owner = _norm_owner(owner)
     token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     res: dict[str, Any] = {"ok": False}
     try:
         _request(
@@ -329,6 +416,9 @@ def verify_github_token(owner: str, token: Optional[str] = None) -> dict[str, An
         result["login"] = me.get("login", "")
         result["expires_at"] = me.get("expires_at", "")
         result["plan"] = (me.get("plan") or {}).get("name", "")
+        # V8 bug-fix C: never build /repos//… paths — an empty *owner* resolves
+        # to the authenticated login for the cleanup DELETE below.
+        owner = _norm_owner(owner) or str(result.get("login") or "")
     except RuntimeError as exc:
         result["error"] = f"identity: {exc}"
         return result
@@ -340,15 +430,19 @@ def verify_github_token(owner: str, token: Optional[str] = None) -> dict[str, An
     except RuntimeError:
         path = "/user/repos"
     try:
-        data = _request(
+        _request(
             "POST", path,
             body={"name": scratch, "private": True, "auto_init": False,
                   "description": "adfarm token write-access verification (auto-deleted)"},
             token=token,
             expected_statuses=(201,),
         )
-        created_path = f"/repos/{quote(owner)}/{quote(scratch)}"
+        if owner:
+            created_path = f"/repos/{quote(owner)}/{quote(scratch)}"
         result["created"] = True
+        if not created_path:
+            result["error"] = "delete: owner login could not be resolved for the cleanup path"
+            return result
     except RuntimeError as exc:
         result["error"] = f"create: {exc}"
         return result
@@ -406,6 +500,10 @@ def list_worker_tokens() -> list[dict[str, str]]:
 
 def _get_public_key(owner: str, repo: str, token: Optional[str] = None) -> tuple[str, str]:
     """Return (key_id, base64_public_key) for encrypting repository secrets."""
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
+    token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     data = _request(
         "GET",
         f"/repos/{quote(owner)}/{quote(repo)}/actions/secrets/public-key",
@@ -446,6 +544,8 @@ def set_repo_secret(
     token: Optional[str] = None,
 ) -> None:
     """Create or update a GitHub Actions secret in a customer repo."""
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token or token_for_owner(owner)
     key_id, pub_key = _get_public_key(owner, repo, token)
     encrypted = _encrypt_secret(pub_key, secret_value)
@@ -472,7 +572,10 @@ def upload_file(
     token: Optional[str] = None,
 ) -> None:
     """Create or update a file in a GitHub repo via the Contents API."""
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     encoded = base64.b64encode(content.encode()).decode()
     # Check if the file already exists (to get its sha for update)
     sha: Optional[str] = None
@@ -516,11 +619,15 @@ def dispatch_workflow(
     token: Optional[str] = None,
 ) -> None:
     """Trigger a workflow_dispatch event on a customer repository."""
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
+    token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     _request(
         "POST",
         f"/repos/{quote(owner)}/{quote(repo)}/actions/workflows/{quote(workflow_file)}/dispatches",
         body={"ref": ref, "inputs": inputs or {}},
-        token=token or token_for_owner(owner),
+        token=token,
         expected_statuses=(204,),
     )
 
@@ -531,7 +638,10 @@ def cancel_workflow_runs(
     token: Optional[str] = None,
 ) -> int:
     """Cancel all in-progress workflow runs on a customer repository."""
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     data = _request(
         "GET",
         f"/repos/{quote(owner)}/{quote(repo)}/actions/runs?status=in_progress&per_page=20",
@@ -576,7 +686,10 @@ def provision_alt_repo(
 
     Returns the HTML URL of the created repo.
     """
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token or token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     # 1. Create the repo (idempotent – skip if it already exists)
     if not repo_exists(owner, repo, token):
         result = create_repo(owner, repo, private=private, token=token)
@@ -624,7 +737,10 @@ def provision_alt_repo(
 
 def rename_banned_repo(owner: str, repo: str) -> str:
     """Rename an alt repo to ``<repo>_BANNED_<timestamp>`` (TODO 1.2)."""
+    owner = _norm_owner(owner)
+    repo = _norm_repo(repo)
     token = token_for_owner(owner)
+    owner = _resolve_owner(owner, token)
     new_name = f"{repo}_BANNED_{int(time.time())}"
     _request(
         "PATCH",
@@ -657,10 +773,11 @@ def sync_sender_to_all_repos(
 
     results: dict[str, str] = {}
     for c in customers:
-        owner = c.get("github_account", "")
+        owner = _norm_owner(c.get("github_account", ""))
         repos = c.get("repos", [])
         for repo in repos:
-            key = f"{owner}/{repo}"
+            repo = _norm_repo(repo)
+            key = f"{owner or '?'}/{repo}"
             try:
                 upload_file(owner, repo, "send_ads.py", sender_code,
                             "chore: sync send_ads.py", token=token)
@@ -668,3 +785,210 @@ def sync_sender_to_all_repos(
             except Exception as exc:
                 results[key] = f"error: {exc}"
     return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# V8 bug-fix K/L — admin repo inventory + direct deletion from Discord
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _paginated_repos(owner: str, token: str) -> list[dict[str, Any]]:
+    """List every repository of one account (org-scoped when possible)."""
+    owner = _norm_owner(owner)
+    try:
+        owner = _resolve_owner(owner, token)
+    except RuntimeError:
+        return []
+    try:
+        _request("GET", f"/orgs/{quote(owner)}", token=token)
+        base = f"/orgs/{quote(owner)}/repos"
+    except RuntimeError:
+        base = "/user/repos"
+    repos: list[dict[str, Any]] = []
+    page = 1
+    while page <= 10:
+        try:
+            data = _request("GET", f"{base}?per_page=100&page={page}&type=all", token=token)
+        except RuntimeError:
+            break
+        if not isinstance(data, list) or not data:
+            break
+        repos.extend(data)
+        if len(data) < 100:
+            break
+        page += 1
+    return repos
+
+
+def _repo_status_flags(name: str) -> tuple[str, str]:
+    """Return (marker, status) for a repo name, e.g. ('_BANNED_', 'banned')."""
+    if "_BANNED_" in name:
+        return "_BANNED_", "banned"
+    if "_DELETED_" in name:
+        return "_DELETED_", "quarantined"
+    return "", "active"
+
+
+def list_all_repos(customers: Optional[list[dict]] = None) -> list[dict[str, Any]]:
+    """Enumerate every customer alt repo across ALL worker accounts.
+
+    V8 bug-fix K — powers ``/admin repos``.  Each returned entry contains:
+    ``owner`` (account login), ``repo`` (name), ``customer`` (Discord username
+    or ""), ``customer_id``, ``alt`` (alt index parsed from the name or 0),
+    ``status`` (active / banned / quarantined / orphan / listing_error) and
+    ``html_url``.  The main account is included as a fallback listing when no
+    worker tokens are configured; main-account noise is filtered to
+    customer-looking repo names.
+    """
+    if customers is None:
+        try:
+            import customer_manager as cm  # lazy import keeps this module DB-free
+            customers = cm.list_customers(active_only=False)
+        except Exception:
+            customers = []
+    customers = customers or []
+
+    # repo name → owning customer record (original, pre-rename names)
+    owner_for_customer: dict[str, dict[str, Any]] = {}
+    by_name: dict[str, dict[str, Any]] = {}
+    for c in customers:
+        for repo in c.get("repos") or []:
+            repo = _norm_repo(repo)
+            by_name.setdefault(repo, c)
+        account = _norm_owner(c.get("github_account") or "")
+        if account:
+            owner_for_customer.setdefault(account, c)
+
+    accounts = get_workers()  # [(username, token)]
+    listing_errors: list[str] = []
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _looks_customerish(name: str) -> bool:
+        return bool(re.search(r"_alt\d+(_BANNED_\d+)?(_DELETED_\d+)?$", name)
+                    or "_BANNED_" in name or "_DELETED_" in name)
+
+    for user, tok in accounts:
+        owner = _norm_owner(user)
+        try:
+            repos = _paginated_repos(owner, tok)
+        except RuntimeError as exc:
+            entries.append({"owner": user or "(main)", "repo": "",
+                            "customer": "", "customer_id": "", "alt": 0,
+                            "status": "listing_error", "html_url": "",
+                            "error": str(exc)})
+            listing_errors.append(f"{user or '(main)'}: {exc}")
+            continue
+        # When listing the main account only, skip unrelated repositories.
+        for item in repos:
+            repo = _norm_repo(item.get("name") or "")
+            repo_owner = _norm_owner((item.get("owner") or {}).get("login") or "")
+            repo_owner = repo_owner or owner or _norm_owner(user)
+            key = (repo_owner, repo)
+            if key in seen:
+                continue
+            seen.add(key)
+            customer = by_name.get(repo)
+            if customer is None and not user and not _looks_customerish(repo):
+                # Main-account noise (core repo, docs, …) is not a customer alt.
+                continue
+            marker, status = _repo_status_flags(repo)
+            base_name = repo.split(marker)[0] if marker else repo
+            if customer is None:
+                customer = by_name.get(base_name) or by_name.get(repo)
+            alt = 0
+            m = re.search(r"_alt(\d+)", base_name)
+            if m:
+                alt = int(m.group(1))
+            entries.append({
+                "owner": repo_owner,
+                "repo": repo,
+                "customer": (customer or {}).get("discord_username", "") or "",
+                "customer_id": (customer or {}).get("discord_id", "") or "",
+                "alt": alt,
+                "status": status if status != "active" else
+                          ("active" if customer and (customer or {}).get("active") else
+                           ("orphan" if customer is None else "inactive")),
+                "html_url": item.get("html_url") or f"https://github.com/{repo_owner}/{repo}",
+            })
+
+    # DB repos that no configured account could list (token/scope gaps) are
+    # still reported so the admin can spot missing workers.
+    listed_names = {e["repo"] for e in entries if e["repo"]}
+    for c in customers:
+        for repo in c.get("repos") or []:
+            repo = _norm_repo(repo)
+            if repo and repo not in listed_names:
+                owner = _norm_owner(c.get("github_account") or "")
+                entries.append({
+                    "owner": owner or "(unknown)",
+                    "repo": repo,
+                    "customer": c.get("discord_username", "") or "",
+                    "customer_id": c.get("discord_id", "") or "",
+                    "alt": int(m.group(1)) if (m := re.search(r"_alt(\d+)", repo)) else 0,
+                    "status": "unlisted",
+                    "html_url": f"https://github.com/{owner or '?'}/{repo}",
+                })
+                listed_names.add(repo)
+    return entries
+
+
+def delete_customer_repo(
+    repo_name: str,
+    customers: Optional[list[dict]] = None,
+) -> dict[str, Any]:
+    """Hard-delete a customer alt repo by name (V8 bug-fix L).
+
+    The owner is taken from the customer DB record first, then discovered by
+    searching every configured worker account.  Returns ``{"ok": bool,
+    "owner": str, "repo": str, "error": str}``.  The caller is responsible for
+    requiring an explicit ``DELETE`` confirmation and for updating the
+    customer record afterwards.
+    """
+    repo_name = _norm_repo(repo_name)
+    if not repo_name:
+        return {"ok": False, "owner": "", "repo": "", "error": "No repo name given."}
+    if customers is None:
+        try:
+            import customer_manager as cm
+            customers = cm.list_customers(active_only=False)
+        except Exception:
+            customers = []
+    customers = customers or []
+
+    # 1. Owner from the DB mapping.
+    for c in customers:
+        for repo in c.get("repos") or []:
+            if _norm_repo(repo) != repo_name:
+                continue
+            owner = _norm_owner(c.get("github_account") or "")
+            if not owner:
+                continue
+            try:
+                deleted = delete_repo(owner, repo_name)
+            except RuntimeError as exc:
+                return {"ok": False, "owner": owner, "repo": repo_name, "error": str(exc)}
+            if deleted:
+                return {"ok": True, "owner": owner, "repo": repo_name,
+                        "customer_id": c.get("discord_id", "") or "", "error": ""}
+            return {"ok": False, "owner": owner, "repo": repo_name,
+                    "error": "GitHub rejected the delete request."}
+
+    # 2. Fallback: search every worker account for the repo.
+    for entry in list_all_repos(customers):
+        if entry.get("repo") != repo_name:
+            continue
+        owner = entry.get("owner") or ""
+        if not owner:
+            continue
+        try:
+            deleted = delete_repo(owner, repo_name)
+        except RuntimeError as exc:
+            return {"ok": False, "owner": owner, "repo": repo_name, "error": str(exc)}
+        if deleted:
+            return {"ok": True, "owner": owner, "repo": repo_name,
+                    "customer_id": entry.get("customer_id", "") or "", "error": ""}
+        return {"ok": False, "owner": owner, "repo": repo_name,
+                "error": "GitHub rejected the delete request."}
+
+    return {"ok": False, "owner": "", "repo": repo_name,
+            "error": "Repo not found on any configured worker account."}

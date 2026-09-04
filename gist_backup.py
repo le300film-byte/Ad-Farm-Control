@@ -46,6 +46,14 @@ DB_PREV_FILENAME = "customers.prev.db.b64"
 META_FILENAME = "db-meta.json"
 LOCK_FILENAME = "LOCK"
 
+# Bootstrap file written when the module has to create the backup Gist from
+# scratch (deleted Gist, or first run without a GIST_ID).  GitHub rejects Gist
+# creation with HTTP 422 "missing_field: files" when the payload has no
+# non-empty ``files`` member, so every create payload always carries a file.
+BOOTSTRAP_FILENAME = "customers.json"
+BOOTSTRAP_CONTENT = "{}"
+GIST_DESCRIPTION = "AdFarm V8 — customers.db backup (auto-managed, do not edit)"
+
 # Startup lease: a booting bot holds the LOCK for 10 minutes and renews it
 # while it runs (see timer_engine), so a second boot cannot start concurrently.
 LEASE_SECONDS = int(os.environ.get("DB_GIST_LEASE_SECONDS", "600") or 600)
@@ -65,6 +73,10 @@ _token = (
 )
 _api_base = os.environ.get("GITHUB_API_BASE", "").strip() or GITHUB_API
 
+# Reentrant lock (V8 bug-fix B): RLock means nested acquisition from
+# backup/lease/heartbeat paths (e.g. gist_configured() inside a locked write)
+# can never deadlock the heartbeat thread — a plain Lock() used to block it
+# for 50+ s.
 _lock = threading.RLock()
 _alert_callback: Optional[Callable[[str], None]] = None
 
@@ -177,6 +189,17 @@ def _request(
         raise GistError(f"{type(exc).__name__}: {exc}") from exc
 
 
+def _is_gist_missing(exc: Exception) -> bool:
+    """True when *exc* means the configured Gist no longer exists.
+
+    HTTP 404/410 = the Gist was deleted (or the id is stale).  HTTP 422 with
+    ``missing_field: files`` happens when GitHub rejects a Gist payload with an
+    empty ``files`` member — treated as missing too so the caller recreates the
+    Gist with a proper ``files`` payload (V8 bug-fix A).
+    """
+    return isinstance(exc, GistError) and exc.status in (404, 410, 422)
+
+
 def fetch_gist(gist_id: Optional[str] = None) -> dict[str, Any]:
     """Fetch full Gist payload (files, history, metadata)."""
     gid = gist_id or _gist_id
@@ -185,12 +208,87 @@ def fetch_gist(gist_id: Optional[str] = None) -> dict[str, Any]:
     return _request("GET", f"/gists/{gid}")
 
 
+def create_gist(
+    files: Optional[dict[str, dict[str, Any]]] = None,
+    description: str = GIST_DESCRIPTION,
+    public: bool = False,
+) -> dict[str, Any]:
+    """Create a NEW private backup Gist and adopt it as the module's target.
+
+    The payload ALWAYS contains a non-empty ``files`` key — GitHub answers
+    ``422 Validation Failed / missing_field: files`` when a create payload has
+    no files, so a bootstrap file (``customers.json`` = ``{}``) is written
+    when none is supplied.  Returns the created Gist payload.
+    """
+    global _gist_id
+    files = files if isinstance(files, dict) and files else {
+        BOOTSTRAP_FILENAME: {"content": BOOTSTRAP_CONTENT},
+    }
+    resp = _request(
+        "POST",
+        "/gists",
+        body={
+            "description": description,
+            "public": bool(public),
+            "files": files,
+        },
+        ok_statuses=(200, 201),
+    )
+    payload = resp if isinstance(resp, dict) else {}
+    new_id = str(payload.get("id") or "").strip()
+    if not new_id:
+        raise GistError("GitHub accepted the Gist create but returned no id.")
+    _gist_id = new_id
+    print(f"[DB-GIST] Created new backup Gist {new_id} (target id updated in-memory).")
+    return payload
+
+
+def ensure_gist() -> dict[str, Any]:
+    """Return the backup Gist payload, creating the Gist first when missing.
+
+    V8 bug-fix A: the Gist is guaranteed to exist before any update is
+    attempted.  When the configured Gist id is stale/deleted (HTTP 404/410) or
+    GitHub rejected the payload for a missing ``files`` member (HTTP 422) a
+    fresh private Gist is created — always with a non-empty ``files`` payload
+    — and ``_gist_id`` is repointed at it so every later PATCH succeeds.
+    """
+    if not _token:
+        raise GistError("GIST_TOKEN is not configured.")
+    gid = _gist_id
+    if gid:
+        try:
+            payload = fetch_gist(gid)
+            if not isinstance(payload, dict) or not payload:
+                raise GistError(f"Gist {gid} returned an empty payload.", status=404)
+            return payload
+        except GistError as exc:
+            if not _is_gist_missing(exc):
+                raise
+            print(f"[DB-GIST] Backup Gist {gid} is missing ({exc}); recreating…")
+    else:
+        print("[DB-GIST] No backup Gist id configured; creating one…")
+    return create_gist()
+
+
 def update_gist_files(files: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """PATCH a Gist, preserving every file not mentioned in *files*."""
+    """PATCH a Gist, preserving every file not mentioned in *files*.
+
+    The ``files`` key is always present in the payload (V8 bug-fix A).  If the
+    configured Gist no longer exists the PATCH is retried once against a fresh
+    Gist created by :func:`ensure_gist`.
+    """
+    if not isinstance(files, dict) or not files:
+        raise GistError("Gist update payload must contain a non-empty 'files' key.")
     gid = _gist_id
     if not gid:
         raise GistError("CUSTOMERS_GIST_ID is not configured.")
-    return _request("PATCH", f"/gists/{gid}", body={"files": files})
+    try:
+        return _request("PATCH", f"/gists/{gid}", body={"files": files})
+    except GistError as exc:
+        if exc.status in (404, 410):
+            ensure_gist()  # repoints _gist_id at the fresh Gist
+            return _request("PATCH", f"/gists/{_gist_id}", body={"files": files})
+        raise
 
 
 def fetch_gist_revision(sha: str) -> dict[str, Any]:
@@ -274,6 +372,10 @@ def backup_db_to_gist(reason: str = "write") -> dict[str, Any]:
         last_err: Optional[Exception] = None
         for attempt in range(len(RETRY_BACKOFFS) + 1):
             try:
+                # V8 bug-fix A: never PATCH a Gist that does not exist — fetch
+                # (or create, when the configured one was deleted / the payload
+                # was rejected as missing files) before doing anything else.
+                ensure_gist()
                 result = _backup_once(db_path, reason)
                 LAST_BACKUP = {"ok": True, "revision": result["revision"], "at": time.time(), "error": ""}
                 return result
@@ -293,6 +395,11 @@ def backup_db_to_gist(reason: str = "write") -> dict[str, Any]:
     return {"ok": False, "error": str(last_err), "degraded": True, "revision": LAST_BACKUP.get("revision", 0)}
 
 
+def backup_to_gist(reason: str = "write") -> dict[str, Any]:
+    """Alias of :func:`backup_db_to_gist` (V8 bug-fix A naming)."""
+    return backup_db_to_gist(reason=reason)
+
+
 def _backup_once(db_path: Path, reason: str) -> dict[str, Any]:
     _checkpoint(db_path)
     if not db_path.exists():
@@ -303,6 +410,7 @@ def _backup_once(db_path: Path, reason: str) -> dict[str, Any]:
     prev_db_b64 = ""
     current_meta: dict[str, Any] = {}
     current_db_b64 = ""
+    # Gist existence is guaranteed by backup_db_to_gist → ensure_gist().
     gist = fetch_gist()
     files = gist.get("files") if isinstance(gist, dict) else {}
     if isinstance(files, dict):
@@ -331,11 +439,8 @@ def _backup_once(db_path: Path, reason: str) -> dict[str, Any]:
             kind="split-brain",
         )
 
-    if current_db_b64 and prev_db_b64:
-        # rotate: keep one previous revision for recovery
-        pass
     new_db_b64 = _encode_db(data)
-    # keep old current as PREV
+    # rotate: keep one previous revision for recovery
     prev_db_b64 = current_db_b64 or prev_db_b64
 
     meta = {
@@ -347,11 +452,16 @@ def _backup_once(db_path: Path, reason: str) -> dict[str, Any]:
         "reason": reason,
         "prev_sha256": _sha256(_decode_db(prev_db_b64)) if prev_db_b64 else "",
     }
-    update_gist_files({
+    # Always send a non-empty files payload.  In particular an empty-string
+    # PATCH deletes a file on GitHub — never send a delete for DB_PREV when the
+    # Gist has no previous artifact yet (GitHub rejects it with HTTP 422).
+    patch_files: dict[str, dict[str, Any]] = {
         META_FILENAME: {"content": json.dumps(meta, sort_keys=True)},
         DB_FILENAME: {"content": new_db_b64},
-        DB_PREV_FILENAME: {"content": prev_db_b64},
-    })
+    }
+    if prev_db_b64:
+        patch_files[DB_PREV_FILENAME] = {"content": prev_db_b64}
+    update_gist_files(patch_files)
     return {"ok": True, "revision": revision, "sha256": digest, "bytes": len(data),
             "reason": reason, "degraded": False}
 
@@ -375,7 +485,9 @@ def restore_db_from_gist() -> dict[str, Any]:
     last_err = ""
     candidates: list[dict[str, Any]] = []
     try:
-        gist = fetch_gist()
+        # V8 bug-fix A: ensure the Gist exists before reading from it — a
+        # deleted Gist is recreated (empty) instead of failing opaque-ly.
+        gist = ensure_gist()
         files = gist.get("files") if isinstance(gist, dict) else {}
         meta_raw = (files.get(META_FILENAME, {}) or {}).get("content", "")
         meta = json.loads(meta_raw) if meta_raw else {}
@@ -475,7 +587,7 @@ def acquire_run_lease(run_id: Optional[str] = None) -> dict[str, Any]:
         return LAST_LEASE
     run_id = run_id or os.environ.get("GITHUB_RUN_ID", "") or f"local-{uuid.uuid4().hex[:12]}"
     try:
-        gist = fetch_gist()
+        gist = ensure_gist()  # never PATCH a missing Gist (V8 bug-fix A)
         files = gist.get("files") if isinstance(gist, dict) else {}
         raw_lock = (files.get(LOCK_FILENAME, {}) or {}).get("content", "")
         holder: dict[str, Any] = {}
@@ -515,6 +627,7 @@ def renew_run_lease(run_id: str) -> bool:
         return True
     try:
         lease = _lease_payload(run_id)
+        ensure_gist()  # never PATCH a missing Gist (V8 bug-fix A)
         update_gist_files({LOCK_FILENAME: {"content": json.dumps(lease, sort_keys=True)}})
         LAST_LEASE["expires_at"] = lease["expires_at"]
         return True
@@ -528,8 +641,10 @@ def release_run_lease(run_id: str) -> bool:
     if not gist_configured():
         return True
     try:
-        gist = fetch_gist()
+        gist = ensure_gist()  # never PATCH a missing Gist (V8 bug-fix A)
         files = gist.get("files") if isinstance(gist, dict) else {}
+        if LOCK_FILENAME not in (files or {}):
+            return True  # nothing to release
         raw_lock = (files.get(LOCK_FILENAME, {}) or {}).get("content", "")
         holder = json.loads(raw_lock) if raw_lock else {}
         if holder.get("run_id") != run_id:

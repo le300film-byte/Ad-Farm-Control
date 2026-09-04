@@ -56,6 +56,126 @@ async def _get_or_create_category(
     return cat
 
 
+async def find_customer_forum(
+    guild: discord.Guild,
+    customer_member: discord.Member,
+    display_name: str,
+) -> Optional[discord.ForumChannel]:
+    """Find a customer's existing private forum inside the Customer Hub.
+
+    V8 bug-fix E: ``/admin activate`` used to create a brand-new forum on
+    every run, so repeated activations piled up duplicate forums.  This
+    searches every forum channel in the ``🏢 Customer Hub`` category and
+    returns the first one that belongs to the customer — matched by:
+
+    1. the customer member appearing in the channel's permission overwrites
+       (the strongest signal), or
+    2. the channel name matching the customer's display name.
+
+    Returns ``None`` when no existing forum belongs to the customer.
+    """
+    try:
+        display_name = (display_name or "").strip().lower()
+        category = discord.utils.get(guild.categories, name=CUSTOMER_HUB_CATEGORY)
+        if category is None:
+            return None
+        candidates: list[discord.ForumChannel] = []
+        for channel in getattr(category, "channels", []) or []:
+            if _looks_like_forum_channel(channel):
+                candidates.append(channel)
+        customer_id = getattr(customer_member, "id", None)
+        for forum in candidates:
+            try:
+                overwrites = forum.overwrites or {}
+            except Exception:
+                overwrites = {}
+            # 1. Permission-overwrite match: the customer is allowed in it.
+            for target in overwrites:
+                if customer_id is not None and getattr(target, "id", None) == customer_id:
+                    ov = overwrites[target]
+                    if ov is None or ov.view_channel:
+                        return forum
+            # 2. Name match on the display name.
+            name = str(getattr(forum, "name", "") or "").strip().lower()
+            if display_name and name == display_name:
+                return forum
+        return None
+    except Exception as exc:
+        print(f"[FORUM] Warning: customer-forum lookup failed: {exc}")
+        return None
+
+
+def _looks_like_forum_channel(channel: Any) -> bool:
+    """True for real ``discord.ForumChannel`` objects and duck-typed stand-ins.
+
+    Real guild categories hold ``ForumChannel`` instances (type 15).  Minimal
+    mocks used by offline tests may carry neither, so a channel with a
+    ``create_thread`` capability or permission-overwrite state and no plain
+    ``send`` method (text channels have one, forums do not) is treated as a
+    forum for the purposes of the reuse lookup.
+    """
+    if isinstance(channel, discord.ForumChannel):
+        return True
+    type_name = str(getattr(channel, "type", "")).lower()
+    if "forum" in type_name or type_name == "15":
+        return True
+    if hasattr(channel, "create_thread"):
+        return True
+    return hasattr(channel, "overwrites") and not hasattr(channel, "send")
+
+
+async def _collect_or_create_threads(
+    forum: discord.ForumChannel,
+    vip: bool,
+    display_name: str,
+) -> dict[str, int]:
+    """Return {forum_id, ..._thread_id} for an EXISTING forum.
+
+    Reuses already-present threads (#control, #dashboard, #farm-logs, #deals,
+    #dm-inbox) and creates only the ones that are missing — e.g. #dm-inbox
+    when a customer is upgraded to VIP after activation.
+    """
+    ids: dict[str, int] = {"forum_id": forum.id}
+    thread_map = [
+        ("control", "control"),
+        ("dashboard", "dashboard"),
+        ("logs", "farm-logs"),
+        ("deals", "deals"),
+    ]
+    if vip:
+        thread_map.insert(3, ("dm_inbox", "dm-inbox"))
+
+    existing: dict[str, discord.Thread] = {}
+    try:
+        for thread in getattr(forum, "threads", []) or []:
+            existing[str(getattr(thread, "name", "") or "").strip()] = thread
+    except Exception:
+        existing = {}
+
+    for key, thread_name in thread_map:
+        thread = existing.get(thread_name)
+        if thread is None:
+            try:
+                thread, _ = await forum.create_thread(
+                    name=thread_name,
+                    content=f"📌 **#{thread_name}** — {_thread_description(thread_name)}",
+                    reason=f"V8 customer thread: #{thread_name}",
+                )
+            except Exception as exc:
+                print(f"[FORUM] Warning: could not create thread #{thread_name}: {exc}")
+                ids[f"{key}_thread_id"] = 0
+                continue
+        ids[f"{key}_thread_id"] = getattr(thread, "id", 0) or 0
+
+    # Ensure non-VIP keys always exist
+    for k in ("control_thread_id", "dashboard_thread_id", "logs_thread_id",
+              "dm_thread_id", "deals_thread_id"):
+        ids.setdefault(k, 0)
+    print(f"[FORUM] Reused existing customer forum {forum.id} for {display_name} "
+          f"(no duplicate created).")
+    return ids
+
+
 async def create_customer_forum(
     guild: discord.Guild,
     bot_member: discord.Member,
@@ -66,6 +186,10 @@ async def create_customer_forum(
 ) -> dict[str, int]:
     """Create a private forum channel for a customer with the required threads.
 
+    V8 bug-fix E: when the customer already has a forum inside the Customer Hub
+    (e.g. /admin activate is run twice, or a re-activation after expiry), the
+    existing forum + threads are REUSED instead of creating duplicates.
+
     Returns a dict with keys: forum_id, control_thread_id, dashboard_thread_id,
     logs_thread_id, dm_thread_id, deals_thread_id.
     All values are Discord snowflake IDs (int).
@@ -73,6 +197,11 @@ async def create_customer_forum(
     category = await _get_or_create_category(
         guild, CUSTOMER_HUB_CATEGORY, bot_member, admin_role
     )
+
+    # Reuse an existing forum for this customer (no duplicates).
+    existing_forum = await find_customer_forum(guild, customer_member, display_name)
+    if existing_forum is not None:
+        return await _collect_or_create_threads(existing_forum, vip, display_name)
 
     # Forum channel overwrites: only the customer and admins/bot can see it
     overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {

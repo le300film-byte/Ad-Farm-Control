@@ -109,6 +109,26 @@ def _on_cooldown(uid: int) -> float:
     return 0.0
 
 
+def _is_operator(inter_or_user: Any) -> bool:
+    """Whether the user may drive customer-tier command flows end-to-end.
+
+    True for the bot owner, V8 admins (OWNER_IDS) and ACTIVE subscribers —
+    used by modal/hub callback guards that sit *inside* a customer-tier
+    command flow (which was already gated at the slash-command entry).
+    """
+    if _is_owner(inter_or_user):
+        return True
+    if not _V8_LOADED:
+        return False
+    try:
+        uid = inter_or_user.user.id
+        if _is_admin_v8(int(uid)):
+            return True
+        return bool(_security.is_active_customer(str(uid)))
+    except Exception:
+        return False
+
+
 def _ad_icon(ad_type: str) -> str:
     if (ad_type or "").lower() == "sell":
         return "💰"
@@ -408,14 +428,75 @@ async def _start_ops_monitors(bot: "commands.Bot") -> None:
 
 
 # ----- Slash commands -----
-async def _check_perms(inter: discord.Interaction) -> bool:
-    if not _is_owner(inter):
-        msg = "🔒 You aren't authorized to run control commands."
-        if inter.response.is_done():
-            await inter.followup.send(msg, ephemeral=True)
-        else:
-            await inter.response.send_message(msg, ephemeral=True)
-        return False
+# Max trading channels per alt (V8 bug-fix M).  The canonical limit lives in
+# customer_manager.MAX_CHANNELS_PER_ALT; mirror it here with a safe fallback
+# so /setup and /channels enforce the cap even if V8 imports fail.
+try:
+    from customer_manager import (  # noqa: F401
+        MAX_CHANNELS_PER_ALT as _MAX_CHANNELS_PER_ALT,
+        channel_limit_message as _channel_limit_message,
+    )
+except Exception:
+    _MAX_CHANNELS_PER_ALT = 10
+
+    def _channel_limit_message(limit: int = 10) -> str:
+        return (
+            f"❌ Maximum {limit} channels per alt. "
+            "Remove one before adding a new one."
+        )
+
+
+# Role sets (V8 bug-fix F): slash commands are grouped by the viewer's tier so
+# /help and the interaction gate can apply one consistent rule per command.
+ROLE_ADMIN_COMMANDS = {"admin"}
+ROLE_VIP_COMMANDS = {"squad", "script"}
+ROLE_PUBLIC_COMMANDS = {"help", "getstarted"}
+ROLE_CUSTOMER_COMMANDS = {
+    "setup", "run", "stop", "pause", "resume", "tune", "channels",
+    "deals", "status", "reply", "refresh", "dashboard", "shutdown",
+    "alt", "renew", "pause-billing", "proofs",
+}
+
+
+def viewer_role(inter: discord.Interaction) -> str:
+    """Classify a user for command visibility: admin / vip / customer / public.
+
+    V8 bug-fix F: admins (OWNER_IDS) see everything; VIPs see VIP + customer +
+    public commands; active customers see customer + public; everyone else sees
+    only public commands (/help, /getstarted).
+    """
+    try:
+        if _V8_LOADED:
+            uid = inter.user.id if hasattr(inter, "user") else None
+            if uid is not None:
+                if _is_owner(inter) or _is_admin_v8(int(uid)):
+                    return "admin"
+                if _security.is_active_customer(str(uid)):
+                    if _security.is_vip_customer(str(uid)):
+                        return "vip"
+                    return "customer"
+            return "public"
+        return "admin" if _is_owner(inter) else "public"
+    except Exception:
+        try:
+            return "admin" if _is_owner(inter) else "public"
+        except Exception:
+            return "public"
+
+
+def commands_for_role(role: str) -> set[str]:
+    """Set of top-level command names visible to *role* (V8 bug-fix F)."""
+    if role == "admin":
+        return ROLE_ADMIN_COMMANDS | ROLE_VIP_COMMANDS | ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS
+    if role == "vip":
+        return ROLE_VIP_COMMANDS | ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS
+    if role == "customer":
+        return ROLE_CUSTOMER_COMMANDS | ROLE_PUBLIC_COMMANDS
+    return set(ROLE_PUBLIC_COMMANDS)  # non-customers: /help + /getstarted only
+
+
+async def _cooldown_allowed(inter: discord.Interaction) -> bool:
+    """Enforce the command cooldown; replies and returns False when hot."""
     cd = _on_cooldown(inter.user.id)
     if cd > 0:
         msg = f"⏱️ Cooldown — wait {cd:.1f}s."
@@ -423,6 +504,51 @@ async def _check_perms(inter: discord.Interaction) -> bool:
             await inter.followup.send(msg, ephemeral=True)
         else:
             await inter.response.send_message(msg, ephemeral=True)
+        return False
+    return True
+
+
+async def _check_perms(inter: discord.Interaction, role: str = "owner") -> bool:
+    """Gate a slash command by *role* (V8 bug-fix F/J).
+
+    role="owner"  → legacy behaviour: OWNER_IDS only (fail closed).
+    role="customer" → admins OR active subscribers (subscription denial for
+        everyone else — plan J).
+    role="vip"    → admins OR active VIP subscribers.
+
+    The bot owner (config OWNER_IDS — the same allow-list security.py reads)
+    always passes every role; the legacy cooldown keeps applying to owners.
+    When the V8 modules are unavailable every role falls back to the legacy
+    owner-only gate so deployments never open up accidentally.
+    """
+    # V8 role-aware gating.
+    if _V8_LOADED and role in ("customer", "vip"):
+        try:
+            from security import check_customer_access as _cca
+            owner = _is_owner(inter)
+            if not owner:
+                if not await _cca(inter, vip_only=(role == "vip")):
+                    return False
+            else:
+                # Owners keep the legacy cooldown behaviour.
+                if not await _cooldown_allowed(inter):
+                    return False
+            return True
+        except Exception as exc:
+            print(f"[V8] Role gate degraded ({exc}); falling back to owner gate.")
+            # fall through to the legacy owner gate below
+
+    if not _is_owner(inter):
+        # Non-owner on a customer command → the active-subscription denial
+        # (never-customer case, V8 bug-fix J) is sent by the role gate above;
+        # here we keep the legacy denial for non-V8 / owner-role paths.
+        msg = "🔒 You aren't authorized to run control commands."
+        if inter.response.is_done():
+            await inter.followup.send(msg, ephemeral=True)
+        else:
+            await inter.response.send_message(msg, ephemeral=True)
+        return False
+    if not await _cooldown_allowed(inter):
         return False
     return True
 
@@ -702,6 +828,12 @@ class AddChannelModal(discord.ui.Modal, title="Add Advertising Channel"):
         cid = self.channel_id.value.strip()
         if not cid.isdigit():
             return await inter.response.send_message("❌ Channel ID must contain digits only.", ephemeral=True)
+        # V8 bug-fix M: the interactive add flow enforces the 10-channel cap too.
+        a_obj = state.get(self.alt_id)
+        if a_obj is not None and len(a_obj.channels) >= _MAX_CHANNELS_PER_ALT:
+            return await inter.response.send_message(
+                _channel_limit_message(_MAX_CHANNELS_PER_ALT), ephemeral=True
+            )
         label = re.sub(r"[\r\n]", " ", self.channel_name.value.strip())[:80]
 
         async def _update_and_persist():
@@ -1448,7 +1580,7 @@ class AltAddModal(discord.ui.Modal, title="Add New Alt Account"):
     )
 
     async def on_submit(self, inter: discord.Interaction):
-        if not _is_owner(inter):
+        if not _is_operator(inter):
             await inter.response.send_message("🔒 You aren't authorized to manage alts.", ephemeral=True)
             return
         def value(item) -> str:
@@ -1580,7 +1712,7 @@ class AltUpdateModal(discord.ui.Modal):
             self.add_item(item)
 
     async def on_submit(self, inter: discord.Interaction):
-        if not _is_owner(inter):
+        if not _is_operator(inter):
             await inter.response.send_message("🔒 You aren't authorized to manage alts.", ephemeral=True)
             return
         alt_id = self.alt_id_value
@@ -1746,7 +1878,7 @@ class AltControlHubView(discord.ui.View):
                 def __init__(parent_self):
                     super().__init__(placeholder="Choose an Alt to manage...", min_values=1, max_values=1, options=options, row=0)
                 async def callback(sel_self, inter: discord.Interaction):
-                    if not _is_owner(inter):
+                    if not _is_operator(inter):
                         return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
                     self.selected_alt = int(sel_self.values[0])
                     self._build_items()
@@ -1763,39 +1895,39 @@ class AltControlHubView(discord.ui.View):
         btn_refresh = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.primary, emoji="🔄", row=2)
 
         async def _cb_add(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await inter.response.send_modal(AltAddModal())
 
         async def _cb_update(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             if not state.get(self.selected_alt):
                 return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
             await inter.response.send_modal(AltUpdateModal(self.selected_alt))
 
         async def _cb_logs(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_logs(inter, self.selected_alt, limit=15)
 
         async def _cb_selfcheck(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_selfcheck(inter, self.selected_alt)
 
         async def _cb_runs(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_runs(inter, self.selected_alt, limit=5)
 
         async def _cb_clearlogs(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             await _handle_alt_clearlogs(inter, self.selected_alt)
 
         async def _cb_refresh(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             self._build_items()
             embed = self._render_embed()
@@ -1844,7 +1976,7 @@ class DealsHubView(discord.ui.View):
                 def __init__(parent_self):
                     super().__init__(placeholder="Select Alt to configure deals...", min_values=1, max_values=1, options=options, row=0)
                 async def callback(sel_self, inter: discord.Interaction):
-                    if not _is_owner(inter):
+                    if not _is_operator(inter):
                         return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
                     self.alt_id = int(sel_self.values[0])
                     self._build_items()
@@ -1858,7 +1990,7 @@ class DealsHubView(discord.ui.View):
         btn_refresh = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄", row=1)
 
         async def _cb_toggle(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             target = self.alt_id or (state.alt_ids[0] if state.alt_ids else 1)
             alt_obj = state.get(target)
@@ -1867,13 +1999,13 @@ class DealsHubView(discord.ui.View):
             await _handle_deal_scan(inter, target, new_val)
 
         async def _cb_modal(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             target = self.alt_id or (state.alt_ids[0] if state.alt_ids else 1)
             await inter.response.send_modal(DealsManagerModal(target))
 
         async def _cb_sim(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             class _SimModal(discord.ui.Modal, title="Simulate Market Listing"):
                 sample = discord.ui.TextInput(
@@ -1889,7 +2021,7 @@ class DealsHubView(discord.ui.View):
             await inter.response.send_modal(_SimModal())
 
         async def _cb_refresh(inter: discord.Interaction):
-            if not _is_owner(inter):
+            if not _is_operator(inter):
                 return await inter.response.send_message("❌ Unauthorized.", ephemeral=True)
             self._build_items()
             embed = self._render_embed()
@@ -1986,7 +2118,7 @@ def _run_preview_embed(values: dict[str, str], parsed: dict[str, object]) -> dis
 
 
 async def _dispatch_run_from_modal(inter: discord.Interaction, values: dict[str, str], parsed: dict[str, object]) -> None:
-    if not _is_owner(inter):
+    if not _is_operator(inter):
         await inter.response.send_message("🔒 You aren't authorized to run control commands.", ephemeral=True)
         return
     if not inter.response.is_done():
@@ -2005,7 +2137,7 @@ async def _dispatch_run_from_modal(inter: discord.Interaction, values: dict[str,
 
 
 async def _execute_run_dispatch(inter: discord.Interaction, values: dict[str, str], parsed: dict[str, object]) -> None:
-    if not _is_owner(inter):
+    if not _is_operator(inter):
         if inter.response.is_done():
             await inter.followup.send("🔒 You aren't authorized to run control commands.", ephemeral=True)
         else:
@@ -2338,7 +2470,7 @@ async def _handle_simulate_listing(inter: discord.Interaction, alt: int, sample_
 
 @bot.tree.command(name="run", description="Launch Ad Run — pick alt, enter ad text, preview & confirm dispatch")
 async def cmd_run(inter: discord.Interaction):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     if not state.alt_ids:
         await inter.response.send_message(
@@ -2358,8 +2490,27 @@ async def cmd_run(inter: discord.Interaction):
 
 @bot.tree.command(name="getstarted", description="Quick-Start Guide — step-by-step V8 checklist from policy acceptance to first ad run.")
 async def cmd_getstarted(inter: discord.Interaction):
-    if not await _check_perms(inter):
-        return
+    """Public onboarding guide (V8 bug-fix F/G).
+
+    Paid customers get a short "already set up" note instead of the full
+    onboarding tour; only non-customers see the step-by-step guide.
+    """
+    if _V8_LOADED:
+        try:
+            if _security.is_active_customer(str(inter.user.id)):
+                embed = discord.Embed(
+                    title="✅ Already set up",
+                    description=(
+                        "You're already set up! Use /help to see available commands."
+                    ),
+                    color=0x57F287,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.set_footer(text="AdFarm V8 · /getstarted")
+                await inter.response.send_message(embed=embed, ephemeral=True)
+                return
+        except Exception:
+            pass  # DB hiccup → fall through to the full guide
     embed = discord.Embed(
         title="🚀 Get Started — V8 Ad Farm Quick-Start Guide",
         description=(
@@ -2372,7 +2523,7 @@ async def cmd_getstarted(inter: discord.Interaction):
     steps = [
         ("1. Accept the Policy", "Read the pinned policy card in `#open-ticket` and click **✅ I Agree**. This is required before any payment address is shared (money-gate)."),
         ("2. Pay & Activate", "Send BEP-20 USDT/BUSD via Trust Wallet. An admin verifies on BSCScan, then runs `/admin activate @You days:30 alts:N` to create your private forum and repos."),
-        ("3. Run /setup", "Type `/setup` in your `#control` thread. Enter your alt tokens and channel IDs — the wizard validates each one before moving to the next. Watch the 3-min video if you're stuck."),
+        ("3. Run /setup", "Type `/setup` in your `#control` thread. Enter your alt tokens and channel IDs — the wizard validates each one before moving to the next. The wizard modal links the token walkthrough video if you need it."),
         ("4. Launch your farm", "Run `/run` — pick your alt, mode (Sell/Buy), interval (3/5 min), runtime (6–48h or ∞ Limitless), enter your ad text, and click **Confirm Launch**."),
         ("5. Monitor", "Check `#dashboard` for live status (updated every 5 min), `#farm-logs` for action logs, and `#deals` for arbitrage alerts. Use `/status` for a quick overview."),
         ("6. Tune on the fly", "Use `/tune alt:1 price:2.50` to change your rate, `/tune alt:1 message:New text` to change your ad copy, or `/channels` to add/replace trading channels."),
@@ -2465,7 +2616,7 @@ async def _run_script_sandbox(inter: discord.Interaction, script: str, *, execut
     ]
 )
 async def cmd_script(inter: discord.Interaction, action: Literal["simulate", "run"], code: str):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="vip"):
         return
     await _run_script_sandbox(inter, code, execute=(action == "run"), label=action)
 
@@ -2473,7 +2624,7 @@ async def cmd_script(inter: discord.Interaction, action: Literal["simulate", "ru
 @bot.tree.command(name="shutdown", description="Shutdown — stop all alts and terminate the bot (requires SHUTDOWN)")
 @app_commands.describe(confirmation="Type SHUTDOWN to confirm")
 async def cmd_shutdown(inter: discord.Interaction, confirmation: str):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     if str(confirmation or "").strip().upper() != "SHUTDOWN":
         return await inter.response.send_message("❌ Type `SHUTDOWN` exactly in the confirmation field to confirm shutdown.", ephemeral=True)
@@ -2516,7 +2667,7 @@ async def cmd_shutdown(inter: discord.Interaction, confirmation: str):
 @bot.tree.command(name="stop", description="Stop Ad Run — sends stop command via Gist queue and cancels the GitHub Actions workflow (~30-45s).")
 @app_commands.describe(alt="Target alt ID to stop")
 async def cmd_stop(inter: discord.Interaction, alt: int):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     a = state.get(alt)
     if not a:
@@ -2535,7 +2686,7 @@ async def cmd_stop(inter: discord.Interaction, alt: int):
 @bot.tree.command(name="pause", description="Pause Posting — temporarily halt ad delivery on all channels without stopping the GitHub runner.")
 @app_commands.describe(alt="Target alt ID to pause (or choose specific alt)")
 async def cmd_pause(inter: discord.Interaction, alt: int):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     await _finish_dm_control(inter, alt, "!pause", "pause requested")
 
@@ -2543,7 +2694,7 @@ async def cmd_pause(inter: discord.Interaction, alt: int):
 @bot.tree.command(name="resume", description="Resume Posting — unpause ad delivery and restore the regular posting schedule.")
 @app_commands.describe(alt="Target alt ID to resume (or choose specific alt)")
 async def cmd_resume(inter: discord.Interaction, alt: int):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     await _finish_dm_control(inter, alt, "!resume", "resume requested")
 
@@ -2589,7 +2740,7 @@ async def cmd_alt(
     kind: Optional[Literal["ALL", "ERROR", "DEAL", "CONTROL", "CHANNEL", "CAUTION", "DEBUG"]] = "ALL",
     search: Optional[str] = None,
 ):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
 
     target_aid = alt if (alt and alt in state.alt_ids) else (state.alt_ids[0] if state.alt_ids else 1)
@@ -2664,7 +2815,7 @@ async def cmd_tune(
     runtime: Optional[Literal[6, 12, 18, 24, 48]] = None,
     image: Optional[discord.Attachment] = None,
 ):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
 
     has_params = any((policy, price, mode, message, interval, runtime, image))
@@ -2922,7 +3073,7 @@ async def cmd_channels(
     new_channel_id: Optional[str] = None,
     name: Optional[str] = "",
 ):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
 
     chosen_alt = alt if (alt and alt in state.alt_ids) else (state.alt_ids[0] if state.alt_ids else 1)
@@ -2967,8 +3118,11 @@ async def cmd_channels(
         cids = [x.strip() for x in raw.replace(",", ",").split(",") if x.strip()]
         if not cids or not all(x.isdigit() for x in cids):
             return await inter.response.send_message("❌ Every channel ID must be numeric.", ephemeral=True)
-        if len(cids) > 100:
-            return await inter.response.send_message("❌ Maximum 100 channels per overwrite.", ephemeral=True)
+        # V8 bug-fix M: the per-alt cap is 10 channels — enforced on overwrite too.
+        if len(cids) > _MAX_CHANNELS_PER_ALT:
+            return await inter.response.send_message(
+                _channel_limit_message(_MAX_CHANNELS_PER_ALT), ephemeral=True
+            )
         a_obj = state.get(chosen_alt)
         if not a_obj:
             return await inter.response.send_message("❓ Unknown alt.", ephemeral=True)
@@ -3019,6 +3173,11 @@ async def cmd_channels(
         label = re.sub(r"[\r\n]", " ", (name or "").strip())[:80]
         a_obj = state.get(chosen_alt)
         old_ids = list(a_obj.channels.keys()) if a_obj else []
+        # V8 bug-fix M: adding past the 10-channel per-alt cap is rejected.
+        if len(old_ids) >= _MAX_CHANNELS_PER_ALT:
+            return await inter.response.send_message(
+                _channel_limit_message(_MAX_CHANNELS_PER_ALT), ephemeral=True
+            )
         old_names = {str(key): str(raw.get("name") or "") for key, raw in (a_obj.channels.items() if a_obj else []) if isinstance(raw, dict)}
         async def _update_and_persist():
             state.set_channel(chosen_alt, cid, label)
@@ -3093,7 +3252,7 @@ async def cmd_deals(
     keywords: Optional[str] = None,
     sample_listing: Optional[str] = None,
 ):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
 
     target_aid = alt if alt != 0 else (state.alt_ids[0] if state.alt_ids else 1)
@@ -3170,7 +3329,7 @@ async def cmd_squad(
     alt: Optional[int] = 0,
     value: Optional[str] = None,
 ):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="vip"):
         return
 
     if action in (None, "overview", "list") and not squad_name:
@@ -3264,7 +3423,7 @@ async def cmd_squad(
 @bot.tree.command(name="status", description="Live Status — fleet-wide dashboard or single-alt diagnostic card")
 @app_commands.describe(alt="Target alt (or 0 for All alts)")
 async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     await _fresh_state()
     if alt == 0:
@@ -3276,7 +3435,7 @@ async def cmd_status(inter: discord.Interaction, alt: Optional[int] = 0):
 @bot.tree.command(name="reply", description="DM Relay — send a message through an alt account directly to a buyer's DM.")
 @app_commands.describe(alt="Alt ID to send from", user="Buyer Discord User ID (from #dm-inbox)", text="Message text to send (leave blank for multiline editor)")
 async def cmd_reply(inter: discord.Interaction, alt: Optional[int] = 1, user: Optional[str] = "", text: Optional[str] = None):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     if not text:
         return await inter.response.send_modal(BuyerReplyModal(alt_id=alt or 1, user_id=user or ""))
@@ -3303,7 +3462,7 @@ async def cmd_reply(inter: discord.Interaction, alt: Optional[int] = 1, user: Op
 
 @bot.tree.command(name="refresh", description="Force Refresh — instantly poll latest GitHub workflow states and update the dashboard.")
 async def cmd_refresh(inter: discord.Interaction):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     await inter.response.defer(ephemeral=True)
     await _fresh_state()
@@ -3313,7 +3472,7 @@ async def cmd_refresh(inter: discord.Interaction):
 
 @bot.tree.command(name="dashboard", description="Dashboard — post a fresh live status snapshot (health, sent/errors, channels, deals) to #dashboard.")
 async def cmd_dashboard(inter: discord.Interaction):
-    if not await _check_perms(inter):
+    if not await _check_perms(inter, role="customer"):
         return
     await inter.response.defer(ephemeral=True)
     await _fresh_state()
@@ -3429,7 +3588,9 @@ _COMMAND_GUIDE = {
         "Admin panel (OWNER_IDS only). Subcommands: "
         "list (show all customers), activate (onboard customer with repos/forum/DB), "
         "extend (add subscription days), deactivate (shut down and lock), "
-        "shutdown (emergency kill-switch, 2-admin multi-sig), repo-sync (push code to all repos), "
+        "shutdown (emergency kill-switch, 2-admin multi-sig), "
+        "repos (list every repo across all worker accounts), "
+        "repo sync (push code to all repos) / repo delete (delete one repo, confirm:DELETE), "
         "expiry-alerts (dry-run reminders), pin-policy (pin ToS in #open-ticket), "
         "activate-template (pre-filled activation), payment-address (share wallet, gated on policy ack), "
         "verify-tokens (write-proof + expiry health), logs (link to #farm-logs)."
@@ -3472,17 +3633,19 @@ _COMMAND_GUIDE = {
 
 @bot.tree.command(name="help", description="V8 Command Reference — complete guide to all commands, arguments, and features.")
 async def cmd_help(inter: discord.Interaction):
-    if not await _check_perms(inter):
-        return
+    """Role-aware command reference (V8 bug-fix F/I).
+
+    Admins see every command; VIPs see VIP + customer + public commands;
+    active customers see customer + public commands; non-customers see only
+    /help and /getstarted.  Commands outside the viewer's tier are never
+    listed.
+    """
+    role = viewer_role(inter)
+    allowed = commands_for_role(role)
+
     registered = {cmd.name: cmd for cmd in bot.tree.get_commands()}
 
-    # Categorize commands for V8-aware help
-    V8_CUSTOMER = {"setup", "run", "stop", "pause", "resume", "status", "tune",
-                   "channels", "deals", "squad", "alt", "reply", "renew",
-                   "pause-billing", "proofs"}
-    V8_ADMIN = {"admin"}
-    V8_SYSTEM = {"getstarted", "script", "shutdown", "refresh", "dashboard", "help"}
-
+    # Categorize commands for V8-aware help (top-level names only)
     categories = [
         ("🚀 Getting Started", ["getstarted", "setup", "run", "help"]),
         ("⚙️ Ad Farm Controls", ["stop", "pause", "resume", "status", "tune"]),
@@ -3501,6 +3664,8 @@ async def cmd_help(inter: discord.Interaction):
             timestamp=datetime.now(timezone.utc),
         )
         for name in cmd_names:
+            if name not in allowed:
+                continue  # hide commands above the viewer's tier (bug-fix F)
             if name not in registered:
                 continue
             cmd_obj = registered[name]
@@ -3653,7 +3818,7 @@ def _valid_channel_ids(raw: str) -> tuple[bool, list[str]]:
     clean = list(dict.fromkeys(parts))
     if not clean:
         return False, []
-    if len(clean) > 20:
+    if len(clean) > _MAX_CHANNELS_PER_ALT:  # V8 bug-fix M: 10 channels per alt
         return False, []
     if not all(p.isdigit() and 10 <= len(p) <= 20 for p in clean):
         return False, []
@@ -3728,6 +3893,20 @@ class SetupAltModal(discord.ui.Modal, title="Alt Setup — Credentials"):
 
     async def on_submit(self, inter: discord.Interaction) -> None:
         tok = self.token.value.strip()
+        # V8 bug-fix M: reject more than MAX_CHANNELS_PER_ALT (10) channels up
+        # front with the canonical error before any validation work happens.
+        submitted = [p.strip() for p in (self.channels.value or "").split(",") if p.strip()]
+        if len(submitted) > _MAX_CHANNELS_PER_ALT:
+            await inter.response.send_message(
+                _channel_limit_message(_MAX_CHANNELS_PER_ALT),
+                ephemeral=True,
+            )
+            view = _NextAltButton(self._alt_num, self._total, self._session)
+            await inter.followup.send(
+                "👉 You can re-open this alt with fewer channels:",
+                view=view, ephemeral=True,
+            )
+            return
         ok_chs, ch_ids = _valid_channel_ids(self.channels.value)
         valid_tok, username = await asyncio.to_thread(_validate_discord_token_sync, tok)
         if not ok_chs or not valid_tok:
@@ -3735,7 +3914,10 @@ class SetupAltModal(discord.ui.Modal, title="Alt Setup — Credentials"):
             if not valid_tok:
                 problems.append(f"token invalid ({username})")
             if not ok_chs:
-                problems.append("channel IDs must be comma-separated numeric snowflakes (1-20)")
+                problems.append(
+                    "channel IDs must be comma-separated numeric snowflakes "
+                    f"(1-{_MAX_CHANNELS_PER_ALT})"
+                )
             await inter.response.send_message(
                 f"❌ **Alt {self._alt_num} rejected** — {', '.join(problems)}.\n"
                 "Fix the values and click the retry button below.",
@@ -3871,14 +4053,8 @@ async def cmd_setup(inter: discord.Interaction) -> None:
     Step 2: one modal per alt (token + channels), each validated before the
             next one is offered.
     """
-    if _V8_LOADED:
-        from security import check_active
-        if not await check_active(inter):
-            return
-    else:
-        if not await _check_perms(inter):
-            return
-
+    if not await _check_perms(inter, role="customer"):
+        return
     uid = str(inter.user.id)
     if _V8_LOADED:
         customer = _cm.get_customer(uid)
@@ -3906,13 +4082,8 @@ async def cmd_setup(inter: discord.Interaction) -> None:
 # TODO 2.7 — /renew: open a pre-filled ticket
 @bot.tree.command(name="renew", description="Open a renewal ticket (pre-filled with your customer ID).")
 async def cmd_renew(inter: discord.Interaction) -> None:
-    if _V8_LOADED:
-        from security import check_active
-        if not await check_active(inter):
-            return
-    else:
-        if not await _check_perms(inter):
-            return
+    if not await _check_perms(inter, role="customer"):
+        return
     uid = str(inter.user.id)
     c = _cm.get_customer(uid) if _V8_LOADED else None
     days = ""
@@ -3955,13 +4126,8 @@ async def cmd_renew(inter: discord.Interaction) -> None:
 # TODO 3.4 — /pause-billing: pause + extend by requested days (admin approval)
 @bot.tree.command(name="pause-billing", description="Pause billing and extend your subscription (manual admin approval).")
 async def cmd_pause_billing(inter: discord.Interaction) -> None:
-    if _V8_LOADED:
-        from security import check_active
-        if not await check_active(inter):
-            return
-    else:
-        if not await _check_perms(inter):
-            return
+    if not await _check_perms(inter, role="customer"):
+        return
     ticket_ch = _os.environ.get("OPEN_TICKET_CH_ID", "") or _os.environ.get("TICKET_CH_ID", "")
     uid = str(inter.user.id)
     if ticket_ch:
@@ -3995,13 +4161,8 @@ async def cmd_pause_billing(inter: discord.Interaction) -> None:
 # TODO 3.3 — /proofs: opt-in anonymous proof sharing
 @bot.tree.command(name="proofs", description="Opt in to post redacted farm proof to the public channel.")
 async def cmd_proofs(inter: discord.Interaction) -> None:
-    if _V8_LOADED:
-        from security import check_active
-        if not await check_active(inter):
-            return
-    else:
-        if not await _check_perms(inter):
-            return
+    if not await _check_perms(inter, role="customer"):
+        return
     from control_bot import proofs
     await inter.response.send_message(
         "🏆 **Proofs are opt-in.** Only first-post screenshots and supplier "
