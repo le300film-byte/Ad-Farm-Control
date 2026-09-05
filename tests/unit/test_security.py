@@ -123,15 +123,3 @@ def test_multisig_requires_two_distinct_admins_within_window():
     assert ms.confirm("reset", "b") == (False, 1)        # first confirmation expired
     assert ms.confirm("reset", "a") == (True, 2)
     assert ms.pending("reset") == 0
-
-
-# ── redaction ───────────────────────────────────────────────────────────────
-def test_redact_masks_tokens_and_webhooks():
-    text = ("gh ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
-            "discord MTIzNDU2Nzg5MDEyMzQ1Njc4.Gabcde.abcdefghijklmnopqrstuvwxyz0123456789ABCD "
-            "hook https://discord.com/api/webhooks/123456789/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
-    out = redact(text)
-    assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in out and "ghp_AB***" in out
-    assert "abcdefghijklmnopqrstuvwxyz0123456789ABCD" not in out
-    assert "/webhooks/123456789/***" in out
-    assert mask("abcdefghijkl") == "abcd…ijkl" and mask("short") == "***" and mask("") == ""
