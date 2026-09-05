@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping
 
 
@@ -49,6 +49,7 @@ class Settings:
     guild_id: str = ""
     owner_ids: frozenset[str] = frozenset()
     admin_alerts_channel_id: str = ""
+    admin_commands_channel_id: str = ""
     admin_chat_channel_id: str = ""
     audit_log_channel_id: str = ""
     ticket_channel_id: str = ""
@@ -113,6 +114,7 @@ class Settings:
             guild_id=get("GUILD_ID"),
             owner_ids=owner_ids,
             admin_alerts_channel_id=get("ADMIN_ALERTS_CH_ID"),
+            admin_commands_channel_id=get("ADMIN_COMMANDS_CH_ID"),
             admin_chat_channel_id=get("ADMIN_CHAT_CH_ID"),
             audit_log_channel_id=get("AUDIT_LOG_CH_ID"),
             ticket_channel_id=get("OPEN_TICKET_CH_ID") or get("TICKET_CH_ID"),
@@ -175,6 +177,28 @@ class Settings:
             if w.login.lower() == wanted:
                 return w
         return None
+
+    # ── runtime overrides (ids provisioned by setup and stored in the meta table) ──
+    def with_channel_ids(self, ids: Mapping[str, str]) -> "Settings":
+        """Return a copy with any *missing* channel/category ids filled in from ``ids``.
+
+        ``ids`` uses the same keys as the environment (``CUSTOMER_HUB_ID`` …) and is
+        normally ``MetaRepo.all()``: setup.py provisions the server, writes the ids to the
+        ``meta`` table, and the bot picks them up on the next boot without a single secret
+        being copied by hand. Explicit environment values always win.
+        """
+        mapping = {
+            "ADMIN_ALERTS_CH_ID": "admin_alerts_channel_id",
+            "ADMIN_COMMANDS_CH_ID": "admin_commands_channel_id",
+            "ADMIN_CHAT_CH_ID": "admin_chat_channel_id",
+            "AUDIT_LOG_CH_ID": "audit_log_channel_id",
+            "OPEN_TICKET_CH_ID": "ticket_channel_id",
+            "PROOFS_CH_ID": "proofs_channel_id",
+            "CUSTOMER_HUB_ID": "customer_hub_category_id",
+        }
+        patch = {attr: str(ids[key]).strip() for key, attr in mapping.items()
+                 if str(ids.get(key, "")).strip() and not getattr(self, attr)}
+        return replace(self, **patch) if patch else self
 
     def redacted(self) -> dict[str, Any]:
         out: dict[str, Any] = {}

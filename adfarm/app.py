@@ -33,6 +33,8 @@ def build_services(settings: Settings, discord: DiscordPort, *, clock: Clock | N
     db = db or Database(settings.db_path)
     db.migrate()
     repos = Repos.for_db(db)
+    # ids provisioned by `python setup.py --discord` are stored in the meta table; env wins
+    settings = settings.with_channel_ids(repos.meta.all())
     vault = TokenVault(settings.token_vault_key)
     github = github or GitHubClient(settings.github_token, timeout=settings.http_timeout)
     gist_client = github if not settings.gist_token or settings.gist_token == settings.github_token else github.with_token(settings.gist_token)
@@ -157,6 +159,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     tree = discord.app_commands.CommandTree(client)
     adapter = DiscordPyAdapter(client, settings.guild_id)
     services = build_services(settings, adapter)
+    settings = services.settings   # may now carry channel ids provisioned into the meta table
     scheduler = Scheduler(on_error=lambda name, exc: services.alerts.admin(f"job:{name}", f"Job {name} failed: {type(exc).__name__}: {exc}"))
     ingestor = build_ingestor(services)
     classifier = ChannelClassifier(settings, services.customers.by_forum)

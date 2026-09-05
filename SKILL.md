@@ -17,6 +17,28 @@ the bot. The legacy bot in the repo root is **not** this system — if a user re
 * All state lives in `adfarm.db` (SQLite), mirrored to a backup Gist. There are **no** `ALT_REPOS`
   / `ALT_DISCORD_IDS` / `ALT_NAMES` core secrets anymore — the fleet is the database.
 
+## Server layout (created automatically — never by hand)
+
+`python setup.py --discord` provisions the whole guild. If a user asks "which channels do I need
+to create?", the answer is **none**:
+
+| Category | Channels | Visibility |
+|---|---|---|
+| `📣 AdFarm` | `#welcome-about` `#pricing-plans` `#whats-new` `#open-ticket` `#general-chat` | `@everyone` can view + post; command access is still gated by tier |
+| `🛡️ AdFarm Staff` | `#admin-commands` `#admin-chat` `#audit-logs` | hidden from `@everyone`; `Bot Admin` role + `OWNER_IDS` only |
+| `🏢 Customer Hub` | per-customer forums, created at activation | hidden from `@everyone`; each customer sees only their own hub |
+
+The `Bot Admin` role is created and granted to every id in `OWNER_IDS`. All ids are stored in the
+`meta` table of `adfarm.db` (`CUSTOMER_HUB_ID`, `ADMIN_CHAT_CH_ID`, `ADMIN_COMMANDS_CH_ID`,
+`AUDIT_LOG_CH_ID`, `OPEN_TICKET_CH_ID`, …) and merged into `Settings` at boot — no secret copying.
+Re-running `--discord` is safe and self-healing: existing channels are reused and their permissions
+re-applied. If a channel was created by hand earlier, the provisioner adopts it instead of making a
+duplicate.
+
+Operator troubleshooting: if provisioning reports failures, the bot is missing **Manage Channels**
+/ **Manage Roles** in the guild, or its role sits below the channels it must edit — fix the invite
+permissions and re-run `python setup.py --discord`.
+
 ## Tiers (who may run what)
 
 | Tier | Who | Where |
@@ -119,5 +141,7 @@ Empty `OWNER_IDS` ⇒ nobody is admin (fail-closed). Expired/inactive customers 
   admin room so the audit trail lives in one place.
 * Tokens are stored sealed in the runner repo secrets (PyNaCl) and, if `TOKEN_VAULT_KEY` is set,
   re-encrypted at rest in `adfarm.db`. They are never shown in chat or logs.
+* Do not hand-create AdFarm channels; run `python setup.py --discord` instead. A hand-made channel
+  with a different name (e.g. `#admin-cmds`) will not be classified as an admin room.
 * The sender (`send_ads.py`) is unchanged. If a customer's ads misbehave, the fix is in
   `new_reform/sender/`, not in the control plane — and a `/admin repo action:sync` pushes it.

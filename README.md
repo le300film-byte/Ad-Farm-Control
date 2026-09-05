@@ -87,20 +87,55 @@ On boot the bot:
 5. starts the scheduler (expiry reminders, limitless renewal, run polling, dirty-sweep,
    stale detection, lease renewal).
 
-## 4. Installing (optional)
+## 4. Installing — fully automated
 
-`new_reform/setup.py` is an idempotent installer that uses only the GitHub REST API:
+`setup.py` is an idempotent installer. **You never create a Discord channel, category or role
+by hand.** Provide the bot token, your user id and the server id; the installer does the rest.
 
 ```bash
-python -m tools.  # (no-op placeholder — run the file directly)
-python setup.py --dry-run                 # print what it would do
-python setup.py                            # create backup gist, set repo secrets, init DB
+python setup.py --dry-run                 # print the full plan (nothing is written)
+python setup.py                            # backup gist, repo secrets, init adfarm.db
 python setup.py --push-workflows          # also upload control_bot.yml + sender files
-python setup.py --discord                 # also create Discord channels/forum + register commands
+python setup.py --discord                 # ← provisions the whole Discord server + slash commands
+python setup.py --discord-provision       # server layout only (no command sync)
+python setup.py --discord --no-provision  # slash-command sync only (old behaviour)
 ```
 
-It never deletes or recreates the backup Gist, and all writes are `--dry-run`-safe. Discord-side
-steps require `discord.py` and are skipped gracefully when it is not installed.
+### What `--discord` creates
+
+| | |
+|---|---|
+| Public channels (category `📣 AdFarm`) | `#welcome-about` `#pricing-plans` `#whats-new` `#open-ticket` `#general-chat` |
+| Staff channels (category `🛡️ AdFarm Staff`) | `#admin-commands` `#admin-chat` `#audit-logs` |
+| Category | `🏢 Customer Hub` (per-customer forums are created inside it at activation) |
+| Role | `Bot Admin`, created and granted to every id in `OWNER_IDS` |
+
+Permissions applied automatically:
+
+* **public** — `@everyone` may view / send / use slash commands; *which* commands are visible and
+  allowed is decided by the channel-aware security layer (`ChannelClassifier` + `CHANNEL_MATRIX`),
+  not by Discord permissions;
+* **staff** — `@everyone` is denied `view_channel`; the `Bot Admin` role and each `OWNER_IDS`
+  member are allowed explicitly;
+* **🏢 Customer Hub** — hidden from `@everyone`; each customer gets an explicit overwrite on their
+  own forum only.
+
+### Where the ids go
+
+Every created id is written to the `meta` table of `adfarm.db` under its environment name
+(`CUSTOMER_HUB_ID`, `ADMIN_CHAT_CH_ID`, `ADMIN_COMMANDS_CH_ID`, `AUDIT_LOG_CH_ID`,
+`OPEN_TICKET_CH_ID`, `WELCOME_CH_ID`, `PRICING_CH_ID`, `WHATS_NEW_CH_ID`, `GENERAL_CHAT_CH_ID`,
+`BOT_ADMIN_ROLE_ID`). At boot `Settings.with_channel_ids(meta.all())` merges them, so the bot finds
+its channels with **no secrets to copy**. If `CORE_REPO` is set they are additionally pushed as
+repo secrets for convenience. Explicit environment values always win over stored ids.
+
+Re-running is safe: existing channels/categories/roles are reused (never duplicated), their
+permissions are re-applied so a drifted server heals, and a single failing channel (missing
+permission, rate limit) is logged and reported without aborting the rest.
+
+Discord-side steps require `discord.py` and are skipped gracefully when it is not installed.
+The bot invite needs the `bot` + `applications.commands` scopes and the **Manage Channels**,
+**Manage Roles** and **Manage Webhooks** permissions.
 
 ## 5. Migrating from the legacy system
 

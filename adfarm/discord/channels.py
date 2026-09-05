@@ -21,7 +21,7 @@ class ChannelClassifier:
     def __init__(self, settings: Settings, customer_by_forum: Callable[[str], Optional[Customer]]):
         self.settings = settings
         self.customer_by_forum = customer_by_forum
-        self._admin_ids = {x for x in (settings.admin_alerts_channel_id, settings.admin_chat_channel_id, settings.audit_log_channel_id) if x}
+        self._admin_ids = {x for x in (settings.admin_alerts_channel_id, settings.admin_commands_channel_id, settings.admin_chat_channel_id, settings.audit_log_channel_id) if x}
         self._public = {n.lower() for n in settings.public_channel_names}
         self._ticket = {n.lower() for n in settings.ticket_channel_names}
         self._admin = {n.lower() for n in settings.admin_channel_names}

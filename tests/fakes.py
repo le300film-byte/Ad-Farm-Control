@@ -343,3 +343,65 @@ def fake_token_checker(valid: dict[str, TokenCheck] | None = None):
 def valid_token(seed: str = "A") -> str:
     """A string that satisfies ``looks_like_token`` (three dotted base64ish segments)."""
     return f"{seed * 24}.{'B' * 6}.{'C' * 38}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+class FakeGuildAdmin:
+    """In-memory guild used to exercise ``GuildProvisioner`` (implements GuildAdminPort)."""
+
+    def __init__(self, *, existing_channels: dict[str, str] | None = None, existing_categories: dict[str, str] | None = None,
+                 fail_on: set[str] | None = None):
+        self.categories: dict[str, str] = dict(existing_categories or {})     # name → id
+        self.channels: dict[str, str] = dict(existing_channels or {})         # name → id
+        self.roles: dict[str, str] = {}
+        self.overwrites: dict[str, list] = {}
+        self.parents: dict[str, str] = {}
+        self.topics: dict[str, str] = {}
+        self.role_members: dict[str, list[str]] = {}
+        self.fail_on = set(fail_on or ())
+        self._seq = 900000000000000000
+
+    def _id(self) -> str:
+        self._seq += 1
+        return str(self._seq)
+
+    def _check(self, name: str) -> None:
+        if name in self.fail_on:
+            raise RuntimeError(f"missing permissions for {name}")
+
+    async def find_category(self, name):
+        return self.categories.get(name)
+
+    async def create_category(self, name, overwrites):
+        self._check(name)
+        cid = self._id()
+        self.categories[name] = cid
+        self.overwrites[cid] = list(overwrites)
+        return cid
+
+    async def find_text_channel(self, name):
+        return self.channels.get(name)
+
+    async def create_text_channel(self, name, *, category_id, topic, overwrites):
+        self._check(name)
+        cid = self._id()
+        self.channels[name] = cid
+        self.parents[cid] = category_id
+        self.topics[cid] = topic
+        self.overwrites[cid] = list(overwrites)
+        return cid
+
+    async def apply_overwrites(self, channel_id, overwrites):
+        self.overwrites[channel_id] = list(overwrites)
+        return True
+
+    async def move_to_category(self, channel_id, category_id):
+        self.parents[channel_id] = category_id
+        return True
+
+    async def ensure_role(self, name):
+        return self.roles.setdefault(name, self._id())
+
+    async def assign_role(self, role_id, user_id):
+        self.role_members.setdefault(role_id, []).append(user_id)
+        return True

@@ -9,8 +9,11 @@ Installs the new control plane without touching the legacy code. It:
   3. sets the GitHub *repository* secrets for the core repo (sealed with the
      repo public key — same path the bot uses at runtime);
   4. initialises adfarm.db (migrations + empty tables);
-  5. optionally (--discord, requires discord.py) creates the Discord channels /
-     forum and registers the slash commands.
+  5. optionally (--discord, requires discord.py) provisions the **entire** Discord
+     server — public channels, staff channels, the 🏢 Customer Hub category, a
+     "Bot Admin" role and every permission overwrite — stores the resulting ids in the
+     `meta` table (and as repo secrets) and registers the slash commands.
+     Nothing has to be created by hand in Discord.
 
 Everything is --dry-run safe: pass --dry-run to print the plan and exit.
 
@@ -31,6 +34,7 @@ import base64
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -125,7 +129,7 @@ def push_workflows(token: str, core_repo: str, *, force: bool, dry_run: bool) ->
         print(f"[workflows] uploaded {repo_path}")
 
 
-def set_repo_secrets(token: str, core_repo: str, *, dry_run: bool) -> None:
+def set_repo_secrets(token: str, core_repo: str, *, dry_run: bool, extra: Optional[dict[str, str]] = None) -> None:
     """Seal and upload the core-repo secrets the bot needs (idempotent)."""
     secrets = {
         "BOT_TOKEN": _env(("BOT_TOKEN",)),
@@ -143,6 +147,9 @@ def set_repo_secrets(token: str, core_repo: str, *, dry_run: bool) -> None:
         "GIST_TOKEN": _env(("GIST_TOKEN", "GH_TOKEN", "GH_ADMIN_TOKEN", "GITHUB_PAT")),
         "TOKEN_VAULT_KEY": _env(("TOKEN_VAULT_KEY",)),
     }
+    for name, value in (extra or {}).items():          # ids just provisioned in Discord
+        if value and not secrets.get(name):
+            secrets[name] = value
     secrets = {k: v for k, v in secrets.items() if v}
 
     if dry_run:
@@ -165,11 +172,28 @@ def init_db(db_path: str, *, dry_run: bool) -> None:
     print(f"[db] adfarm.db ready at {db_path} (schema v{version})")
 
 
-def discord_setup(guild_id: str, *, dry_run: bool) -> None:
-    """Best-effort Discord channel/forum creation + command registration.
+def discord_setup(guild_id: str, *, dry_run: bool, db_path: str, provision: bool = True, sync_commands: bool = True) -> dict[str, str]:
+    """Provision the Discord server **and** register the slash commands.
 
-    Guarded: only runs when discord.py is importable and --discord is passed.
+    Creates (idempotently, nothing is ever duplicated or deleted):
+
+      * public channels   #welcome-about #pricing-plans #whats-new #open-ticket #general-chat
+      * staff channels    #admin-commands #admin-chat #audit-logs  (hidden from @everyone)
+      * the ``🏢 Customer Hub`` category (hidden; per-customer forums land inside it)
+      * a ``Bot Admin`` role, granted to every id in OWNER_IDS
+      * all permission overwrites, re-applied on every run so a drifted server heals
+
+    Every resulting id is written to the ``meta`` table of adfarm.db (survives restarts;
+    ``Settings.with_channel_ids`` merges them at boot) and returned so the caller can also
+    push them as repo secrets.
     """
+    if dry_run:
+        from adfarm.discord.provision import ALL_CHANNELS, HUB_CATEGORY_NAME
+        names = ", ".join("#" + c.name for c in ALL_CHANNELS)
+        print(f"[discord] would create category {HUB_CATEGORY_NAME}, the AdFarm/AdFarm Staff categories, the 'Bot Admin' role and: {names}")
+        print("[discord] would apply permission overwrites, store the ids in the meta table and sync the slash commands")
+        return {}
+
     try:
         import asyncio
 
@@ -179,38 +203,67 @@ def discord_setup(guild_id: str, *, dry_run: bool) -> None:
         from adfarm.app import build_services
         from adfarm.commands.registry import CommandRegistry
         from adfarm.config import Settings
-        from adfarm.discord.adapter import DiscordPyAdapter
+        from adfarm.db import Database
+        from adfarm.discord.adapter import DiscordPyAdapter, DiscordPyGuildAdmin
         from adfarm.discord.channels import ChannelClassifier
+        from adfarm.discord.provision import GuildProvisioner
+        from adfarm.services.container import Repos
     except Exception as exc:  # pragma: no cover - optional dependency
         print(f"[discord] skipped (discord.py not installed: {exc})")
-        return
-
-    if dry_run:
-        print("[discord] would create 🏢 Customer Hub category, admin/ticket rooms, and register slash commands")
-        return
+        return {}
 
     settings = Settings.from_env()
+    if not settings.bot_token:
+        print("[discord] skipped: BOT_TOKEN is not set")
+        return {}
+    if guild_id and not settings.guild_id:
+        settings = replace(settings, guild_id=guild_id)
+
+    db = Database(db_path)
+    db.migrate()
+    meta = Repos.for_db(db).meta
+
     intents = discord.Intents.default()
     intents.message_content = True
     intents.members = True
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
+    out: dict[str, str] = {}
 
     @client.event
     async def on_ready() -> None:
-        adapter = DiscordPyAdapter(client, settings.guild_id)
-        services = build_services(settings, adapter)
-        classifier = ChannelClassifier(settings, services.customers.by_forum)
-        registry = CommandRegistry(tree, services, classifier, guild_id=settings.guild_id)
-        registry.register_all()
-        n = await registry.sync()
-        print(f"[discord] synced {n} commands; guild={client.guilds[0].name if client.guilds else '?'}")
-        await client.close()
+        try:
+            if provision:
+                admin_api = DiscordPyGuildAdmin(client, settings.guild_id)
+                provisioner = GuildProvisioner(admin_api, owner_ids=sorted(settings.owner_ids), store=meta.set)
+                report = await provisioner.provision()
+                out.update(report.ids)
+                for name in report.created:
+                    print(f"[discord] created {name}")
+                for name in report.reused:
+                    print(f"[discord] exists  {name} (skipped, permissions refreshed)")
+                for name, err in report.failures:
+                    print(f"[discord] FAILED  {name}: {err}")
+                print(f"[discord] provisioning: {report.summary()}")
+                for key, value in sorted(report.ids.items()):
+                    print(f"[discord]   {key}={value}  (stored in {db_path} → meta)")
+            if sync_commands:
+                merged = Settings.from_env().with_channel_ids(meta.all())
+                adapter = DiscordPyAdapter(client, merged.guild_id or settings.guild_id)
+                services = build_services(merged, adapter, db=db)
+                classifier = ChannelClassifier(services.settings, services.customers.by_forum)
+                registry = CommandRegistry(tree, services, classifier, guild_id=services.settings.guild_id)
+                registry.register_all()
+                n = await registry.sync()
+                print(f"[discord] synced {n} commands; guild={client.guilds[0].name if client.guilds else '?'}")
+        finally:
+            await client.close()
 
     try:
         asyncio.run(client.start(settings.bot_token))
     except Exception as exc:  # pragma: no cover - network
-        print(f"[discord] command/channel setup failed (continuing): {exc}")
+        print(f"[discord] setup failed (continuing): {exc}")
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,7 +274,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     p.add_argument("--push-workflows", action="store_true", help="upload control_bot.yml + sender files to the core repo")
     p.add_argument("--force", action="store_true", help="overwrite existing workflow files")
-    p.add_argument("--discord", action="store_true", help="also create Discord channels and register commands")
+    p.add_argument("--discord", action="store_true", help="provision the Discord server (channels, category, role, permissions) and register commands")
+    p.add_argument("--discord-provision", action="store_true", help="provision the Discord server layout only (no slash-command sync)")
+    p.add_argument("--no-provision", action="store_true", help="with --discord: only sync slash commands, do not touch the server layout")
     p.add_argument("--db", default=_env(("ADFARM_DB", "CUSTOMERS_DB"), "adfarm.db"), help="path to adfarm.db")
     p.add_argument("--core-repo", default=_env(("CORE_REPO", "GITHUB_REPOSITORY")), help="owner/repo of the core repo")
     args = p.parse_args(argv)
@@ -235,13 +290,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     print(f"AdFarm V9 setup — dry_run={args.dry_run}")
+    do_discord = args.discord or args.discord_provision
+    channel_ids: dict[str, str] = {}
+    if do_discord:
+        # provision first so the freshly created ids can be pushed as repo secrets below
+        channel_ids = discord_setup(_env(("GUILD_ID",)), dry_run=args.dry_run, db_path=args.db,
+                                    provision=not args.no_provision, sync_commands=not args.discord_provision)
     gist_id = ensure_backup_gist(token, _env(("ADFARM_GIST_ID", "CUSTOMERS_GIST_ID")), args.dry_run)
     if args.push_workflows:
         push_workflows(token, args.core_repo, force=args.force, dry_run=args.dry_run)
-    set_repo_secrets(token, args.core_repo, dry_run=args.dry_run)
+    if args.core_repo:
+        set_repo_secrets(token, args.core_repo, dry_run=args.dry_run, extra=channel_ids)
+    else:
+        print("[secrets] skipped (no CORE_REPO configured)")
     init_db(args.db, dry_run=args.dry_run)
-    if args.discord:
-        discord_setup(_env(("GUILD_ID",)), dry_run=args.dry_run)
     print("Done. Remember to install workflows/control_bot.yml as .github/workflows/control_bot.yml "
           "and set ADFARM_REGISTER_COMMANDS=true on chunk 1.")
     return 0

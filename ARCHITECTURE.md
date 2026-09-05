@@ -41,7 +41,7 @@ battle-tested `send_ads.py` sender byte-for-byte (`new_reform/sender/`).
 | `core/` | `models` (frozen dataclasses), `errors`, `rules` (every limit/validator), `clock` |
 | `db/` | `database` (WAL + transactions + migrations + online backup), `repositories` (SQL lives here only), `vault` (authenticated token encryption), `gist_backup` (write-through + lease + restore chain) |
 | `github/` | `client` (one REST wrapper), `accounts` (3-worker round-robin pool), `secrets` (PyNaCl sealing — no `gh` CLI), `repos` (provision/upload/rename/delete), `workflows` (dispatch/cancel/inspect), `control_queue` (Gist command bus) |
-| `discord/` | `channels` (classifier), `ports` (the `DiscordPort` protocol), `adapter` (discord.py impl — only file importing discord.py), `forums` (provision threads **and** webhooks), `embeds` (pure builders), `replies` (value object) |
+| `discord/` | `channels` (classifier), `ports` (the `DiscordPort` protocol), `adapter` (discord.py impl of `DiscordPort` **and** `GuildAdminPort` — only file importing discord.py), `provision` (server layout: public/staff channels, 🏢 Customer Hub category, `Bot Admin` role, permission overwrites — pure, port-driven, idempotent), `forums` (provision threads **and** webhooks), `embeds` (pure builders), `replies` (value object) |
 | `security/` | `roles`, `policy` (single source for tiers + channel matrix + denial text), `guards` (Gate + MultiSig), `redact` |
 | `telemetry/` | `heartbeat` (parse embed/JSON → `Heartbeat`), `fleet_state` (in-memory live per-alt state), `ingest` (thread-id routing + ban detection) |
 | `timers/` | `expiry` (7/3/1-day reminders + shutdown), `renewal` (48 h limitless re-dispatch), `scheduler` (asyncio job runner — the only clock consumer) |
@@ -103,3 +103,33 @@ from the policy tables so documentation cannot drift from enforcement.
   credits time, and prepares a fresh replacement repo.
 * **Crash**: the GitHub Actions watchdog restarts the bot with back-off; the DB lease hands off
   cleanly between 8×350-min chunks.
+
+
+## 9. Server provisioning (zero manual Discord setup)
+
+```
+setup.py --discord
+   └─ DiscordPyGuildAdmin (adapter.py)      ← the only discord.py code involved
+        ↑ GuildAdminPort
+   └─ GuildProvisioner (discord/provision.py)   pure logic, unit-tested with FakeGuildAdmin
+        ├─ categories  📣 AdFarm · 🛡️ AdFarm Staff · 🏢 Customer Hub
+        ├─ channels    welcome-about pricing-plans whats-new open-ticket general-chat
+        │              admin-commands admin-chat audit-logs
+        ├─ role        Bot Admin → granted to every OWNER_IDS member
+        └─ ids ──▶ MetaRepo (`meta` table in adfarm.db) ──▶ Settings.with_channel_ids() at boot
+```
+
+Design notes:
+
+* the provisioner never imports discord.py — it drives the tiny `GuildAdminPort` protocol, so the
+  whole layout (including the permission model) is exercised in unit tests against
+  `tests.fakes.FakeGuildAdmin`;
+* **idempotent by construction**: lookup-then-create, with permissions re-applied on reuse; nothing
+  is deleted, nothing is duplicated;
+* **fail-soft**: each step is wrapped, failures land in `ProvisionReport.failures` and the run
+  continues;
+* the created names are exactly the ones in `Settings.public_channel_names` /
+  `ticket_channel_names` / `admin_channel_names`, so `ChannelClassifier` tags them correctly even
+  before the ids reach the config (`#admin-commands` → `ADMIN`, `#open-ticket` → `TICKET`, …);
+* ids persist in the DB (which itself is backed up to the Gist), so they survive restarts and
+  Actions-runner churn.

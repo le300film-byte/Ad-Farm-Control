@@ -279,3 +279,143 @@ class DiscordPyAdapter(DiscordPort):
             return True
         except discord.HTTPException:
             return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+class DiscordPyGuildAdmin:
+    """discord.py implementation of ``provision.GuildAdminPort`` (server layout admin).
+
+    Kept beside the adapter because this is the only other place allowed to import
+    discord.py. Every method is idempotent-friendly: lookups return ``None`` instead of
+    raising when something is missing.
+    """
+
+    def __init__(self, client: discord.Client, guild_id: str):
+        self.client = client
+        self.guild_id = int(guild_id) if guild_id else 0
+
+    @property
+    def guild(self) -> Optional[discord.Guild]:
+        if self.guild_id:
+            return self.client.get_guild(self.guild_id)
+        return self.client.guilds[0] if self.client.guilds else None
+
+    def _require_guild(self) -> discord.Guild:
+        guild = self.guild
+        if guild is None:
+            raise RuntimeError("bot is not in the configured guild (check GUILD_ID and the invite)")
+        return guild
+
+    # ── permission translation ──────────────────────────────────────────────
+    async def _resolve(self, guild: discord.Guild, overwrites) -> dict[Any, discord.PermissionOverwrite]:
+        out: dict[Any, discord.PermissionOverwrite] = {}
+        for ow in overwrites:
+            if ow.target == "everyone":
+                target: Any = guild.default_role
+            elif ow.target == "bot":
+                target = guild.me
+            elif ow.target == "role":
+                target = guild.get_role(int(ow.target_id)) if ow.target_id else None
+            else:
+                target = guild.get_member(int(ow.target_id)) if ow.target_id else None
+                if target is None and ow.target_id:
+                    try:
+                        target = await guild.fetch_member(int(ow.target_id))
+                    except (discord.HTTPException, ValueError):
+                        target = None
+            if target is None:
+                continue
+            perm = discord.PermissionOverwrite()
+            for name in ow.allow:
+                setattr(perm, name, True)
+            for name in ow.deny:
+                setattr(perm, name, False)
+            out[target] = perm
+        return out
+
+    # ── categories ──────────────────────────────────────────────────────────
+    async def find_category(self, name: str) -> Optional[str]:
+        guild = self._require_guild()
+        wanted = name.strip().lower()
+        for cat in guild.categories:
+            if cat.name.strip().lower() == wanted:
+                return str(cat.id)
+        return None
+
+    async def create_category(self, name: str, overwrites) -> str:
+        guild = self._require_guild()
+        cat = await guild.create_category(name, overwrites=await self._resolve(guild, overwrites), reason="AdFarm setup")
+        return str(cat.id)
+
+    # ── channels ────────────────────────────────────────────────────────────
+    async def find_text_channel(self, name: str) -> Optional[str]:
+        guild = self._require_guild()
+        wanted = name.strip().lower().lstrip("#")
+        for ch in guild.text_channels:
+            if ch.name.strip().lower() == wanted:
+                return str(ch.id)
+        return None
+
+    async def create_text_channel(self, name: str, *, category_id: str, topic: str, overwrites) -> str:
+        guild = self._require_guild()
+        category = guild.get_channel(int(category_id)) if category_id else None
+        ch = await guild.create_text_channel(name, category=category if isinstance(category, discord.CategoryChannel) else None,
+                                             topic=topic or None, overwrites=await self._resolve(guild, overwrites), reason="AdFarm setup")
+        return str(ch.id)
+
+    async def apply_overwrites(self, channel_id: str, overwrites) -> bool:
+        guild = self._require_guild()
+        ch = guild.get_channel(int(channel_id))
+        if ch is None:
+            return False
+        resolved = await self._resolve(guild, overwrites)
+        ok = True
+        for target, perm in resolved.items():
+            try:
+                await ch.set_permissions(target, overwrite=perm, reason="AdFarm setup")
+            except discord.HTTPException as exc:
+                log.warning("set_permissions on %s failed: %s", channel_id, exc)
+                ok = False
+        return ok
+
+    async def move_to_category(self, channel_id: str, category_id: str) -> bool:
+        guild = self._require_guild()
+        ch = guild.get_channel(int(channel_id))
+        cat = guild.get_channel(int(category_id)) if category_id else None
+        if ch is None or not isinstance(cat, discord.CategoryChannel):
+            return False
+        if getattr(ch, "category_id", None) == cat.id:
+            return True
+        try:
+            await ch.edit(category=cat, reason="AdFarm setup")
+            return True
+        except discord.HTTPException as exc:
+            log.warning("move %s to category failed: %s", channel_id, exc)
+            return False
+
+    # ── roles ───────────────────────────────────────────────────────────────
+    async def ensure_role(self, name: str) -> str:
+        guild = self._require_guild()
+        role = discord.utils.get(guild.roles, name=name)
+        if role is None:
+            role = await guild.create_role(name=name, hoist=True, mentionable=False, reason="AdFarm setup")
+        return str(role.id)
+
+    async def assign_role(self, role_id: str, user_id: str) -> bool:
+        guild = self._require_guild()
+        role = guild.get_role(int(role_id))
+        if role is None:
+            return False
+        member = guild.get_member(int(user_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except (discord.HTTPException, ValueError):
+                return False
+        if role in member.roles:
+            return True
+        try:
+            await member.add_roles(role, reason="AdFarm admin")
+            return True
+        except discord.HTTPException:
+            return False
