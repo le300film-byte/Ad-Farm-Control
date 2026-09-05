@@ -18,15 +18,17 @@ from .migrations import MIGRATIONS, SCHEMA_VERSION
 
 
 class Database:
-    def __init__(self, path: str | os.PathLike[str]):
+    def __init__(self, path: str | os.PathLike[str], *, busy_timeout: float = 30.0):
         self.path = str(path)
+        # sqlite's busy timeout, exposed so a lock contention can be reproduced in tests (F05).
+        self.busy_timeout = float(busy_timeout)
         self._lock = threading.RLock()
         self._local = threading.local()
         self._on_commit: list[Callable[[], None]] = []
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
+        conn = sqlite3.connect(self.path, timeout=self.busy_timeout, isolation_level=None, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         if self.path != ":memory:":
@@ -45,14 +47,20 @@ class Database:
                 for version, statements in MIGRATIONS:
                     if version <= current:
                         continue
-                    conn.execute("BEGIN")
+                    began = False
                     try:
+                        conn.execute("BEGIN")
+                        began = True
                         for stmt in statements:
                             conn.execute(stmt)
                         conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, strftime('%s','now'))", (version,))
                         conn.execute("COMMIT")
                     except Exception:
-                        conn.execute("ROLLBACK")
+                        # F05: ROLLBACK only when the BEGIN actually succeeded — rolling back a
+                        # non-existent transaction raises and would mask the original error.
+                        if began:
+                            with contextlib.suppress(Exception):
+                                conn.execute("ROLLBACK")
                         raise
                     current = version
                 return int(current)
@@ -84,19 +92,33 @@ class Database:
             return
         with self._lock:
             conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except BaseException:
+                # F05: a failed BEGIN (lock timeout, I/O error, disk full) must leave the
+                # thread-local transaction state untouched. The old code set depth=1 *before*
+                # BEGIN, so the raised error skipped the cleanup in the finally below and every
+                # later transaction() on this thread took the re-entrant branch, reusing a
+                # closed connection and never committing again.
+                with contextlib.suppress(Exception):
+                    conn.close()
+                raise
             self._local.conn = conn
             self._local.depth = 1
-            conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
                 conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
+            except BaseException:
+                # BaseException, not Exception: asyncio.CancelledError / KeyboardInterrupt
+                # must roll back too, and a failing ROLLBACK must never mask the real error.
+                with contextlib.suppress(Exception):
+                    conn.execute("ROLLBACK")
                 raise
             finally:
                 self._local.depth = 0
                 self._local.conn = None
-                conn.close()
+                with contextlib.suppress(Exception):
+                    conn.close()
         for cb in list(self._on_commit):
             try:
                 cb()
@@ -134,6 +156,34 @@ class Database:
                     mem.close()
             finally:
                 src.close()
+
+    def payload_is_usable(self, raw: bytes) -> bool:
+        """True when ``raw`` is an intact SQLite database that carries the adfarm schema.
+
+        F06: restore candidates are validated on a throwaway copy *before* the live database
+        file is touched, so a truncated / foreign / empty snapshot can never be swapped in and
+        can never be mistaken for a legitimate starting point.
+        """
+        if not raw:
+            return False
+        tmp = f"{self.path}.verify.tmp"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(raw)
+            conn = sqlite3.connect(tmp)
+            try:
+                row = conn.execute("PRAGMA integrity_check").fetchone()
+                if not row or str(row[0]).lower() != "ok":
+                    return False
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                return {"schema_migrations", "customers"} <= tables
+            finally:
+                conn.close()
+        except Exception:
+            return False
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
 
     def replace_with(self, raw: bytes) -> None:
         """Atomically replace the on-disk database with ``raw`` (validated first)."""

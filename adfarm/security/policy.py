@@ -41,10 +41,19 @@ COMMAND_TIERS: dict[str, Tier] = {
     "proofs": Tier.CUSTOMER,
     "vip": Tier.VIP,
     "admin": Tier.ADMIN,
+    "help-admin": Tier.ADMIN,
 }
 
 # Customer-tier commands that are also allowed in the ticket room (billing conversations).
 TICKET_ROOM_COMMANDS = frozenset({"renew", "pause-billing", "proofs", "account"})
+
+# P2-9: commands that Discord itself hides from non-administrators (default_permissions).
+ADMIN_ONLY_COMMANDS = frozenset({"admin", "help-admin"})
+
+# F09: a customer whose plan has expired drops to Tier.PUBLIC, which used to lock them out of
+# ``/renew`` — the very command that tells them to renew. These commands stay reachable while
+# expired (the channel rules below still apply, and ``/renew`` only opens a ticket).
+EXPIRED_ALLOWED_COMMANDS = frozenset({"renew"})
 
 # ── tier of command → channel kinds where it may run ────────────────────────
 CHANNEL_MATRIX: dict[Tier, frozenset[ChannelKind]] = {
@@ -62,7 +71,7 @@ MULTISIG_ACTIONS: dict[tuple[str, str], str] = {
 
 # ── user-facing denial strings ──────────────────────────────────────────────
 DENY_NOT_CUSTOMER = "❌ You do not have an active subscription. You are not authorized to use this command."
-DENY_EXPIRED = "❌ Your subscription has expired. Contact an admin to renew."
+DENY_EXPIRED = "❌ Your subscription has expired. Run `/renew` here to open a renewal ticket."
 DENY_VIP = "❌ This feature requires VIP. Ask an admin to upgrade your plan."
 DENY_ADMIN = "❌ You are not authorized to use this command."
 DENY_PUBLIC_ROOM = "❌ Customer commands are disabled in public channels. Use your private customer hub."
@@ -92,18 +101,25 @@ def required_tier(command: str) -> Tier:
     return COMMAND_TIERS.get(command.split(" ", 1)[0].lower(), Tier.ADMIN)  # unknown ⇒ admin only (fail closed)
 
 
-def decide(actor_tier: Tier, command: str, kind: ChannelKind) -> Decision:
-    """Pure policy decision. ``kind`` must already account for hub ownership."""
+def decide(actor_tier: Tier, command: str, kind: ChannelKind, *, state: str = "") -> Decision:
+    """Pure policy decision. ``kind`` must already account for hub ownership.
+
+    ``state`` is the caller's subscription state (``roles.subscription_state``) and is only used
+    for the F09 renewal escape hatch: an expired customer may still open a renewal ticket.
+    """
     command = command.split(" ", 1)[0].lower()
     needed = required_tier(command)
 
     # 1. tier check
     if not actor_tier.covers(needed):
-        if needed is Tier.ADMIN:
+        if state == "expired" and needed is Tier.CUSTOMER and command in EXPIRED_ALLOWED_COMMANDS:
+            pass  # allowed: the renewal path is the way back in (channel rules still apply)
+        elif needed is Tier.ADMIN:
             return Decision.deny(DENY_ADMIN)
-        if needed is Tier.VIP and actor_tier is Tier.CUSTOMER:
+        elif needed is Tier.VIP and actor_tier is Tier.CUSTOMER:
             return Decision.deny(DENY_VIP)
-        return Decision.deny(DENY_NOT_CUSTOMER)
+        else:
+            return Decision.deny(DENY_NOT_CUSTOMER)
 
     # 2. channel check
     if needed is Tier.PUBLIC:

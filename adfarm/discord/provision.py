@@ -68,52 +68,27 @@ ADMIN_ROLE_META_KEY = "BOT_ADMIN_ROLE_ID"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Permission model (framework neutral)
+# Permission model (framework neutral) — defined once in ``permissions.py`` and
+# re-exported here so both the guild provisioner and the per-customer forums
+# build their overrides from the same source of truth.
 # ─────────────────────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class Overwrite:
-    """One permission override. ``target`` is ``everyone`` | ``role`` | ``member`` | ``bot``."""
-
-    target: str
-    target_id: str = ""
-    allow: frozenset[str] = frozenset()
-    deny: frozenset[str] = frozenset()
-
-
-VIEW = "view_channel"
-SEND = "send_messages"
-HISTORY = "read_message_history"
-CMDS = "use_application_commands"
-THREADS_IN = "send_messages_in_threads"
-MANAGE = "manage_channels"
-MANAGE_MSG = "manage_messages"
-MANAGE_HOOKS = "manage_webhooks"
-
-BOT_FULL = Overwrite("bot", allow=frozenset({VIEW, SEND, HISTORY, CMDS, THREADS_IN, MANAGE, MANAGE_MSG, MANAGE_HOOKS}))
-
-
-def public_overwrites(admin_role_id: str = "") -> tuple[Overwrite, ...]:
-    """@everyone may read/write/slash — command *visibility* is enforced by the
-    channel-aware security layer (``ChannelClassifier`` + ``Guard``), not by Discord."""
-    out = [Overwrite("everyone", allow=frozenset({VIEW, SEND, HISTORY, CMDS})), BOT_FULL]
-    if admin_role_id:
-        out.append(Overwrite("role", admin_role_id, allow=frozenset({VIEW, SEND, HISTORY, CMDS, MANAGE_MSG})))
-    return tuple(out)
-
-
-def staff_overwrites(admin_role_id: str = "", owner_ids: Iterable[str] = ()) -> tuple[Overwrite, ...]:
-    out = [Overwrite("everyone", deny=frozenset({VIEW, SEND, CMDS})), BOT_FULL]
-    if admin_role_id:
-        out.append(Overwrite("role", admin_role_id, allow=frozenset({VIEW, SEND, HISTORY, CMDS, MANAGE_MSG})))
-    for uid in owner_ids:
-        out.append(Overwrite("member", str(uid), allow=frozenset({VIEW, SEND, HISTORY, CMDS, MANAGE_MSG})))
-    return tuple(out)
-
-
-def hub_overwrites(admin_role_id: str = "", owner_ids: Iterable[str] = ()) -> tuple[Overwrite, ...]:
-    """Customer Hub: invisible to @everyone. Per-customer forums created inside it by
-    ``ForumProvisioner`` add the customer as an explicit member overwrite."""
-    return staff_overwrites(admin_role_id, owner_ids)
+from .permissions import (  # noqa: F401  (re-exported for callers importing from provision)
+    ATTACH,
+    BOT_FULL,
+    CMDS,
+    HISTORY,
+    MANAGE,
+    MANAGE_HOOKS,
+    MANAGE_MSG,
+    SEND,
+    THREADS_IN,
+    VIEW,
+    Overwrite,
+    forum_overwrites,
+    hub_overwrites,
+    public_overwrites,
+    staff_overwrites,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -33,8 +33,16 @@ MAX_AUTOREPLY_CHARS = 1500
 MAX_KEYWORDS = 20
 MAX_KEYWORD_CHARS = 60
 MAX_KEYWORDS_TOTAL_CHARS = 500
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
+# The ad image travels to the alt repo through GitHub's Contents API, whose per-file cap is
+# 1 MB. (V9.1 shipped it as an `AD_IMAGE_B64` repo secret — capped at 48 KB and never read.)
+MAX_IMAGE_BYTES = 1024 * 1024
+MAX_IMAGE_MB = 1
 IMAGE_CONTENT_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
+
+# ── Customer-facing service agreement (wording lives in discord/policy.py) ──
+# Bump when the agreement text changes: policy acks are stored per version, so every
+# customer is asked to confirm the new wording once.
+POLICY_VERSION = "v9-2026-09-05-1"
 
 # ── Subscription timers ──────────────────────────────────────────────────────
 REMINDER_THRESHOLDS_DAYS = (7, 3, 1)

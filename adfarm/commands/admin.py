@@ -17,6 +17,28 @@ ADMIN_ACTIONS = (
     "ticket-panel", "payment-address", "sync-commands", "logs", "reset", "shutdown-bot",
 )
 
+# Rendered by /help-admin. One line per action: summary + a copy-pasteable example.
+ADMIN_HELP: tuple[tuple[str, str, str], ...] = (
+    ("list", "List every customer with plan, VIP flag and days left.", "/admin action:list  ·  /admin action:list fleet:true"),
+    ("customer", "Full customer card: plan, expiry, hub, webhooks and alts.", "/admin action:customer user:2000…01"),
+    ("activate", "Activate (or re-activate) a customer; creates their private hub.", "/admin action:activate user:2000…01 days:30 alts:2 vip:false"),
+    ("extend", "Extend a plan by N days and close their open renewal ticket.", "/admin action:extend user:2000…01 days:30"),
+    ("deactivate", "Stop every run, lock the hub read-only and remove roles.", "/admin action:deactivate user:2000…01 confirm:DEACTIVATE"),
+    ("vip", "Grant or revoke VIP (adds #dm-inbox and DM auto-reply).", "/admin action:vip user:2000…01 enabled:true"),
+    ("alt", "Manage one customer's alts: list, add, remove, sync, replace.", "/admin action:alt user:2000…01 sub:sync"),
+    ("repo", "Alt repositories: list, push the sender, hard-delete an orphan.", "/admin action:repo sub:delete repo:worker1/foo_alt1 confirm:DELETE"),
+    ("health", "Workers, backup, lease, dirty alts and config problems.", "/admin action:health"),
+    ("backup", "Gist backup status, or force an upload right now.", "/admin action:backup sub:now  ·  sub:force"),
+    ("tickets", "List open renewal / billing / support tickets.", "/admin action:tickets"),
+    ("resolve", "Close a ticket after the payment was verified.", "/admin action:resolve ticket:12 note:paid"),
+    ("ticket-panel", "Post the ticket panel (with its 🎫 button) and register the ticket channel.", "/admin action:ticket-panel channel:4000…03"),
+    ("payment-address", "Show the configured BEP-20 payment address.", "/admin action:payment-address"),
+    ("sync-commands", "Re-sync the slash commands to this guild.", "/admin action:sync-commands"),
+    ("logs", "Recent audit/event log, optionally filtered by user.", "/admin action:logs user:2000…01 limit:50"),
+    ("reset", "Platform reset: stop all runs and remove all alts (two admins).", "/admin action:reset confirm:RESET"),
+    ("shutdown-bot", "Stop this runner after flushing the backup (two admins).", "/admin action:shutdown-bot confirm:SHUTDOWN"),
+)
+
 
 def _user(ctx: CommandContext) -> str:
     return validate_snowflake(ctx.text("user") or ctx.text("customer"), "User ID")
@@ -177,13 +199,17 @@ async def _health(ctx: CommandContext) -> Reply:
 
 async def _backup(ctx: CommandContext) -> Reply:
     sub = ctx.text("sub", "status").lower()
-    if sub == "now":
-        ok = await asyncio.to_thread(ctx.s.backup.flush)
-        await ctx.s.alerts.audit(ctx.user_id, "backup.now", ok=ok)
-        return Reply.ok("💾 Backup uploaded." if ok else f"⚠️ Backup failed: {ctx.s.backup.last_error or 'disabled'}")
+    if sub in ("now", "force"):
+        force = sub == "force"
+        ok = await asyncio.to_thread(lambda: ctx.s.backup.flush(force=force))
+        await ctx.s.alerts.audit(ctx.user_id, "backup.now", ok=ok, force=force)
+        if ok:
+            return Reply.ok("💾 Backup uploaded." + (" (forced past the empty-database interlock.)" if force else ""))
+        return Reply.ok(f"⚠️ Backup failed: {ctx.s.backup.last_error or 'disabled'}")
     b = ctx.s.backup.status()
     meta = await asyncio.to_thread(ctx.s.backup.remote_meta)
-    return Reply.ok(f"💾 Backup {'enabled' if b.enabled else 'disabled'} (gist `{b.gist_id or '—'}`) · pending={b.pending} · seq={b.seq} · remote={meta}")
+    blocked = " · ⛔ restore failed, uploads held (sub:force to override)" if b.restore_blocked else ""
+    return Reply.ok(f"💾 Backup {'enabled' if b.enabled else 'disabled'} (gist `{b.gist_id or '—'}`) · pending={b.pending} · seq={b.seq}{blocked} · remote={meta}")
 
 
 async def _tickets(ctx: CommandContext) -> Reply:
@@ -204,22 +230,46 @@ async def _ticket_panel(ctx: CommandContext) -> Reply:
     channel = ctx.text("channel") or ctx.channel.id
     ctx.s.tickets.set_ticket_channel(channel)
     embed = Embed(title="🎫 Tickets & payments", color=0x5865F2, description=(
-        "• New customer? Read `/getstarted`, then post here what plan you want.\n"
+        "• New here? Click **🎫 Open Ticket** below and tell us what you need.\n"
+        "• Want the details first? Read `/getstarted`.\n"
         "• Renewing? Use `/renew` here or in your hub.\n"
         "• Paid? Post the tx hash with `/proofs`.\n"
         f"• Address (BEP-20): `{ctx.s.settings.payment_address or 'ask an admin'}`"))
-    mid = await ctx.s.discord.send(channel, "", embed=embed)
-    if mid:
-        await ctx.s.discord.pin(channel, mid)
-    return Reply.ok(f"📌 Ticket panel posted in <#{channel}> and registered as the ticket channel.")
+    # P1-7: the panel is useless without the button. Handlers stay framework-neutral, so the
+    # actual posting is handed back to the registry (the only module allowed to import
+    # discord.py) which attaches the persistent ``TicketPanelView`` and pins the message.
+    return Reply(content=f"📌 Ticket panel posted in <#{channel}> with the 🎫 Open Ticket button, and registered as the ticket channel.",
+                 ephemeral=True, view={"kind": "post_ticket_panel", "channel": channel, "embed": embed})
 
 
 async def _payment_address(ctx: CommandContext) -> Reply:
     return Reply.ok(f"💳 Payment address: `{ctx.s.settings.payment_address or '(not configured — set PAYMENT_ADDRESS)'}`")
 
 
+# ── /help-admin ────────────────────────────────────────────────────────────
+async def help_admin(ctx: CommandContext) -> Reply:
+    """P1-3: the operator command reference. Rendered from ``ADMIN_HELP`` so it cannot drift
+    from ``ADMIN_ACTIONS`` — and ``/help-admin`` itself is listed, so nothing is discoverable
+    only by reading the source."""
+    embed = Embed(title="🛡️ AdFarm — operator commands", color=0xED4245,
+                  description="Every operator command is `/admin action:<name>` (admin channels only). "
+                              "Destructive actions need a typed confirmation, and `reset` / `shutdown-bot` "
+                              "need a second admin within the multisig window.")
+    for name, summary, example in ADMIN_HELP:
+        embed.add(f"/admin action:{name}", f"{summary}\n`{example}`")
+    embed.add("/help-admin", "Show this reference.")
+    missing = [a for a in ADMIN_ACTIONS if a not in {h[0] for h in ADMIN_HELP}]
+    if missing:  # pragma: no cover - guarded by a test
+        embed.add("⚠️ undocumented", ", ".join(missing))
+    embed.footer = f"{len(ADMIN_HELP)} actions · multisig window {ctx.s.settings.multisig_window}s"
+    return Reply(embed=embed, ephemeral=True)
+
+
 async def _sync_commands(ctx: CommandContext) -> Reply:
-    return Reply(content="admin:sync-commands", ephemeral=True, view={"kind": "sync_commands"})
+    # No view marker here: the registry performs the sync from the content sentinel and reports
+    # the count itself. (V9.1 also returned {"kind": "sync_commands"}, which no renderer ever
+    # handled — a marker for a button that did not exist.)
+    return Reply(content="admin:sync-commands", ephemeral=True)
 
 
 async def _logs(ctx: CommandContext) -> Reply:

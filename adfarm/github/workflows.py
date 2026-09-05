@@ -18,6 +18,37 @@ log = logging.getLogger(__name__)
 
 ACTIVE_STATUSES = {"queued", "in_progress", "waiting", "requested", "pending"}
 
+# The inputs ``sender/workflows/send_ads.yml`` declares under ``workflow_dispatch``. GitHub
+# rejects a dispatch carrying anything else with ``422 Unexpected input(s)``, and every
+# ``type: choice`` input must carry one of its declared options — which is why the boolean-ish
+# flags below are "1"/"0" and "yes"/"no" rather than "true"/"false" (F02).
+WORKFLOW_INPUTS = frozenset({
+    "ad_type", "message", "sell_rate", "sell_extra", "buy_style", "buy_rate", "buy_rate_rap", "buy_simple_text",
+    "channel_1", "channel_2", "channel_1_name", "channel_2_name", "interval_min", "total_hours",
+    "runtime_limitless", "attach_image",
+})
+# Values the workflow's choice inputs accept.
+RUNTIME_LIMITLESS_VALUES = ("0", "1")
+ATTACH_IMAGE_VALUES = ("yes", "no")
+
+
+def flag_0_1(value: bool) -> str:
+    """``runtime_limitless`` is ``type: choice`` over 0/1 in send_ads.yml."""
+    return "1" if value else "0"
+
+
+def flag_yes_no(value: bool) -> str:
+    """``attach_image`` is ``type: choice`` over yes/no in send_ads.yml."""
+    return "yes" if value else "no"
+
+
+def declared_only(inputs: dict[str, str]) -> dict[str, str]:
+    """Drop anything send_ads.yml does not declare, so a dispatch can never 422."""
+    dropped = sorted(set(inputs) - WORKFLOW_INPUTS)
+    if dropped:
+        log.warning("dropping workflow inputs not declared by send_ads.yml: %s", ", ".join(dropped))
+    return {k: v for k, v in inputs.items() if k in WORKFLOW_INPUTS}
+
 
 @dataclass(frozen=True)
 class RunInfo:
@@ -36,20 +67,29 @@ class RunInfo:
 def build_inputs(*, ad_type: str, message: str, sell_rate: str = "", buy_rate: str = "", buy_style: str = "simple",
                  buy_items: str = "", buy_items_price: str = "", buy_items_style: str = "list", interval_min: int = 5,
                  total_hours: int = 24, limitless: bool = False, attach_image: bool = False, channel_ids: tuple[str, ...] = ()) -> dict[str, str]:
-    """Inputs for send_ads.yml (names are the workflow's; see sender/workflows/send_ads.yml)."""
+    """Inputs for send_ads.yml (names are the workflow's; see sender/workflows/send_ads.yml).
+
+    F02: ``runtime_limitless`` is a 0/1 choice and ``attach_image`` a yes/no choice, so they are
+    rendered with :func:`flag_0_1` / :func:`flag_yes_no` — sending ``"true"``/``"false"`` made
+    GitHub reject the dispatch (or silently fall back to the workflow defaults, which meant
+    ``/run hours:Limitless`` never actually ran limitless).
+    """
     inputs: dict[str, str] = {
         "ad_type": ad_type,
         "message": message,
         "interval_min": str(int(interval_min)),
         "total_hours": str(int(total_hours) if not limitless else 48),
-        "runtime_limitless": "true" if limitless else "false",
-        "attach_image": "true" if attach_image else "false",
+        "runtime_limitless": flag_0_1(limitless),
+        "attach_image": flag_yes_no(attach_image),
     }
     if ad_type == "sell":
         inputs["sell_rate"] = sell_rate
     else:
         inputs["buy_rate"] = buy_rate
         inputs["buy_style"] = buy_style
+        # buy_items / buy_items_price / buy_items_style are kept on RunRequest for the control
+        # gist overrides, but send_ads.yml has no matching workflow_dispatch input — they are
+        # dropped by declared_only() instead of 422-ing the dispatch.
         if buy_items:
             inputs["buy_items"] = buy_items
             inputs["buy_items_price"] = buy_items_price
@@ -59,7 +99,7 @@ def build_inputs(*, ad_type: str, message: str, sell_rate: str = "", buy_rate: s
         inputs["channel_1"] = channel_ids[0]
         if len(channel_ids) == 2:
             inputs["channel_2"] = channel_ids[1]
-    return inputs
+    return declared_only(inputs)
 
 
 class WorkflowDispatcher:

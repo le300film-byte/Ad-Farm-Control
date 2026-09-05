@@ -239,6 +239,8 @@ class FakeDiscord(DiscordPort):
         self._seq = 900_000_000_000_000_000
         self.forums: dict[str, dict[str, Any]] = {}
         self.history: dict[str, list[MessageRef]] = {}
+        self.forum_specs: list[ForumSpec] = []            # every ForumSpec handed to create_customer_forum
+        self.threads_created: list[tuple[str, str, str]] = []   # (parent channel, name, content)
 
     def _next(self) -> str:
         self._seq += 1
@@ -282,6 +284,7 @@ class FakeDiscord(DiscordPort):
         return True
 
     async def create_customer_forum(self, spec: ForumSpec) -> ForumResult:
+        self.forum_specs.append(spec)
         existing = next((fid for fid, f in self.forums.items() if f["name"] == spec.name), None)
         created = existing is None
         fid = existing or self._next()
@@ -300,6 +303,14 @@ class FakeDiscord(DiscordPort):
     async def ensure_forum_webhooks(self, forum_id: str, thread_ids: dict[str, str]) -> dict[str, str]:
         self.webhook_calls += 1
         return {role: f"https://discord.com/api/webhooks/{forum_id}/tok_{role}_{'x' * 30}?thread_id={tid}" for role, tid in thread_ids.items() if role in ("dashboard", "farm-logs", "deals", "dm-inbox")}
+
+    async def create_thread(self, channel_id: str, name: str, content: str = "") -> str:
+        if channel_id not in self.channels:
+            return ""
+        tid = self._next()
+        self.add_channel(tid, name, kind="thread", parent_id=channel_id)
+        self.threads_created.append((channel_id, name, content))
+        return tid
 
     async def set_forum_readonly(self, forum_id: str, customer_user_id: str, readonly: bool) -> bool:
         self.readonly[forum_id] = readonly

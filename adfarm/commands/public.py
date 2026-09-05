@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from ..discord.embeds import account_embed, help_embed
+from ..discord.policy import POLICY_TEXT, POLICY_TITLE
 from ..discord.ports import Embed
 from ..discord.replies import Reply
 from .context import CommandContext
@@ -27,6 +28,9 @@ async def getstarted(ctx: CommandContext) -> Reply:
     ticket = ctx.s.tickets.ticket_channel_id if ctx.s.tickets else ""
     if ticket:
         embed.add("Tickets", f"<#{ticket}>")
+    # P1-5: the agreement is shown up front in its service framing, not as a wall of risk at the
+    # moment of payment. The same wording is what /run asks them to confirm.
+    embed.add(POLICY_TITLE, POLICY_TEXT)
     return Reply(embed=embed, ephemeral=True)
 
 

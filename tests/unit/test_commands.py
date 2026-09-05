@@ -89,7 +89,11 @@ def test_stop_pause_resume_tune_deals_reply_channels_alt(invoke, services, trans
     assert invoke.call(CUSTOMER, "channels", cust.channels, control, action="rescan").content.startswith("🔎")
     assert invoke.call(CUSTOMER, "channels", cust.channels, control, action="bogus").content.startswith("❌ Action")
     over = invoke.call(CUSTOMER, "alt", cust.alt, control, action="overview")
-    assert "Sender ALT_ID" in [f["name"] for f in over.embed.to_dict()["fields"]]
+    fields = [f["name"] for f in over.embed.to_dict()["fields"]]
+    # P1-4: repo slug / sender ALT_ID are operator internals, hidden from customers
+    assert "Sender ALT_ID" not in fields and "Repo" not in fields
+    admin_over = invoke.call(ADMIN, "alt", cust.alt, control, action="overview", alt=1, customer=CUSTOMER)
+    assert "Sender ALT_ID" in [f["name"] for f in admin_over.embed.to_dict()["fields"]]
     assert invoke.call(CUSTOMER, "alt", cust.alt, control, action="logs").content.startswith("📜")
     assert invoke.call(CUSTOMER, "alt", cust.alt, control, action="runs").content.startswith("🏃")
     assert invoke.call(CUSTOMER, "alt", cust.alt, control, action="selfcheck").content.startswith("🩺")
@@ -147,8 +151,14 @@ def test_admin_lifecycle_actions(invoke, services, transport, discord):
     assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="repo", sub="list").content.startswith("📦")
     assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="repo", sub="sync").content.startswith("🔁")
     assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="alt", sub="sync", user=CUSTOMER).content.startswith("🔄")
-    assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="ticket-panel", channel=TICKET_CH).content.startswith("📌")
-    assert services.tickets.ticket_channel_id == TICKET_CH and discord.pinned
+    panel = invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="ticket-panel", channel=TICKET_CH)
+    assert panel.content.startswith("📌")
+    assert services.tickets.ticket_channel_id == TICKET_CH
+    # P1-7: the handler hands the actual posting to the registry, which is the only module
+    # allowed to import discord.py and therefore the only one that can attach a real view.
+    # The send+pin itself is asserted in test_v9_fixes.py (this module stays discord.py-free).
+    assert panel.view["kind"] == "post_ticket_panel" and panel.view["channel"] == TICKET_CH
+    assert panel.view["embed"].description.count("Open Ticket") == 1
     assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="tickets").content.startswith("🎫")
     assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="logs").content.startswith("📜")
     assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="payment-address").content.startswith("💳")

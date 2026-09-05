@@ -51,7 +51,8 @@ def build_services(settings: Settings, discord: DiscordPort, *, clock: Clock | N
     s = Services(settings=settings, clock=clock, db=db, repos=repos, vault=vault, backup=backup, discord=discord, workers=workers, provisioner=provisioner,
                  dispatcher=dispatcher, queue=queue, fleet=fleet, guard=guard, multisig=multisig)
     s.alerts = AlertService(discord, repos.events, clock=clock, alerts_channel_id=settings.admin_alerts_channel_id, audit_channel_id=settings.audit_log_channel_id)
-    forums = ForumProvisioner(discord, category_id=settings.customer_hub_category_id)
+    forums = ForumProvisioner(discord, category_id=settings.customer_hub_category_id,
+                              admin_role_id=settings.admin_role_id, admin_user_ids=tuple(sorted(settings.owner_ids)))
     s.customers = CustomerService(s, forums)
     s.alts = AltService(s, token_checker=token_checker)
     s.runs = RunService(s)
@@ -74,6 +75,51 @@ def rehydrate(s: Services) -> int:
 
 def build_ingestor(s: Services) -> WebhookIngestor:
     return WebhookIngestor(s.fleet, s.customers.by_thread, s.repos.alts.for_customer)
+
+
+def embeds_of(message: Any) -> list[EmbedLike]:
+    """discord.Embed → EmbedLike (kept here so every MESSAGE_* handler converts identically)."""
+    return [EmbedLike(title=e.title or "", description=e.description or "", footer=(e.footer.text if e.footer else "") or "",
+                      fields=[(f.name or "", f.value or "") for f in e.fields]) for e in getattr(message, "embeds", [])]
+
+
+async def ingest_message(s: Services, ingestor: WebhookIngestor, message: Any) -> None:
+    """Feed one webhook message (new **or edited**) into the fleet state and react to it.
+
+    F03: this is the shared body of ``on_message`` / ``on_message_edit`` /
+    ``on_raw_message_edit``. The sender PATCHes its heartbeat message in place instead of
+    posting a new one every interval, so listening only to MESSAGE_CREATE meant a perfectly
+    healthy alt went "offline" after its first heartbeat edit.
+
+    ``message`` may be a ``discord.Message`` (or ``RawMessageUpdateEvent.message``) or any
+    duck-typed stand-in with ``webhook_id`` / ``channel`` / ``author`` / ``content`` /
+    ``embeds`` — which is what the tests use.
+    """
+    if not getattr(message, "webhook_id", None):
+        return
+    channel = getattr(message, "channel", None)
+    channel_id = str(getattr(channel, "id", "") or getattr(message, "channel_id", "") or "")
+    author = getattr(message, "author", None)
+    result = ingestor.ingest(IncomingMessage(
+        channel_id=channel_id, author_name=getattr(author, "name", "") or "", content=getattr(message, "content", "") or "",
+        embeds=embeds_of(message), is_webhook=True, message_id=str(getattr(message, "id", "") or ""),
+    ))
+    if result.key is None:
+        return
+    customer_id, alt_index = result.key
+    if result.ban_detected:
+        alt = s.repos.alts.get(customer_id, alt_index)
+        if alt:
+            await s.bans.handle(alt, reason=(getattr(message, "content", "") or "heartbeat error")[:200])
+    if result.kind == "dm" and result.dm_author_id:
+        customer = s.repos.customers.get(customer_id)
+        if customer and customer.vip and customer.autoreply_text and s.fleet.should_autoreply(result.key, result.dm_author_id, s.settings.autoreply_cooldown):
+            alt = s.repos.alts.get(customer_id, alt_index)
+            if alt:
+                try:
+                    await s.runs.reply(alt, result.dm_author_id, customer.autoreply_text, actor_id="autoreply")
+                except Exception as exc:
+                    log.warning("autoreply failed: %s", exc)
 
 
 def register_jobs(s: Services, scheduler: Scheduler, *, discord_send=None) -> None:
@@ -125,7 +171,14 @@ def register_jobs(s: Services, scheduler: Scheduler, *, discord_send=None) -> No
                 await s.discord.send(customer.thread("control"), f"⚫ Alt {key[1]} went silent (no heartbeat for {s.settings.offline_after // 60} min). Check `/alt action:runs`.")
 
     async def lease_job() -> None:
-        await asyncio.to_thread(s.backup.renew_lease)
+        """Renew our DB lease. F04: if another runner owns it, stop writing the database instead
+        of continuing into a split brain — the next scheduled chunk will take over cleanly."""
+        held = await asyncio.to_thread(s.backup.renew_lease)
+        if not held:
+            await s.alerts.admin("lease-lost", f"Another runner holds the database lease "
+                                               f"(`{s.backup.lease_holder or 'unknown'}`). This runner is shutting down to avoid a split brain.",
+                                 force=True)
+            s.shutdown_requested = True
 
     scheduler.add("expiry", s.settings.expiry_scan_interval, expiry_job, run_immediately=True)
     scheduler.add("renewal", s.settings.renewal_scan_interval, renewal_job, run_immediately=True)
@@ -167,6 +220,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     registry.register_all()
     state: dict[str, Any] = {"ready": False}
 
+    # Persistent component: the ticket-panel button keeps a stable custom_id, so it must be
+    # re-registered on every boot or already-posted panels stop responding (P1-7).
+    from .commands.registry import TicketPanelView
+
+    client.add_view(TicketPanelView(registry))
+
     @client.event
     async def on_ready() -> None:
         if state["ready"]:
@@ -196,32 +255,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         await scheduler.start()
         await services.alerts.admin("boot", f"AdFarm control bot online (run {settings.run_id}); config problems: {len(problems)}", force=True)
 
+    def is_self(message: discord.Message) -> bool:
+        return message.author.id == getattr(client.user, "id", 0)
+
     @client.event
     async def on_message(message: discord.Message) -> None:
-        if message.author.id == getattr(client.user, "id", 0):
+        if is_self(message):
             return
-        if not message.webhook_id:
+        await ingest_message(services, ingestor, message)
+
+    @client.event
+    async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+        """F03: the sender PATCHes its heartbeat message in place — an edit *is* the heartbeat."""
+        if is_self(after):
             return
-        embeds = [EmbedLike(title=e.title or "", description=e.description or "", footer=(e.footer.text if e.footer else "") or "",
-                            fields=[(f.name or "", f.value or "") for f in e.fields]) for e in message.embeds]
-        result = ingestor.ingest(IncomingMessage(channel_id=str(message.channel.id), author_name=message.author.name, content=message.content or "", embeds=embeds,
-                                                 is_webhook=True, message_id=str(message.id)))
-        if result.key is None:
+        await ingest_message(services, ingestor, after)
+
+    @client.event
+    async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+        """Fallback for MESSAGE_UPDATE events whose message is not in the local cache
+        (webhook heartbeats usually are not). discord.py only fires ``on_message_edit`` when it
+        has the cached message, so gating on ``cached_message is None`` avoids double-ingesting."""
+        if payload.cached_message is not None:
             return
-        customer_id, alt_index = result.key
-        if result.ban_detected:
-            alt = services.repos.alts.get(customer_id, alt_index)
-            if alt:
-                await services.bans.handle(alt, reason=(message.content or "heartbeat error")[:200])
-        if result.kind == "dm" and result.dm_author_id:
-            customer = services.repos.customers.get(customer_id)
-            if customer and customer.vip and customer.autoreply_text and services.fleet.should_autoreply(result.key, result.dm_author_id, settings.autoreply_cooldown):
-                alt = services.repos.alts.get(customer_id, alt_index)
-                if alt:
-                    try:
-                        await services.runs.reply(alt, result.dm_author_id, customer.autoreply_text, actor_id="autoreply")
-                    except Exception as exc:
-                        log.warning("autoreply failed: %s", exc)
+        message = getattr(payload, "message", None)
+        if message is not None and not is_self(message):
+            await ingest_message(services, ingestor, message)
 
     async def runner() -> None:
         loop = asyncio.get_running_loop()

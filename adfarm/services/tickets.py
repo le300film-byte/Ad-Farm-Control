@@ -8,19 +8,13 @@ from typing import Optional
 from ..core.errors import ConflictError, ValidationError
 from ..core.models import Customer
 from ..core.rules import validate_days
+from ..discord.policy import POLICY_ACCEPT_LABEL, POLICY_TEXT, POLICY_TITLE  # noqa: F401  (re-exported)
 from ..discord.ports import Embed
 from .container import Services
 
 TX_HASH = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
 
-POLICY_TEXT = (
-    "**AdFarm usage policy**\n"
-    "1. Alts are your accounts; you accept the ban risk. Bans within 48 h of the first run get full time credit, later bans pro-rated.\n"
-    "2. No illegal goods, no harassment, no mass-mention. Violations end the subscription without refund.\n"
-    "3. Payments are manual crypto transfers; a plan starts when an admin confirms the transaction.\n"
-    "4. Keep your alt tokens private. We store them encrypted only to re-provision after a ban.\n"
-    "React with the button (or run `/account`) to acknowledge."
-)
+MIN_SUPPORT_TOPIC_CHARS = 5
 
 
 @dataclass(frozen=True)
@@ -123,6 +117,29 @@ class TicketService:
             self.s.alerts.event(discord_id, "policy_ack", version=self.s.settings.policy_version)
 
     def policy_embed(self) -> Embed:
-        embed = Embed(title="📜 Policy", description=POLICY_TEXT, color=0xFEE75C)
-        embed.footer = f"version {self.s.settings.policy_version}"
+        embed = Embed(title=POLICY_TITLE, description=POLICY_TEXT, color=0x5865F2)
+        embed.footer = f"version {self.s.settings.policy_version} · {POLICY_ACCEPT_LABEL}"
         return embed
+
+    # ── support (ticket panel button) ───────────────────────────────────────
+    async def open_support(self, *, discord_id: str, topic: str, username: str = "") -> Ticket:
+        """Open a support thread from the ticket panel (P1-7).
+
+        Deliberately independent of the ``customers`` table: the people clicking the panel
+        button are usually *prospective* buyers who do not have a row yet.
+        """
+        topic = " ".join(str(topic or "").split())[:300]
+        if len(topic) < MIN_SUPPORT_TOPIC_CHARS:
+            raise ValidationError(f"❌ Please describe what you need in at least {MIN_SUPPORT_TOPIC_CHARS} characters.")
+        existing = self.s.repos.tickets.find_open(discord_id, "support")
+        if existing:
+            raise ConflictError(f"⚠️ Your ticket #{existing['id']} is still open — an admin will answer there shortly.")
+        tid = self.s.repos.tickets.open(discord_id, "support", now=self.s.now(), topic=topic, username=str(username or "")[:60])
+        channel = self.ticket_channel_id
+        thread_id = ""
+        if channel:
+            thread_id = await self.s.discord.create_thread(channel, f"ticket-{tid}", f"🎫 **Ticket #{tid}** — <@{discord_id}>\n{topic}")
+        if self.s.alerts:
+            await self.s.alerts.admin(f"ticket:support:{discord_id}", f"Support ticket #{tid} opened by {username or discord_id}: {topic[:120]}", force=True)
+            self.s.alerts.event(discord_id, "ticket_opened", kind="support", ticket=tid)
+        return Ticket(tid, "support", discord_id, thread_id or channel)

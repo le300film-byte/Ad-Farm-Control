@@ -31,10 +31,14 @@ class ForumOutcome:
 
 
 class ForumProvisioner:
-    def __init__(self, discord: DiscordPort, *, category_id: str, admin_role_id: str = ""):
+    def __init__(self, discord: DiscordPort, *, category_id: str, admin_role_id: str = "", admin_user_ids: tuple[str, ...] = ()):
         self.discord = discord
         self.category_id = category_id
         self.admin_role_id = admin_role_id
+        # Operators get an explicit overwrite in every hub so they can always reach a customer,
+        # even when their role does not carry ``manage_channels`` (which is what would otherwise
+        # grant the implicit "view all channels" permission).
+        self.admin_user_ids = tuple(str(x) for x in admin_user_ids if str(x).strip())
 
     @staticmethod
     def thread_specs(vip: bool) -> tuple[tuple[str, str, str], ...]:
@@ -49,7 +53,7 @@ class ForumProvisioner:
         """Create the forum if missing; otherwise create only missing threads/webhooks (idempotent)."""
         spec = ForumSpec(
             name=self.forum_name(customer), category_id=self.category_id, customer_user_id=customer.discord_id,
-            admin_role_id=self.admin_role_id, threads=self.thread_specs(customer.vip),
+            admin_role_id=self.admin_role_id, admin_user_ids=self.admin_user_ids, threads=self.thread_specs(customer.vip),
         )
         if customer.forum_id and await self.discord.get_channel(customer.forum_id) is not None:
             result = await self._complete_existing(customer, spec)
@@ -67,7 +71,7 @@ class ForumProvisioner:
         if missing:
             partial = await self.discord.create_customer_forum(ForumSpec(
                 name=spec.name, category_id=spec.category_id, customer_user_id=spec.customer_user_id,
-                admin_role_id=spec.admin_role_id, threads=tuple(missing),
+                admin_role_id=spec.admin_role_id, admin_user_ids=spec.admin_user_ids, threads=tuple(missing),
             ))
             # Adapter contract: when forum name matches an existing forum it reuses it.
             thread_ids.update(partial.thread_ids)

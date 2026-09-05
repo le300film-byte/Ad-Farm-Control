@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import logging
 import threading
@@ -31,6 +32,7 @@ CURRENT = "adfarm.db.b64"
 PREVIOUS = "adfarm.prev.db.b64"
 META = "db-meta.json"
 LOCK = "LOCK"
+EMPTY_LOCK = {"run_id": "", "token": "", "acquired_at": 0, "expires_at": 0}
 
 
 class GistTransport(Protocol):
@@ -56,11 +58,13 @@ class BackupStatus:
     lease_holder: str
     lease_expires_at: float
     seq: int
+    restore_blocked: bool = False    # F06: remote snapshot could not be used, uploads are held
 
 
 class GistBackup:
     def __init__(self, db: Database, transport: GistTransport | None, gist_id: str, *, run_id: str,
-                 clock: Clock | None = None, lease_ttl: int = 600, debounce: float = 5.0, retries: tuple[float, ...] = (10.0, 20.0, 40.0)):
+                 clock: Clock | None = None, lease_ttl: int = 600, debounce: float = 5.0, retries: tuple[float, ...] = (10.0, 20.0, 40.0),
+                 lease_attempts: int = 3):
         self.db = db
         self.transport = transport
         self.gist_id = (gist_id or "").strip()
@@ -69,15 +73,19 @@ class GistBackup:
         self.lease_ttl = int(lease_ttl)
         self.debounce = float(debounce)
         self.retries = retries
+        self.lease_attempts = max(1, int(lease_attempts))
         self._cv = threading.Condition()
         self._pending = False
         self._stop = False
         self._thread: threading.Thread | None = None
         self._seq = 0
+        self._lease_token = ""                       # unique per acquisition — the CAS nonce (F04)
+        self._nonce = itertools.count(1)
         self.last_upload_at = 0.0
         self.last_error = ""
         self.lease_holder = ""
         self.lease_expires_at = 0.0
+        self.restore_blocked = False                 # F06: set when a remote snapshot could not be used
 
     # ── wiring ──────────────────────────────────────────────────────────────
     @property
@@ -112,15 +120,19 @@ class GistBackup:
             self._pending = True
             self._cv.notify_all()
 
-    def flush(self) -> bool:
-        """Synchronous upload (used by tests, shutdown, and ``/admin backup now``)."""
+    def flush(self, *, force: bool = False) -> bool:
+        """Synchronous upload (used by tests, shutdown, and ``/admin backup now``).
+
+        ``force`` bypasses the F06 safety interlock that refuses to overwrite a remote
+        snapshot with an empty local database after a failed restore.
+        """
         if not self.enabled:
             return False
         with self._cv:
             self._pending = False
         for attempt, delay in enumerate((0.0,) + self.retries):
             try:
-                self._upload()
+                self._upload(force=force)
                 self.last_error = ""
                 return True
             except BackupUnavailable as exc:
@@ -150,8 +162,18 @@ class GistBackup:
                     return
             self.flush()
 
-    def _upload(self) -> None:
+    def _upload(self, *, force: bool = False) -> None:
         raw = self.db.snapshot_bytes()
+        if not force and self.restore_blocked and self._local_is_empty():
+            # F06: the remote Gist holds a snapshot we could not use and the local database is
+            # empty. Overwriting it now would destroy the only copy of the customer data, so we
+            # hold the upload and surface the reason instead. `/admin backup sub:force` is the
+            # deliberate escape hatch once the operator has confirmed the remote is useless.
+            raise BackupUnavailable(
+                f"refusing to overwrite the remote snapshot with an empty local database "
+                f"(restore of gist {self.gist_id} failed). Fix ADFARM_GIST_ID / the snapshot, "
+                f"or force it with /admin backup sub:force."
+            )
         digest = hashlib.sha256(raw).hexdigest()
         existing = self._get_gist()
         files = existing.get("files") or {}
@@ -181,6 +203,13 @@ class GistBackup:
                 raise BackupUnavailable(f"backup gist {self.gist_id} not found (404) — fix ADFARM_GIST_ID; not auto-recreating") from exc
             raise
 
+    def _local_is_empty(self) -> bool:
+        """True when the local database carries no customer rows (fresh install or failed restore)."""
+        try:
+            return int(self.db.table_counts().get("customers", 0)) == 0
+        except Exception:
+            return True
+
     # ── restore ─────────────────────────────────────────────────────────────
     def restore_if_missing(self) -> str:
         """Called at boot: if the local DB is absent/empty, pull the newest valid snapshot."""
@@ -201,12 +230,14 @@ class GistBackup:
         gist = self._get_gist()
         files = gist.get("files") or {}
         meta = _load_meta(files)
+        had_remote_snapshot = bool((files.get(CURRENT) or {}).get("content") or (files.get(PREVIOUS) or {}).get("content"))
         candidates: list[tuple[str, Optional[str], Optional[str]]] = [
             ("current", (files.get(CURRENT) or {}).get("content"), meta.get("sha256")),
             ("previous", (files.get(PREVIOUS) or {}).get("content"), None),
         ]
         for name, content, sha in candidates:
             if content and self._try_restore(content, sha):
+                self.restore_blocked = False
                 return name
         try:
             revisions = self.transport.gist_revisions(self.gist_id, limit=5)  # type: ignore[union-attr]
@@ -221,7 +252,14 @@ class GistBackup:
             rev_files = rev.get("files") or {}
             content = (rev_files.get(CURRENT) or {}).get("content")
             if content and self._try_restore(content, _load_meta(rev_files).get("sha256")):
+                self.restore_blocked = False
                 return f"revision:{sha[:7]}"
+        if had_remote_snapshot:
+            # F06: a snapshot exists but nothing in it is usable. Arm the interlock so the first
+            # write-through of the now-empty local database cannot clobber the remote copy.
+            self.restore_blocked = True
+            log.error("restore failed: gist %s has a snapshot but no candidate passed sha256 + "
+                      "integrity + schema checks. Uploads are held until an operator intervenes.", self.gist_id)
         return "none"
 
     def _try_restore(self, b64: str, expected_sha: Optional[str]) -> bool:
@@ -232,6 +270,11 @@ class GistBackup:
         if expected_sha and hashlib.sha256(raw).hexdigest() != expected_sha:
             log.warning("restore candidate sha256 mismatch — skipping")
             return False
+        # Integrity + schema are checked on a scratch copy first, so a rejected payload leaves
+        # the live database exactly as it was (F06).
+        if not self.db.payload_is_usable(raw):
+            log.warning("restore candidate is not an intact adfarm database — skipping")
+            return False
         try:
             self.db.replace_with(raw)
         except Exception as exc:
@@ -241,40 +284,105 @@ class GistBackup:
 
     # ── lease ───────────────────────────────────────────────────────────────
     def acquire_lease(self) -> bool:
-        """Advisory lock so two chunk runners never write the same DB concurrently."""
+        """Advisory lock so two chunk runners never write the same DB concurrently.
+
+        F04: the Gist API has no conditional-write primitive, so the compare-and-swap is
+        emulated — we write a lock carrying a unique token and then read the Gist back. Only
+        the writer whose token survived owns the lease; a loser backs off and re-reads. A
+        foreign lease that has not expired is never stolen.
+        """
         if not self.enabled:
             return True
-        gist = self._get_gist()
-        files = gist.get("files") or {}
-        now = self.clock.now()
-        try:
-            lock = json.loads((files.get(LOCK) or {}).get("content") or "{}")
-        except ValueError:
-            lock = {}
+        token = f"{self.run_id}:{self.clock.now():.0f}:{next(self._nonce)}"
+        for attempt in range(self.lease_attempts):
+            now = self.clock.now()
+            try:
+                lock = _load_lock(self._get_gist().get("files") or {})
+            except BackupUnavailable:
+                raise
+            except Exception as exc:
+                log.warning("lease read failed (attempt %d): %s", attempt + 1, exc)
+                continue
+            holder = str(lock.get("run_id") or "")
+            expires = float(lock.get("expires_at") or 0)
+            if holder and holder != self.run_id and expires > now:
+                self.lease_holder, self.lease_expires_at = holder, expires
+                return False                      # somebody else owns a live lease — do not steal
+            if holder == self.run_id and str(lock.get("token") or "") == token:
+                self.lease_holder, self.lease_expires_at = self.run_id, expires
+                return True
+            try:
+                self._write_lock(now, token)
+            except Exception as exc:
+                log.warning("lease write failed (attempt %d): %s", attempt + 1, exc)
+                continue
+            seen = _load_lock(self._safe_gist_files())
+            if str(seen.get("run_id") or "") == self.run_id and str(seen.get("token") or "") == token:
+                self._lease_token = token
+                self.lease_holder = self.run_id
+                self.lease_expires_at = float(seen.get("expires_at") or 0)
+                return True
+            log.warning("lease write lost a race (gist now shows run_id=%r) — retrying", seen.get("run_id"))
+        return False
+
+    def renew_lease(self) -> bool:
+        """Extend our own lease. Returns False when the lease is held by another run — the
+        caller must stop writing the database rather than fight over it (F04)."""
+        if not self.enabled:
+            return True
+        lock = _load_lock(self._safe_gist_files())
         holder = str(lock.get("run_id") or "")
-        expires = float(lock.get("expires_at") or 0)
-        if holder and holder != self.run_id and expires > now:
-            self.lease_holder, self.lease_expires_at = holder, expires
+        if holder != self.run_id:
+            self.lease_holder = holder
+            self.lease_expires_at = float(lock.get("expires_at") or 0)
+            log.warning("lease renewal refused: the lease belongs to %r (we are %r)", holder or "<none>", self.run_id)
             return False
-        self._write_lock(now)
+        self._write_lock(self.clock.now())
         return True
 
-    def renew_lease(self) -> None:
-        if self.enabled:
-            self._write_lock(self.clock.now())
+    def release_lease(self) -> bool:
+        """Release **our own** lease and nobody else's.
 
-    def release_lease(self) -> None:
+        F04: the previous implementation unconditionally wrote an empty lock, so a runner that
+        never held the lease (rejected at boot, or restarted after a takeover) released the
+        active holder's lease and opened the door to a split brain.
+        """
         if not self.enabled:
-            return
+            return False
         try:
-            self.transport.update_gist(self.gist_id, {LOCK: json.dumps({"run_id": "", "acquired_at": 0, "expires_at": 0})})  # type: ignore[union-attr]
+            lock = _load_lock(self._get_gist().get("files") or {})
+        except Exception as exc:
+            log.warning("lease release failed: %s", exc)
+            return False
+        holder = str(lock.get("run_id") or "")
+        token = str(lock.get("token") or "")
+        if holder != self.run_id or (self._lease_token and token != self._lease_token):
+            self.lease_holder = holder
+            self.lease_expires_at = float(lock.get("expires_at") or 0)
+            log.warning("lease release skipped: the lease belongs to %r (we are %r)", holder or "<none>", self.run_id)
+            return False
+        try:
+            self.transport.update_gist(self.gist_id, {LOCK: json.dumps(dict(EMPTY_LOCK))})  # type: ignore[union-attr]
         except Exception as exc:  # pragma: no cover - best effort
             log.warning("lease release failed: %s", exc)
+            return False
+        self._lease_token = ""
         self.lease_holder, self.lease_expires_at = "", 0.0
+        return True
 
-    def _write_lock(self, now: float) -> None:
+    def _safe_gist_files(self) -> dict:
+        try:
+            return self._get_gist().get("files") or {}
+        except Exception as exc:
+            log.warning("gist read failed: %s", exc)
+            return {}
+
+    def _write_lock(self, now: float, token: str = "") -> None:
         expires = now + self.lease_ttl
-        self.transport.update_gist(self.gist_id, {LOCK: json.dumps({"run_id": self.run_id, "acquired_at": now, "expires_at": expires})})  # type: ignore[union-attr]
+        token = token or self._lease_token or f"{self.run_id}:{now:.0f}"
+        self.transport.update_gist(self.gist_id, {LOCK: json.dumps(  # type: ignore[union-attr]
+            {"run_id": self.run_id, "token": token, "acquired_at": now, "expires_at": expires})})
+        self._lease_token = token
         self.lease_holder, self.lease_expires_at = self.run_id, expires
 
     # ── status ──────────────────────────────────────────────────────────────
@@ -282,6 +390,7 @@ class GistBackup:
         return BackupStatus(
             enabled=self.enabled, gist_id=self.gist_id, last_upload_at=self.last_upload_at, last_error=self.last_error,
             pending=self._pending, lease_holder=self.lease_holder, lease_expires_at=self.lease_expires_at, seq=self._seq,
+            restore_blocked=self.restore_blocked,
         )
 
     def remote_meta(self) -> dict:
@@ -292,10 +401,24 @@ class GistBackup:
         except Exception as exc:
             return {"error": str(exc)}
 
+    def remote_lease(self) -> dict:
+        if not self.enabled:
+            return {}
+        return _load_lock(self._safe_gist_files())
+
 
 def _load_meta(files: dict) -> dict:
     try:
         value = json.loads((files.get(META) or {}).get("content") or "{}")
     except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _load_lock(files: dict) -> dict:
+    """Parse the advisory LOCK file; any malformed content degrades to 'no lease'."""
+    try:
+        value = json.loads((files.get(LOCK) or {}).get("content") or "{}")
+    except (ValueError, TypeError):
         return {}
     return value if isinstance(value, dict) else {}

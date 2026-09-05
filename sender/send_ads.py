@@ -938,6 +938,30 @@ def _fake_err_response(code, msg):
     return r
 
 # --------------------------------------------------------------------------- #
+# Webhook URL helpers (AdFarm V9 / F01)                                       #
+# --------------------------------------------------------------------------- #
+# The control bot stores forum webhooks as ".../webhooks/<id>/<token>?thread_id=<tid>"
+# because a webhook attached to a *forum* channel must target a thread. Naively
+# appending "?wait=true" to such a URL produced the malformed
+# "?thread_id=456?wait=true", and "{URL}/messages/<id>" produced
+# "?thread_id=456/messages/777" — so heartbeats, dashboards and logs never
+# reached the customer forums. These two helpers are the only sanctioned way to
+# derive an execute/edit URL from a configured webhook URL.
+
+def _webhook_base(url):
+    """Webhook URL with its query string removed (required for /messages/<id> endpoints)."""
+    return (url or "").split("?", 1)[0].rstrip("/")
+
+def _webhook_execute(url):
+    """Webhook execute URL with wait=true appended, joining with '&' when the URL
+    already carries a query string (e.g. the forum ?thread_id= selector)."""
+    base = (url or "").rstrip()
+    if not base:
+        return base
+    sep = "&" if "?" in base else "?"
+    return base + sep + "wait=true"
+
+# --------------------------------------------------------------------------- #
 # Webhook (DM forwarding)                                                     #
 # --------------------------------------------------------------------------- #
 _buyer_forum_threads = {}   # user_id / channel_id -> forum thread_id for ticket continuation
@@ -987,7 +1011,7 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
         # their own URL token.
         wh_proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY} if HTTPS_PROXY else None
         r = None
-        target_url = DM_WEBHOOK_URL + "?wait=true"
+        target_url = _webhook_execute(DM_WEBHOOK_URL)
         if thread_id:
             target_url += f"&thread_id={thread_id}"
         for attempt in range(3):
@@ -1009,7 +1033,7 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
                     return True
                 # If thread_id failed with 400 or 404 (thread deleted or archived, or text channel mode), fall back to standard POST
                 if thread_id and r.status_code in (400, 404):
-                    fallback_url = DM_WEBHOOK_URL + "?wait=true"
+                    fallback_url = _webhook_execute(DM_WEBHOOK_URL)
                     if thread_name:
                         payload["thread_name"] = thread_name[:100]
                     r2 = creq.post(fallback_url,
@@ -1039,7 +1063,7 @@ def send_webhook(content, username=None, avatar_url=None, embed=None, embeds=Non
                 # If Discord returns 400 because thread_name was supplied on a standard text channel
                 if r.status_code == 400 and "thread_name" in payload:
                     fallback_payload = {k: v for k, v in payload.items() if k != "thread_name"}
-                    r2 = creq.post(DM_WEBHOOK_URL + "?wait=true",
+                    r2 = creq.post(_webhook_execute(DM_WEBHOOK_URL),
                                    json=fallback_payload, impersonate=_BROWSER, timeout=DM_WEBHOOK_TIMEOUT,
                                    proxies=wh_proxies)
                     if r2.status_code in (200, 204):
@@ -1104,13 +1128,13 @@ def send_log_webhook(msg, username=None, kind=None):
             payload = {"content": line[:2000],
                        "username": (username or f"Alt {ALT_ID}: {ALT_NAME}")[:80],
                        "allowed_mentions": {"parse": []}}
-            r = creq.post(target_url + "?wait=true",
+            r = creq.post(_webhook_execute(target_url),
                           json=payload,
                           impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                           proxies=wh_proxies)
             if r.status_code == 400:
                 payload["thread_name"] = f"📜 Logs (Alt {ALT_ID}: {ALT_NAME})"
-                r = creq.post(target_url + "?wait=true",
+                r = creq.post(_webhook_execute(target_url),
                               json=payload,
                               impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                               proxies=wh_proxies)
@@ -1154,13 +1178,13 @@ def send_dashboard(embed_dict):
         def _send():
             global _dash_webhook_failures
             try:
-                r = creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
+                r = creq.post(_webhook_execute(DASHBOARD_WEBHOOK_URL),
                               json=payload, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                               proxies=wh_proxies)
                 if r.status_code == 400:
                     payload_forum = dict(payload)
                     payload_forum["thread_name"] = f"📊 Dashboard (Alt {ALT_ID}: {ALT_NAME})" if ALT_ID else "📊 Live Dashboard"
-                    r = creq.post(DASHBOARD_WEBHOOK_URL + "?wait=true",
+                    r = creq.post(_webhook_execute(DASHBOARD_WEBHOOK_URL),
                                   json=payload_forum, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                                   proxies=wh_proxies)
                 if r.status_code in (200, 204):
@@ -1203,14 +1227,14 @@ def send_deal_webhook(embed_dict, thread_name=None):
         def _send():
             global _deal_webhook_failures
             try:
-                r = creq.post(target + "?wait=true",
+                r = creq.post(_webhook_execute(target),
                               json=payload, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                               proxies=wh_proxies)
                 if r.status_code in (200, 204):
                     _deal_webhook_failures = 0
                 elif r.status_code == 400 and "thread_name" in payload:
                     fallback_payload = {k: v for k, v in payload.items() if k != "thread_name"}
-                    r2 = creq.post(target + "?wait=true",
+                    r2 = creq.post(_webhook_execute(target),
                                    json=fallback_payload, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                                    proxies=wh_proxies)
                     if r2.status_code in (200, 204):
@@ -4211,7 +4235,7 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
             response = None
             if _dashboard_message_id:
                 response = creq.patch(
-                    f"{DASHBOARD_WEBHOOK_URL}/messages/{_dashboard_message_id}",
+                    f"{_webhook_base(DASHBOARD_WEBHOOK_URL)}/messages/{_dashboard_message_id}",
                     json=payload, impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT,
                     proxies=wh_proxies,
                 )
@@ -4219,7 +4243,7 @@ def _send_heartbeat(active_channels_list, ch_names, slowmodes, last_sent,
                     _dashboard_message_id = ""
             if not _dashboard_message_id:
                 response = creq.post(
-                    DASHBOARD_WEBHOOK_URL + "?wait=true", json=payload,
+                    _webhook_execute(DASHBOARD_WEBHOOK_URL), json=payload,
                     impersonate=_BROWSER, timeout=WEBHOOK_TIMEOUT, proxies=wh_proxies,
                 )
                 if response.status_code in (200, 204):

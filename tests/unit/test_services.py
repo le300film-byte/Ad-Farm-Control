@@ -165,7 +165,9 @@ def test_remove_alt_scrubs_secrets_and_renames_repo(services, transport, activat
 # ── runs ────────────────────────────────────────────────────────────────────
 def test_run_request_validation():
     req = RunRequest.validated(mode="sell", rate="2.3", message="hi", interval=5, hours=0)
-    assert req.limitless and req.workflow_inputs(("1",))["runtime_limitless"] == "true" and req.workflow_inputs(("1",))["total_hours"] == "48"
+    # F02: the workflow's runtime_limitless input is a 0/1 choice, not true/false
+    assert req.limitless and req.workflow_inputs(("1",))["runtime_limitless"] == "1" and req.workflow_inputs(("1",))["total_hours"] == "48"
+    assert RunRequest.validated(mode="sell", rate="2.3", message="hi", interval=5, hours=24).workflow_inputs(("1",))["runtime_limitless"] == "0"
     with pytest.raises(ValidationError):
         RunRequest.validated(mode="sell", rate="25", message="hi", interval=5, hours=24)
     with pytest.raises(ValidationError):

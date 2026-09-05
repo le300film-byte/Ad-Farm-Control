@@ -2,7 +2,7 @@
 ownership is enforced uniformly; admins may pass ``customer`` to act on behalf of someone."""
 from __future__ import annotations
 
-import base64
+import asyncio
 
 from ..core.errors import ValidationError
 from ..core.models import Alt
@@ -34,9 +34,12 @@ async def setup_submit(ctx: CommandContext) -> Reply:
         ctx.actor, alt_index, token=ctx.text("token"), channel_ids=ctx.text("channels"), display_name=ctx.text("display_name"),
         customer_id=ctx.text("customer") or None,
     )
+    # Repo names and GitHub accounts are operator internals; customers only ever see their alt
+    # index/label. Admins keep the slug because they operate the repos directly.
+    repo_line = f" · Repo: `{alt.repo_slug}`" if ctx.is_admin else ""
     return Reply.ok(
         f"✅ Alt {alt.alt_index} (`{alt.label}`) is ready.\n"
-        f"• Account: `{alt.username}` · Channels: {len(alt.channel_ids)} · Repo: `{alt.repo_slug}`\n"
+        f"• Account: `{alt.username}` · Channels: {len(alt.channel_ids)}{repo_line}\n"
         f"• Next: `/run alt:{alt.alt_index}` — your token was stored in the runner secrets, never in chat."
     )
 
@@ -49,11 +52,11 @@ async def run(ctx: CommandContext) -> Reply:
     if ctx.flag("policy_ack", False) and ctx.s.tickets and not ctx.s.tickets.policy_acked(alt.customer_id):
         ctx.s.tickets.ack_policy(alt.customer_id)
     if ctx.attachment_bytes is not None:
-        from ..core.rules import IMAGE_CONTENT_TYPES, MAX_IMAGE_BYTES
+        from ..core.rules import IMAGE_CONTENT_TYPES, MAX_IMAGE_BYTES, MAX_IMAGE_MB
         if ctx.attachment_content_type not in IMAGE_CONTENT_TYPES:
             raise ValidationError("❌ Image must be PNG, JPEG or WEBP.")
         if len(ctx.attachment_bytes) > MAX_IMAGE_BYTES:
-            raise ValidationError("❌ Image must be smaller than 8 MB.")
+            raise ValidationError(f"❌ Image must be smaller than {MAX_IMAGE_MB} MB.")
     req = RunRequest.validated(
         mode=ctx.text("mode", "sell"), rate=ctx.text("rate"), message=ctx.text("message"), interval=ctx.integer("interval", 5) or 5,
         hours=ctx.integer("hours", 24) if ctx.integer("hours", 24) is not None else 24, attach_image=ctx.attachment_bytes is not None,
@@ -61,13 +64,18 @@ async def run(ctx: CommandContext) -> Reply:
     )
     if req.attach_image and ctx.attachment_bytes is not None:
         await ctx.s.alts.push_secrets(alt)  # ensure channel/webhook secrets are fresh before the image run
-        ctx.s.provisioner.set_secrets(alt.repo_owner, alt.repo_name, {"AD_IMAGE_B64": base64.b64encode(ctx.attachment_bytes).decode()})
+        # F02: the image is committed to the repo (IMAGE_PATH default `ad.png`), not stored as a
+        # secret — the sender reads a file from the checkout, and a 48 KB secret cap could never
+        # have carried an image anyway.
+        await asyncio.to_thread(ctx.s.provisioner.upload_image, alt.repo_owner, alt.repo_name, ctx.attachment_bytes)
     result = await ctx.s.runs.start(alt, req, actor_id=ctx.user_id)
     runtime = "limitless (auto-renewed every 48 h)" if req.limitless else f"{req.total_hours} h"
+    # the run URL embeds the worker account and repo name → admins only
+    runner = f" · run {result.run_url}" if ctx.is_admin else ""
     return Reply.ok(
         f"🚀 Alt {alt.alt_index} (`{alt.label}`) dispatched.\n"
         f"• `{req.ad_type}` at `${req.rate:.2f}/1k` every {req.interval_min} min for {runtime}\n"
-        f"• {len(alt.channel_ids)} channel(s) · run {result.run_url}\n"
+        f"• {len(alt.channel_ids)} channel(s){runner}\n"
         f"• First heartbeat arrives in #dashboard within ~5 minutes."
     )
 
@@ -168,7 +176,9 @@ async def status(ctx: CommandContext) -> Reply:
     chosen = [a for a in alts if alt_index is None or a.alt_index == alt_index]
     if not chosen:
         raise ValidationError(f"❌ Alt must be one of {', '.join(str(a.alt_index) for a in alts)}.")
-    embeds = [alt_status_embed(a, ctx.s.fleet.get((customer_id, a.alt_index)), ctx.s.repos.runs.get(customer_id, a.alt_index), now) for a in chosen]
+    # Repo names / worker GitHub accounts are operator internals: only admins see them.
+    embeds = [alt_status_embed(a, ctx.s.fleet.get((customer_id, a.alt_index)), ctx.s.repos.runs.get(customer_id, a.alt_index), now,
+                               reveal_infra=ctx.is_admin) for a in chosen]
     reply = Reply(embed=embeds[0], ephemeral=not ctx.flag("post", False), followups=[Reply(embed=e, ephemeral=not ctx.flag("post", False)) for e in embeds[1:]])
     if ctx.flag("post", False) and customer.thread("dashboard"):
         for e in embeds:
@@ -184,8 +194,9 @@ async def alt(ctx: CommandContext) -> Reply:
     key = (target.customer_id, target.alt_index)
     if action == "overview":
         live = ctx.s.fleet.get(key)
-        embed = alt_status_embed(target, live, ctx.s.repos.runs.get(*key), ctx.s.now())
-        embed.add("Sender ALT_ID", f"`{target.sender_alt_id}`", True).add("Sync", target.sync_state.value, True)
+        embed = alt_status_embed(target, live, ctx.s.repos.runs.get(*key), ctx.s.now(), reveal_infra=ctx.is_admin)
+        if ctx.is_admin:
+            embed.add("Sender ALT_ID", f"`{target.sender_alt_id}`", True).add("Sync", target.sync_state.value, True)
         return Reply(embed=embed)
     if action == "logs":
         kind = ctx.text("kind") or None
@@ -197,6 +208,11 @@ async def alt(ctx: CommandContext) -> Reply:
         return Reply.ok(f"🧹 Cleared the in-memory log buffer of alt {target.alt_index}.")
     if action == "runs":
         runs = ctx.s.dispatcher.recent(target.repo_owner, target.repo_name, limit=5)
+        if not ctx.is_admin:
+            # The Actions URL contains the worker account and repo name — customers get the
+            # status summary only, without the infrastructure details.
+            body = "\n".join(f"• `{r.status}/{r.conclusion or '—'}` started {r.created_at}" for r in runs) or "no runs yet"
+            return Reply.ok(f"🏃 Recent runs of alt {target.alt_index}:\n{body}")
         body = "\n".join(f"• `{r.run_id}` {r.status}/{r.conclusion or '—'} {r.created_at} {r.html_url}" for r in runs) or "no runs yet"
         return Reply.ok(f"🏃 Recent runs of `{target.repo_slug}`:\n{body}")
     if action == "selfcheck":

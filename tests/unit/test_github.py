@@ -110,10 +110,15 @@ def test_provisioner_refuses_unknown_owner(pool):
 
 def test_build_inputs_sell_buy_and_channel_override():
     sell = build_inputs(ad_type="sell", message="m", sell_rate="2.30", interval_min=3, total_hours=24, channel_ids=("1", "2"))
-    assert sell["sell_rate"] == "2.30" and sell["channel_1"] == "1" and sell["channel_2"] == "2" and sell["runtime_limitless"] == "false"
+    assert sell["sell_rate"] == "2.30" and sell["channel_1"] == "1" and sell["channel_2"] == "2"
+    # F02: send_ads.yml declares runtime_limitless as a 0/1 choice and attach_image as yes/no.
+    assert sell["runtime_limitless"] == "0" and sell["attach_image"] == "no"
     buy = build_inputs(ad_type="buy", message="m", buy_rate="1.10", buy_items="skins", buy_items_price="5", limitless=True, channel_ids=("1", "2", "3"))
-    assert buy["buy_rate"] == "1.10" and buy["buy_items"] == "skins" and buy["total_hours"] == "48" and buy["runtime_limitless"] == "true"
+    assert buy["buy_rate"] == "1.10" and buy["total_hours"] == "48" and buy["runtime_limitless"] == "1"
+    # buy_items is not a declared workflow input — it must be dropped, not 422 the dispatch
+    assert "buy_items" not in buy and "buy_items_price" not in buy
     assert "channel_1" not in buy  # >2 channels → CHANNEL_IDS secret is authoritative
+    assert build_inputs(ad_type="sell", message="m", attach_image=True)["attach_image"] == "yes"
 
 
 def test_dispatcher_dispatch_cancel_targets_only_sender_runs(pool, transport):

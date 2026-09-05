@@ -66,6 +66,28 @@ class DispatchResult:
     renewed: bool = False
 
 
+#: RunRequest fields a customer can change mid-run through ``/tune``.
+TUNABLE_PAYLOAD_KEYS = ("ad_type", "message", "rate", "interval_min", "policy")
+
+
+def merged_renewal_payload(payload: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """The dispatch payload for a renewal: the original ``/run`` values with every later ``/tune``
+    applied on top (F09).
+
+    ``/tune`` records its changes in ``Alt.runtime_overrides`` (that is what the control gist
+    pushes to the live sender), never in ``RunState.payload`` — so a limitless renewal that
+    rebuilt its request from the payload alone silently reverted the customer's price, message,
+    cadence, mode and policy every 48 hours.
+    """
+    out = dict(payload or {})
+    for key in TUNABLE_PAYLOAD_KEYS:
+        value = (overrides or {}).get(key)
+        if value is None or value == "":
+            continue
+        out[key] = value
+    return out
+
+
 class RunService:
     def __init__(self, s: Services):
         self.s = s
@@ -128,7 +150,7 @@ class RunService:
         alt = self.s.repos.alts.get(run.customer_id, run.alt_index)
         if alt is None or alt.status is not AltStatus.READY:
             return None
-        payload = run.payload
+        payload = merged_renewal_payload(run.payload, alt.runtime_overrides)
         req = RunRequest(ad_type=payload.get("ad_type", "sell"), message=payload.get("message", ""), rate=float(payload.get("rate", 1.0)),
                          interval_min=int(payload.get("interval_min", 5)), total_hours=0, attach_image=bool(payload.get("attach_image")),
                          buy_style=payload.get("buy_style", "simple"), buy_items=payload.get("buy_items", ""), buy_items_price=payload.get("buy_items_price", ""),

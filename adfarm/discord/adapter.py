@@ -9,9 +9,42 @@ from typing import Any, Optional
 
 import discord
 
+from .permissions import forum_overwrites
 from .ports import ChannelRef, DiscordPort, Embed, ForumResult, ForumSpec, MessageRef
 
 log = logging.getLogger(__name__)
+
+
+async def resolve_overwrites(guild: discord.Guild, overwrites) -> dict[Any, discord.PermissionOverwrite]:
+    """Translate framework-neutral ``permissions.Overwrite`` values into discord.py objects.
+
+    Module level so both ``DiscordPyAdapter`` (customer forums) and ``DiscordPyGuildAdmin``
+    (guild layout) build permissions from the exact same code path.
+    """
+    out: dict[Any, discord.PermissionOverwrite] = {}
+    for ow in overwrites:
+        if ow.target == "everyone":
+            target: Any = guild.default_role
+        elif ow.target == "bot":
+            target = guild.me
+        elif ow.target == "role":
+            target = guild.get_role(int(ow.target_id)) if ow.target_id else None
+        else:
+            target = guild.get_member(int(ow.target_id)) if ow.target_id else None
+            if target is None and ow.target_id:
+                try:
+                    target = await guild.fetch_member(int(ow.target_id))
+                except (discord.HTTPException, ValueError):
+                    target = None
+        if target is None:
+            continue
+        perm = discord.PermissionOverwrite()
+        for name in ow.allow:
+            setattr(perm, name, True)
+        for name in ow.deny:
+            setattr(perm, name, False)
+        out[target] = perm
+    return out
 
 
 def to_discord_embed(embed: Embed) -> discord.Embed:
@@ -168,19 +201,15 @@ class DiscordPyAdapter(DiscordPort):
             raise RuntimeError("bot is not in the configured guild")
         category = guild.get_channel(int(spec.category_id)) if spec.category_id else None
         member = await self._member(spec.customer_user_id)
-        me = guild.me
-        overwrites: dict[Any, discord.PermissionOverwrite] = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True, manage_webhooks=True,
-                                            create_public_threads=True, create_private_threads=True, send_messages_in_threads=True),
-        }
-        if member is not None:
-            overwrites[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, send_messages_in_threads=True, read_message_history=True,
-                                                             attach_files=True, use_application_commands=True)
-        if spec.admin_role_id:
-            role = guild.get_role(int(spec.admin_role_id))
-            if role is not None:
-                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, send_messages_in_threads=True)
+        if member is None:
+            # The forum would be created with nobody but the bot able to see it — create it
+            # anyway (ids are still useful) but make the operator notice immediately.
+            log.warning("customer %s could not be resolved as a member; their hub will need a "
+                        "permission refresh once they are in the server", spec.customer_user_id)
+        overwrites = await resolve_overwrites(guild, forum_overwrites(
+            customer_user_id=spec.customer_user_id if member is not None else "",
+            admin_role_id=spec.admin_role_id, admin_user_ids=spec.admin_user_ids,
+        ))
         existing = next((c for c in guild.forums if c.name == spec.name and (category is None or c.category_id == getattr(category, "id", None))), None)
         created = existing is None
         forum = existing or await guild.create_forum(name=spec.name, category=category, overwrites=overwrites, reason="AdFarm customer hub")
@@ -199,8 +228,16 @@ class DiscordPyAdapter(DiscordPort):
         return ForumResult(forum_id=str(forum.id), thread_ids=thread_ids, webhooks=webhooks, created=created)
 
     async def ensure_forum_webhooks(self, forum_id: str, thread_ids: dict[str, str]) -> dict[str, str]:
-        """One webhook on the forum per sender-facing thread; the URL carries ``?thread_id=`` so
-        posts land in the right thread (Discord webhooks on forums require a thread target)."""
+        """One webhook on the forum per sender-facing thread.
+
+        F01: the stored URL deliberately keeps the ``?thread_id=<id>`` selector — a webhook
+        attached to a **forum** channel has no other way to target a thread, and without it
+        Discord answers the POST with a 400. The sender is responsible for joining query
+        parameters correctly: ``send_ads.py::_webhook_execute`` appends ``&wait=true`` (not a
+        second ``?``) and ``_webhook_base`` strips the query before PATCHing
+        ``.../messages/<id>``. Together those two rules are what keep
+        ``?thread_id=456?wait=true`` and ``?thread_id=456/messages/777`` from ever being built.
+        """
         forum = await self._channel(forum_id)
         if forum is None or not hasattr(forum, "webhooks"):
             return {}
@@ -223,6 +260,23 @@ class DiscordPyAdapter(DiscordPort):
                     continue
             urls[role_name] = f"{hook.url}?thread_id={tid}"
         return urls
+
+    async def create_thread(self, channel_id: str, name: str, content: str = "") -> str:
+        """Open a thread in a text channel or forum; returns the thread id ('' on failure)."""
+        ch = await self._channel(channel_id)
+        if ch is None or not hasattr(ch, "create_thread"):
+            return ""
+        try:
+            if isinstance(ch, discord.ForumChannel):
+                thread, _ = await ch.create_thread(name=name[:100], content=content[:2000] or None, reason="AdFarm ticket")
+            else:
+                thread = await ch.create_thread(name=name[:100], reason="AdFarm ticket")
+                if content:
+                    await thread.send(content[:2000], allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+            return str(thread.id)
+        except discord.HTTPException as exc:
+            log.warning("create_thread in %s failed: %s", channel_id, exc)
+            return ""
 
     async def set_forum_readonly(self, forum_id: str, customer_user_id: str, readonly: bool) -> bool:
         forum = await self._channel(forum_id)
@@ -308,30 +362,7 @@ class DiscordPyGuildAdmin:
 
     # ── permission translation ──────────────────────────────────────────────
     async def _resolve(self, guild: discord.Guild, overwrites) -> dict[Any, discord.PermissionOverwrite]:
-        out: dict[Any, discord.PermissionOverwrite] = {}
-        for ow in overwrites:
-            if ow.target == "everyone":
-                target: Any = guild.default_role
-            elif ow.target == "bot":
-                target = guild.me
-            elif ow.target == "role":
-                target = guild.get_role(int(ow.target_id)) if ow.target_id else None
-            else:
-                target = guild.get_member(int(ow.target_id)) if ow.target_id else None
-                if target is None and ow.target_id:
-                    try:
-                        target = await guild.fetch_member(int(ow.target_id))
-                    except (discord.HTTPException, ValueError):
-                        target = None
-            if target is None:
-                continue
-            perm = discord.PermissionOverwrite()
-            for name in ow.allow:
-                setattr(perm, name, True)
-            for name in ow.deny:
-                setattr(perm, name, False)
-            out[target] = perm
-        return out
+        return await resolve_overwrites(guild, overwrites)
 
     # ── categories ──────────────────────────────────────────────────────────
     async def find_category(self, name: str) -> Optional[str]:

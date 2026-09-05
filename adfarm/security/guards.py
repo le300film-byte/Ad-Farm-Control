@@ -51,10 +51,10 @@ class Guard:
         try:
             actor = self.actor_for(user_id)
             kind = self.classify(actor, channel)
-            decision = policy.decide(actor.tier, command, kind)
+            state = subscription_state(actor.customer, self.clock.now())
+            decision = policy.decide(actor.tier, command, kind, state=state)
             if not decision.allowed and decision.reason == policy.DENY_NOT_CUSTOMER:
                 # Give expired/inactive customers a more actionable message.
-                state = subscription_state(actor.customer, self.clock.now())
                 if state in ("expired", "inactive"):
                     decision = Decision.deny(policy.DENY_EXPIRED)
             return GateResult(actor=actor, decision=decision, kind=kind)

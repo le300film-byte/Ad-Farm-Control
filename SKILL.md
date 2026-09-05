@@ -49,13 +49,16 @@ permissions and re-run `python setup.py --discord`.
 | `admin` | `OWNER_IDS` | **admin rooms only** |
 
 Empty `OWNER_IDS` ⇒ nobody is admin (fail-closed). Expired/inactive customers get a tailored
-"subscription expired" message instead of a generic denial.
+"subscription expired" message instead of a generic denial — and can still run `/renew`, since
+that is the command that gets them back in. Operator commands (`/admin`, `/help-admin`) carry
+`default_permissions=administrator`, so Discord hides them from non-admins entirely; every
+command is guild-only, and the per-user tier check still runs at invoke time.
 
 ## Command reference
 
 ### Public / self-service
 * `/help` — commands available to *your* tier (rendered from the policy tables).
-* `/getstarted` — how the service works + payment address.
+* `/getstarted` — how the service works + payment address + the service agreement.
 * `/account` — plan, days left, alts, policy-ack status, ticket links.
 
 ### Customer (in their hub)
@@ -95,9 +98,11 @@ Empty `OWNER_IDS` ⇒ nobody is admin (fail-closed). Expired/inactive customers 
   `delete` needs `confirm:DELETE` and refuses repos that still belong to an active alt.
 * `/admin health` — worker PAT validity, backup age + lease holder, dirty/missing alts, customers
   without webhooks, config problems.
-* `/admin backup action:<now|status>` — force a snapshot / show restore chain.
+* `/admin backup action:<now|force|status>` — force a snapshot / override the empty-DB
+  interlock / show restore chain.
 * `/admin tickets` / `/admin resolve ticket:<id>` — payment tickets.
-* `/admin ticket-panel channel:<id>` — post the tickets/payments card and register the channel.
+* `/admin ticket-panel channel:<id>` — post the tickets/payments card, register the channel,
+  and pin it with a persistent **🎫 Open Ticket** button (modal → support thread).
 * `/admin payment-address` — show the configured wallet.
 * `/admin sync-commands` — re-sync slash commands.
 * `/admin logs user:<id>` — event ledger.
@@ -105,6 +110,8 @@ Empty `OWNER_IDS` ⇒ nobody is admin (fail-closed). Expired/inactive customers 
   `_DELETED_`); customer rows are kept.
 * `/admin shutdown-bot confirm:SHUTDOWN` — **two-admin** stop of the current runner only; the next
   cron chunk starts a fresh one. Replaces the old customer `/shutdown`.
+* `/help-admin` — the full operator command reference (every action, its summary and a
+  copy-pasteable example). Admin-only, like `/admin`.
 
 ## Common tasks
 

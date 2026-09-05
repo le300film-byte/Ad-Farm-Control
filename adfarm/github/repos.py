@@ -25,6 +25,9 @@ SENDER_FILES = {
 }
 DELETED_PREFIX = "_DELETED_"
 BANNED_PREFIX = "_BANNED_"
+# send_ads.py defaults IMAGE_PATH to "ad.png" inside the checked-out repository, so committing
+# the customer's image under this name needs no workflow or sender change.
+AD_IMAGE_PATH = "ad.png"
 
 
 @dataclass
@@ -76,6 +79,21 @@ class RepoProvisioner:
             client.put_file(owner, repo, rel, path.read_bytes(), f"adfarm: sync {rel}")
             done.append(rel)
         return done
+
+    def upload_image(self, owner: str, repo: str, raw: bytes, *, path: str = AD_IMAGE_PATH) -> str:
+        """Commit the customer's ad image into the repo (F02).
+
+        The old path pushed the image as a repo secret named ``AD_IMAGE_B64`` which nothing ever
+        read — and could never have worked: GitHub caps a secret at 48 KB. The sender reads
+        ``IMAGE_PATH`` (default ``ad.png``) from the checked-out working tree, so the Contents API
+        is the transport that actually reaches it. Its own cap is 1 MB, which is why
+        ``MAX_IMAGE_BYTES`` matches that.
+        """
+        if not raw:
+            raise ValueError("image payload is empty")
+        client = self.pool.client_for(owner)
+        client.put_file(owner, repo, path, raw, "adfarm: update ad image")
+        return path
 
     # ── secrets / variables ─────────────────────────────────────────────────
     def set_secrets(self, owner: str, repo: str, values: Mapping[str, str], *, skip_empty: bool = True) -> list[str]:

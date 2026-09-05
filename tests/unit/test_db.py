@@ -227,7 +227,11 @@ def test_lease_acquire_conflict_and_expiry(backup_env):
     assert not other.acquire_lease() and other.lease_holder == "run-A"
     clock.advance(601)
     assert other.acquire_lease()
-    backup.release_lease()
+    # F04: run-A lost the lease when it expired, so it must not be able to release run-B's.
+    assert backup.release_lease() is False
+    assert json.loads(transport.gists["g1"]["files"]["LOCK"]["content"])["run_id"] == "run-B"
+    # the real holder still releases its own lease
+    assert other.release_lease() is True
     assert json.loads(transport.gists["g1"]["files"]["LOCK"]["content"])["run_id"] == ""
 
 
@@ -248,3 +252,105 @@ def test_write_through_thread_coalesces(backup_env):
     assert backup.status().seq >= 1
     assert json.loads(transport.gists["g1"]["files"]["db-meta.json"]["content"])["seq"] == backup.status().seq
     assert backup.status().seq < 5  # coalesced
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# V9 critical-fix regressions (F04 / F05 / F06)
+# ═════════════════════════════════════════════════════════════════════════════
+def test_f05_failed_begin_does_not_poison_later_transactions(tmp_path):
+    """A BEGIN that fails on a lock timeout used to leave depth=1 behind, which made every
+    later transaction on that thread reuse a closed connection and silently stop committing."""
+    path = tmp_path / "locked.db"
+    db = Database(path, busy_timeout=0.2)
+    db.migrate()
+    repo = MetaRepo(db)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("CREATE TABLE IF NOT EXISTS _probe (x INTEGER)")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            with db.transaction() as conn:
+                conn.execute("INSERT INTO meta(key, value) VALUES ('never', 'committed')")
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    # the thread-local transaction state was reset, so the next write really commits
+    repo.set("after", "1")
+    assert repo.get("after") == "1"
+    assert repo.get("never") == ""
+    assert getattr(db._local, "depth", 0) == 0 and getattr(db._local, "conn", None) is None
+
+
+def test_f05_rollback_error_does_not_mask_the_original(tmp_path):
+    db = Database(tmp_path / "t2.db")
+    db.migrate()
+    with pytest.raises(RuntimeError, match="boom"):
+        with db.transaction():
+            raise RuntimeError("boom")
+    MetaRepo(db).set("ok", "1")
+    assert MetaRepo(db).get("ok") == "1"
+
+
+def test_f06_payload_is_usable_rejects_truncated_and_foreign_databases(tmp_path):
+    db = Database(tmp_path / "t3.db")
+    db.migrate()
+    good = db.snapshot_bytes()
+    assert db.payload_is_usable(good)
+    assert not db.payload_is_usable(b"")
+    assert not db.payload_is_usable(good[: len(good) // 2])
+    foreign = sqlite3.connect(":memory:")
+    foreign.execute("CREATE TABLE unrelated(x)")
+    assert not db.payload_is_usable(foreign.serialize())
+
+
+def test_f06_failed_restore_blocks_the_write_through_instead_of_overwriting(backup_env, tmp_path):
+    transport, client, db, backup, clock = backup_env
+    CustomerRepo(db).save(Customer("1", "a", 1, False, 0, 100, True), now=1.0)
+    backup.flush()
+    remote = transport.gists["g1"]["files"]["adfarm.db.b64"]["content"]
+    # the snapshot on the gist is now garbage and no older revision survives
+    transport.gists["g1"]["files"]["adfarm.db.b64"]["content"] = base64.b64encode(b"not a database").decode()
+    transport.gists["g1"]["history"] = []
+    fresh = Database(tmp_path / "empty.db")
+    fresh.migrate()
+    restorer = GistBackup(fresh, client, "g1", run_id="run-B", clock=clock, retries=())
+    assert restorer.restore_if_missing() == "none"
+    assert restorer.restore_blocked and restorer.status().restore_blocked
+    # the empty local database must not clobber the remote snapshot
+    assert restorer.flush() is False
+    assert "refusing to overwrite" in restorer.last_error
+    assert transport.gists["g1"]["files"]["adfarm.db.b64"]["content"] == base64.b64encode(b"not a database").decode()
+    assert base64.b64decode(remote)  # the operator still has the original bytes to inspect
+    # an operator can still force the overwrite once they have decided
+    assert restorer.flush(force=True) is True
+
+
+def test_f06_empty_gist_is_a_fresh_install_not_a_blocked_restore(backup_env, tmp_path):
+    transport, client, db, backup, clock = backup_env
+    fresh = Database(tmp_path / "new.db")
+    fresh.migrate()
+    restorer = GistBackup(fresh, client, "g1", run_id="run-B", clock=clock, retries=())
+    assert restorer.restore_if_missing() == "none"
+    assert not restorer.restore_blocked
+    assert restorer.flush() is True
+
+
+def test_f04_two_racing_runners_only_one_wins_the_lease(backup_env):
+    transport, client, db, backup, clock = backup_env
+    assert backup.acquire_lease()
+    stolen = GistBackup(db, client, "g1", run_id="run-B", clock=clock, lease_ttl=600)
+    assert not stolen.acquire_lease()
+    assert json.loads(transport.gists["g1"]["files"]["LOCK"]["content"])["run_id"] == "run-A"
+    # renewing keeps our token, and a foreign holder is refused instead of overwritten
+    assert backup.renew_lease() is True
+    assert json.loads(transport.gists["g1"]["files"]["LOCK"]["content"])["token"] == backup._lease_token
+    assert stolen.renew_lease() is False
+    assert json.loads(transport.gists["g1"]["files"]["LOCK"]["content"])["run_id"] == "run-A"
+
+
+def test_f04_reacquiring_after_release_works(backup_env):
+    transport, client, db, backup, clock = backup_env
+    assert backup.acquire_lease()
+    assert backup.release_lease() is True
+    other = GistBackup(db, client, "g1", run_id="run-B", clock=clock, lease_ttl=600)
+    assert other.acquire_lease() is True

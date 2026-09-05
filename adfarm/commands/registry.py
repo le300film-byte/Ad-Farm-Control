@@ -11,12 +11,14 @@ from typing import Any, Optional
 import discord
 from discord import app_commands
 
+from ..core.errors import AdFarmError
 from ..core.rules import AD_TYPES, INTERVALS_MIN, POLICY_TEMPLATES, RUNTIMES_HOURS
 from ..discord.adapter import channel_ref, to_discord_embed
 from ..discord.channels import ChannelClassifier
-from ..discord.ports import ChannelRef
+from ..discord.policy import POLICY_ACCEPT_LABEL
+from ..discord.ports import ChannelRef, Embed
 from ..discord.replies import Reply
-from ..security.policy import ChannelKind
+from ..security.policy import ADMIN_ONLY_COMMANDS, ChannelKind
 from ..services.container import Services
 from . import admin as admin_cmds
 from . import customer as cust
@@ -25,6 +27,18 @@ from . import vip as vip_cmds
 from .context import CommandContext, Handler, run_handler
 
 log = logging.getLogger(__name__)
+
+# Discord caps a Modal title at 45 characters (error 50035 otherwise). Every title in this
+# module goes through modal_title() so it can never regress — see tests/unit/test_ui_limits.py.
+MODAL_TITLE_LIMIT = 45
+
+
+def modal_title(text: str, *, limit: int = MODAL_TITLE_LIMIT) -> str:
+    """Trim a modal title to Discord's hard 45-character limit."""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 class CommandRegistry:
@@ -64,6 +78,12 @@ class CommandRegistry:
         await self.render(inter, reply, ctx)
 
     async def render(self, inter: discord.Interaction, reply: Reply, ctx: CommandContext | None = None) -> None:
+        # P1-7: the ticket panel is posted *into a channel* rather than returned as the
+        # interaction response, so the handler hands back a marker and this — the only module
+        # allowed to import discord.py — performs the send with the real persistent view.
+        if isinstance(reply.view, dict) and reply.view.get("kind") == "post_ticket_panel":
+            await self.post_ticket_panel(str(reply.view.get("channel") or ""), reply.view.get("embed"))
+            reply.view = None
         kwargs: dict[str, Any] = {"ephemeral": reply.ephemeral}
         if reply.embed is not None:
             kwargs["embed"] = to_discord_embed(reply.embed)
@@ -202,11 +222,45 @@ class CommandRegistry:
                 "note": note, "reason": reason, "channel": channel, "fleet": fleet, "enabled": enabled, "worker": worker, "username": username, "limit": limit, "hard": hard,
             })
 
+        @tree.command(name="help-admin", description="Operator command reference (admins only)")
+        async def _help_admin(inter: discord.Interaction):
+            await reg._dispatch(inter, "help-admin", admin_cmds.help_admin, {})
+
+        self.apply_default_permissions()
+
+    async def post_ticket_panel(self, channel_id: str, embed: Embed | None) -> Optional[str]:
+        """Send the pinned ticket panel with its persistent 🎫 button attached (P1-7)."""
+        if not channel_id:
+            return None
+        view = TicketPanelView(self)
+        message_id = await self.s.discord.send(channel_id, "", embed=embed, view=view)
+        if message_id:
+            await self.s.discord.pin(channel_id, message_id)
+        return message_id
+
+    # ── visibility ──────────────────────────────────────────────────────────
+    def apply_default_permissions(self) -> None:
+        """P2-9: the static half of the command-visibility model.
+
+        Discord has no per-user command visibility, so this is what can actually be enforced at
+        the API level: operator commands require the Administrator permission and therefore
+        disappear from the autocomplete of every non-admin member, and every command is marked
+        guild-only so nothing shows up in DMs. The per-user half — a stranger must not be able
+        to *use* ``/run`` or ``/setup`` — is enforced by ``Guard`` at invoke time, which answers
+        with ``DENY_NOT_CUSTOMER`` / ``DENY_EXPIRED``.
+        """
+        for cmd in self.tree.get_commands():
+            if cmd.name in ADMIN_ONLY_COMMANDS:
+                cmd.default_permissions = discord.Permissions(administrator=True)
+            cmd.guild_only = True
+
 
 # ── interactive components ─────────────────────────────────────────────────
 class SetupModal(discord.ui.Modal):
     def __init__(self, registry: CommandRegistry, ctx: CommandContext, alt_index: int):
-        super().__init__(title=f"Alt {alt_index} Setup")
+        # P1-1: the previous title was 46 characters, which Discord rejects with
+        # "400 Bad Request (50035): In data.title: Must be between 1 and 45 in length".
+        super().__init__(title=modal_title(f"Setup alt {alt_index} — keep this token private"))
         self.registry, self.ctx, self.alt_index = registry, ctx, alt_index
         self.token = discord.ui.TextInput(label="Alt Discord user token", style=discord.TextStyle.short, required=True, max_length=120)
         self.channels = discord.ui.TextInput(label="Target channel IDs (comma-separated, ≤10)", style=discord.TextStyle.paragraph, required=True, max_length=400)
@@ -221,12 +275,53 @@ class SetupModal(discord.ui.Modal):
         await self.registry.render(inter, reply, self.ctx)
 
 
+class TicketModal(discord.ui.Modal):
+    """Opened by the ticket-panel button (P1-7); creates a support thread on submit."""
+
+    def __init__(self, registry: CommandRegistry):
+        super().__init__(title=modal_title("🎫 Open a ticket"))
+        self.registry = registry
+        self.topic = discord.ui.TextInput(label="How can we help?", style=discord.TextStyle.paragraph, required=True,
+                                          min_length=5, max_length=300,
+                                          placeholder="e.g. I'd like 2 alts for 30 days — how do I pay?")
+        self.add_item(self.topic)
+
+    async def on_submit(self, inter: discord.Interaction) -> None:  # type: ignore[override]
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            ticket = await self.registry.s.tickets.open_support(
+                discord_id=str(inter.user.id), topic=str(self.topic.value or ""), username=inter.user.display_name)
+        except AdFarmError as exc:
+            await inter.followup.send(exc.user_message, ephemeral=True)
+            return
+        where = f"<#{ticket.channel_id}>" if ticket.channel_id else "the ticket channel"
+        await inter.followup.send(f"🎫 Ticket #{ticket.id} opened in {where} — an admin will answer there shortly.", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    """Persistent view attached to the pinned ticket panel.
+
+    ``timeout=None`` + a stable ``custom_id`` mean the button keeps working across restarts
+    (the composition root re-registers it with ``client.add_view`` in ``on_ready``).
+    """
+
+    CUSTOM_ID = "adfarm:ticket:open"
+
+    def __init__(self, registry: CommandRegistry):
+        super().__init__(timeout=None)
+        self.registry = registry
+
+    @discord.ui.button(label="🎫 Open Ticket", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID)
+    async def open_ticket(self, inter: discord.Interaction, _btn: discord.ui.Button) -> None:
+        await inter.response.send_modal(TicketModal(self.registry))
+
+
 class PolicyAckView(discord.ui.View):
     def __init__(self, registry: CommandRegistry, ctx: CommandContext):
         super().__init__(timeout=300)
         self.registry, self.ctx = registry, ctx
 
-    @discord.ui.button(label="I accept the policy — start the run", style=discord.ButtonStyle.success)
+    @discord.ui.button(label=POLICY_ACCEPT_LABEL, style=discord.ButtonStyle.success)
     async def accept(self, inter: discord.Interaction, _btn: discord.ui.Button) -> None:
         if str(inter.user.id) != self.ctx.user_id:
             await inter.response.send_message("❌ Only the person who issued /run can accept.", ephemeral=True)
@@ -245,8 +340,12 @@ def _modal_for(registry: CommandRegistry, ctx: CommandContext, command: str) -> 
 
 
 def _view_for(registry: CommandRegistry, reply: Reply, ctx: CommandContext | None) -> Optional[discord.ui.View]:
-    if isinstance(reply.view, dict) and reply.view.get("kind") == "policy_ack" and ctx is not None:
-        return PolicyAckView(registry, ctx)
+    if isinstance(reply.view, dict):
+        kind = reply.view.get("kind")
+        if kind == "policy_ack" and ctx is not None:
+            return PolicyAckView(registry, ctx)
+        if kind == "ticket_panel":
+            return TicketPanelView(registry)
     if isinstance(reply.view, discord.ui.View):
         return reply.view
     return None

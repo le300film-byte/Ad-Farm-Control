@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping
 
+from .core.rules import POLICY_VERSION
+
 
 def _truthy(value: str | None, default: bool = False) -> bool:
     if value is None or str(value).strip() == "":
@@ -56,6 +58,7 @@ class Settings:
     proofs_channel_id: str = ""
     customer_hub_category_id: str = ""
     customer_hub_marker: str = "customer hub"
+    admin_role_id: str = ""      # "Bot Admin" role provisioned by setup.py (BOT_ADMIN_ROLE_ID)
     public_channel_names: tuple[str, ...] = ("welcome-about", "pricing-plans", "announcements", "whats-new", "general-chat")
     ticket_channel_names: tuple[str, ...] = ("open-ticket", "tickets")
     admin_channel_names: tuple[str, ...] = ("admin-commands", "admin-alerts", "admin-chat", "audit-logs")
@@ -76,7 +79,7 @@ class Settings:
     store_tokens_in_db: bool = True
     # Business
     payment_address: str = ""
-    policy_version: str = "v9-2026-09-04-1"
+    policy_version: str = POLICY_VERSION
     # Timers (seconds)
     expiry_scan_interval: int = 3600
     renewal_scan_interval: int = 3600
@@ -121,6 +124,7 @@ class Settings:
             proofs_channel_id=get("PROOFS_CH_ID"),
             customer_hub_category_id=get("CUSTOMER_HUB_ID"),
             customer_hub_marker=(get("CUSTOMER_HUB_MARKER") or "customer hub").lower(),
+            admin_role_id=get("BOT_ADMIN_ROLE_ID") or get("ADMIN_ROLE_ID"),
             public_channel_names=_csv(get("PUBLIC_CHANNELS")) or cls.public_channel_names,
             ticket_channel_names=_csv(get("TICKET_CHANNELS")) or cls.ticket_channel_names,
             admin_channel_names=_csv(get("ADMIN_CHANNELS")) or cls.admin_channel_names,
@@ -137,7 +141,7 @@ class Settings:
             token_vault_key=get("TOKEN_VAULT_KEY"),
             store_tokens_in_db=_truthy(get("STORE_ALT_TOKENS_IN_DB"), True),
             payment_address=get("PAYMENT_ADDRESS"),
-            policy_version=get("POLICY_VERSION", "v9-2026-09-04-1"),
+            policy_version=get("POLICY_VERSION", POLICY_VERSION),
             expiry_scan_interval=_int(get("EXPIRY_SCAN_INTERVAL_SEC"), 3600),
             renewal_scan_interval=_int(get("RENEWAL_SCAN_INTERVAL_SEC"), 3600),
             sync_sweep_interval=_int(get("SYNC_SWEEP_INTERVAL_SEC"), 900),
@@ -195,6 +199,7 @@ class Settings:
             "OPEN_TICKET_CH_ID": "ticket_channel_id",
             "PROOFS_CH_ID": "proofs_channel_id",
             "CUSTOMER_HUB_ID": "customer_hub_category_id",
+            "BOT_ADMIN_ROLE_ID": "admin_role_id",
         }
         patch = {attr: str(ids[key]).strip() for key, attr in mapping.items()
                  if str(ids.get(key, "")).strip() and not getattr(self, attr)}

@@ -59,11 +59,17 @@ def account_embed(customer: Customer, alts: Sequence[Alt], now: float, *, policy
     return embed
 
 
-def alt_status_embed(alt: Alt, live: LiveAlt | None, run: RunState | None, now: float) -> Embed:
+def alt_status_embed(alt: Alt, live: LiveAlt | None, run: RunState | None, now: float, *, reveal_infra: bool = False) -> Embed:
+    """Customer-facing status card.
+
+    ``reveal_infra`` is False for customers: the repo slug exposes the worker GitHub account and
+    the internal repo layout, which is operator information only.
+    """
     status = live.status if live and live.online else (run.status if run and run.status in ("queued", "in_progress") else "offline")
     embed = Embed(title=f"{STATUS_ICON.get(status, '•')} Alt {alt.alt_index} · {alt.label}", color=STATUS_COLORS.get(status, GREY))
     embed.add("Status", f"`{status}`", True)
-    embed.add("Repo", f"`{alt.repo_slug}`", True)
+    if reveal_infra:
+        embed.add("Repo", f"`{alt.repo_slug}`", True)
     embed.add("Channels", f"{len(alt.channel_ids)} configured" + (f" · {live.active_channels}/{live.total_channels} alive" if live and live.online else ""), True)
     if run:
         embed.add("Run", f"{run.mode.value} · {run.runtime_hours or '∞'}h · started {_ts(run.started_at)} · renewals {run.renewals}", False)
