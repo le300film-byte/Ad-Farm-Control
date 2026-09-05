@@ -74,7 +74,15 @@ class CommandRegistry:
             await inter.response.send_modal(modal)
             return
         await inter.response.defer(ephemeral=True, thinking=True)
-        reply = await run_handler(handler, ctx)
+        try:
+            reply = await run_handler(handler, ctx)
+        except AdFarmError as exc:
+            await inter.followup.send(
+                f"❌ {exc.user_message}\n\n"
+                "💡 If this keeps happening, wait 2-3 minutes and try again, or open a ticket.",
+                ephemeral=True,
+            )
+            return
         await self.render(inter, reply, ctx)
 
     async def render(self, inter: discord.Interaction, reply: Reply, ctx: CommandContext | None = None) -> None:
@@ -242,16 +250,14 @@ class CommandRegistry:
     def apply_default_permissions(self) -> None:
         """P2-9: the static half of the command-visibility model.
 
-        Discord has no per-user command visibility, so this is what can actually be enforced at
-        the API level: operator commands require the Administrator permission and therefore
-        disappear from the autocomplete of every non-admin member, and every command is marked
-        guild-only so nothing shows up in DMs. The per-user half — a stranger must not be able
-        to *use* ``/run`` or ``/setup`` — is enforced by ``Guard`` at invoke time, which answers
-        with ``DENY_NOT_CUSTOMER`` / ``DENY_EXPIRED``.
+        Discord has no per-user command visibility. Operator commands are still
+        guild-only; they are *not* hidden behind Discord's Administrator permission
+        so owners listed in ``OWNER_IDS`` (who may not hold Server Administrator)
+        can see ``/admin`` and ``/help-admin``. The per-user half — a stranger must
+        not be able to *use* ``/run`` or ``/setup`` — is enforced by ``Guard`` at
+        invoke time (``DENY_NOT_CUSTOMER`` / ``DENY_EXPIRED`` / ``DENY_ADMIN``).
         """
         for cmd in self.tree.get_commands():
-            if cmd.name in ADMIN_ONLY_COMMANDS:
-                cmd.default_permissions = discord.Permissions(administrator=True)
             cmd.guild_only = True
 
 

@@ -35,8 +35,15 @@ ADMIN_HELP: tuple[tuple[str, str, str], ...] = (
     ("payment-address", "Show the configured BEP-20 payment address.", "/admin action:payment-address"),
     ("sync-commands", "Re-sync the slash commands to this guild.", "/admin action:sync-commands"),
     ("logs", "Recent audit/event log, optionally filtered by user.", "/admin action:logs user:2000…01 limit:50"),
-    ("reset", "Platform reset: stop all runs and remove all alts (two admins).", "/admin action:reset confirm:RESET"),
-    ("shutdown-bot", "Stop this runner after flushing the backup (two admins).", "/admin action:shutdown-bot confirm:SHUTDOWN"),
+    ("reset", "Platform reset: stop all runs and remove all alts (typed confirm:RESET).", "/admin action:reset confirm:RESET"),
+    ("shutdown-bot", "Stop this runner after flushing the backup (typed confirm:SHUTDOWN).", "/admin action:shutdown-bot confirm:SHUTDOWN"),
+)
+
+ADMIN_HELP_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("👥 Customer Management", ("list", "customer", "activate", "extend", "deactivate", "vip")),
+    ("📦 Alts / Repos", ("alt", "repo")),
+    ("🩺 Ops", ("health", "backup", "tickets", "resolve", "ticket-panel", "payment-address", "sync-commands", "logs")),
+    ("🧨 Destructive", ("reset", "shutdown-bot")),
 )
 
 
@@ -251,17 +258,29 @@ async def help_admin(ctx: CommandContext) -> Reply:
     """P1-3: the operator command reference. Rendered from ``ADMIN_HELP`` so it cannot drift
     from ``ADMIN_ACTIONS`` — and ``/help-admin`` itself is listed, so nothing is discoverable
     only by reading the source."""
+    by_name = {h[0]: h for h in ADMIN_HELP}
+    lines = [
+        "Every operator command is `/admin action:<name>` (admin channels only).",
+        "Destructive actions need a typed confirmation (`confirm:RESET` / `confirm:SHUTDOWN`).",
+        "One admin is enough — no second-admin multi-sig.",
+        "",
+    ]
+    for category, names in ADMIN_HELP_CATEGORIES:
+        lines.append(f"**{category}**")
+        for name in names:
+            _n, summary, example = by_name[name]
+            lines.append(f"• **{name}** — {summary}")
+            lines.append(f"  `{example}`")
+        lines.append("")
     embed = Embed(title="🛡️ AdFarm — operator commands", color=0xED4245,
-                  description="Every operator command is `/admin action:<name>` (admin channels only). "
-                              "Destructive actions need a typed confirmation, and `reset` / `shutdown-bot` "
-                              "need a second admin within the multisig window.")
+                  description="\n".join(lines)[:4000])
     for name, summary, example in ADMIN_HELP:
-        embed.add(f"/admin action:{name}", f"{summary}\n`{example}`")
-    embed.add("/help-admin", "Show this reference.")
+        embed.add(f"/admin action:{name}", f"• {summary}\n`{example}`")
+    embed.add("/help-admin", "Show this grouped reference.")
     missing = [a for a in ADMIN_ACTIONS if a not in {h[0] for h in ADMIN_HELP}]
     if missing:  # pragma: no cover - guarded by a test
         embed.add("⚠️ undocumented", ", ".join(missing))
-    embed.footer = f"{len(ADMIN_HELP)} actions · multisig window {ctx.s.settings.multisig_window}s"
+    embed.footer = f"{len(ADMIN_HELP)} actions · typed confirmation on destructive commands"
     return Reply(embed=embed, ephemeral=True)
 
 
@@ -282,10 +301,6 @@ async def _logs(ctx: CommandContext) -> Reply:
 # ── destructive ────────────────────────────────────────────────────────────
 async def _reset(ctx: CommandContext) -> Reply:
     validate_confirmation(ctx.text("confirm"), MULTISIG_ACTIONS[("admin", "reset")])
-    approved, count = ctx.s.multisig.confirm("admin:reset", ctx.user_id)
-    if not approved:
-        await ctx.s.alerts.admin("multisig:reset", f"<@{ctx.user_id}> requested a full RESET — a second admin must run the same command within {ctx.s.settings.multisig_window}s.", force=True)
-        return Reply.ok(f"⚠️ Reset armed ({count}/2). A second admin must confirm within {ctx.s.settings.multisig_window} s.")
     stopped = 0
     for c in ctx.s.repos.customers.all():
         stopped += await ctx.s.runs.stop_all_for(c.discord_id, reason="platform reset")
@@ -300,10 +315,6 @@ async def _reset(ctx: CommandContext) -> Reply:
 
 async def _shutdown_bot(ctx: CommandContext) -> Reply:
     validate_confirmation(ctx.text("confirm"), MULTISIG_ACTIONS[("admin", "shutdown-bot")])
-    approved, count = ctx.s.multisig.confirm("admin:shutdown-bot", ctx.user_id)
-    if not approved:
-        await ctx.s.alerts.admin("multisig:shutdown", f"<@{ctx.user_id}> requested a bot SHUTDOWN — second admin confirmation needed within {ctx.s.settings.multisig_window}s.", force=True)
-        return Reply.ok(f"⚠️ Shutdown armed ({count}/2). A second admin must confirm within {ctx.s.settings.multisig_window} s.")
     ctx.s.shutdown_requested = True
     ctx.s.repos.meta.set("shutdown_requested", str(int(ctx.s.now())))
     await ctx.s.alerts.audit(ctx.user_id, "bot.shutdown")

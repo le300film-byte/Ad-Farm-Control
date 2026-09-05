@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
-from ..core.errors import AdFarmError
+from ..core.errors import AdFarmError, ExternalServiceError
 from ..core.models import Actor
 from ..discord.ports import ChannelRef
 from ..discord.replies import Reply
@@ -73,7 +73,15 @@ async def run_handler(handler: Handler, ctx: CommandContext) -> Reply:
     try:
         return await handler(ctx)
     except AdFarmError as exc:
-        return Reply.error(exc.user_message)
+        from ..core.errors import ExternalServiceError
+
+        msg = exc.user_message
+        if isinstance(exc, ExternalServiceError):
+            msg = (
+                f"{msg}\n\n"
+                "💡 If this keeps happening, wait 2-3 minutes and try again, or open a ticket."
+            )
+        return Reply.error(msg)
     except Exception as exc:  # pragma: no cover - defensive
         log.exception("command %s failed", ctx.command)
         if ctx.services.alerts:

@@ -6,7 +6,7 @@ from adfarm.commands import customer as cust
 from adfarm.commands import public as pub
 from adfarm.commands import vip as vipc
 from adfarm.security import policy
-from tests.conftest import ADMIN, ADMIN2, ADMIN_CH, CUSTOMER, OTHER, PUBLIC_CH, STRANGER, TICKET_CH, run
+from tests.conftest import ADMIN, ADMIN_CH, CUSTOMER, OTHER, PUBLIC_CH, STRANGER, TICKET_CH, run
 from tests.fakes import valid_token
 
 
@@ -29,19 +29,28 @@ def test_customer_commands_denied_in_public_other_hub_and_for_strangers(invoke, 
     assert "Renewal ticket" in invoke.call(CUSTOMER, "renew", cust.renew, TICKET_CH, days=30).content
 
 
+def test_external_service_error_suggests_ticket(invoke, services):
+    from adfarm.commands.context import run_handler
+    from adfarm.core.errors import ExternalServiceError
+
+    async def boom(_ctx):
+        raise ExternalServiceError("github down", status=502)
+
+    ctx = invoke.ctx(ADMIN, "admin", ADMIN_CH, action="health")
+    reply = run(run_handler(boom, ctx))
+    assert "external service failed" in reply.content.lower() or "⚠️" in reply.content
+    assert "wait 2-3 minutes" in reply.content and "open a ticket" in reply.content
+
+
 def test_admin_commands_only_in_admin_rooms(invoke, activated):
     assert invoke.call(ADMIN, "admin", adm.admin, activated["control"], action="list").content == policy.DENY_ADMIN_ROOM
     assert invoke.call(CUSTOMER, "admin", adm.admin, ADMIN_CH, action="list").content == policy.DENY_ADMIN
     assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="list").embed.title.startswith("Customers")
 
 
-def test_shutdown_is_admin_only_and_multisig(invoke, services):
+def test_shutdown_is_admin_only_and_typed_confirm(invoke, services):
     r1 = invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="shutdown-bot", confirm="SHUTDOWN")
-    assert "armed (1/2)" in r1.content and not services.shutdown_requested
-    r2 = invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="shutdown-bot", confirm="SHUTDOWN")
-    assert "armed (1/2)" in r2.content                       # same admin twice does not count
-    r3 = invoke.call(ADMIN2, "admin", adm.admin, ADMIN_CH, action="shutdown-bot", confirm="SHUTDOWN")
-    assert "Shutdown confirmed" in r3.content and services.shutdown_requested
+    assert "Shutdown confirmed" in r1.content and services.shutdown_requested
     bad = invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="shutdown-bot", confirm="yes")
     assert bad.content.startswith("❌ Type `SHUTDOWN`")
 
@@ -176,9 +185,9 @@ def test_admin_can_operate_customer_alt_by_naming_customer(invoke, activated):
     assert fleet.embed.title == "Fleet overview" and "alice" in fleet.embed.description
 
 
-def test_admin_reset_requires_two_admins(invoke, services, activated):
-    assert "armed (1/2)" in invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="reset", confirm="RESET").content
+def test_admin_reset_requires_typed_confirm_only(invoke, services, activated):
+    assert invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="reset").content.startswith("❌ Type `RESET`")
     assert services.repos.alts.for_customer(CUSTOMER)
-    done = invoke.call(ADMIN2, "admin", adm.admin, ADMIN_CH, action="reset", confirm="RESET")
+    done = invoke.call(ADMIN, "admin", adm.admin, ADMIN_CH, action="reset", confirm="RESET")
     assert done.content.startswith("🧨") and services.repos.alts.for_customer(CUSTOMER) == []
     assert services.repos.customers.get(CUSTOMER) is not None

@@ -351,8 +351,12 @@ def test_p1_3_help_admin_documents_every_action(invoke):
     reply = invoke.call(ADMIN, "help-admin", admin_cmds.help_admin, "400000000000000001")
     body = reply.embed.to_dict()
     names = [f["name"] for f in body["fields"]]
+    desc = body.get("description") or ""
     for action in admin_cmds.ADMIN_ACTIONS:
         assert f"/admin action:{action}" in names, f"{action} is missing from /help-admin"
+        assert f"• **{action}**" in desc or any("•" in (f.get("value") or "") for f in body["fields"])
+    for category, _names in admin_cmds.ADMIN_HELP_CATEGORIES:
+        assert category in desc
     assert "⚠️ undocumented" not in names
     assert COMMAND_TIERS["help-admin"] is Tier.ADMIN
 
@@ -547,13 +551,27 @@ def test_p2_9_registry_hides_operator_commands_from_non_admins(services, classif
     by_name = {c.name: c for c in tree.get_commands()}
     assert {"admin", "help-admin"} <= set(by_name)
     for name in ADMIN_ONLY_COMMANDS:
-        assert by_name[name].default_permissions is not None
-        assert by_name[name].default_permissions.administrator is True
+        # Visible to OWNER_IDS who may not have Discord Server Administrator.
+        assert by_name[name].default_permissions is None or by_name[name].default_permissions.administrator is not True
     for name, cmd in by_name.items():
         assert cmd.guild_only is True, name
-        if name not in ADMIN_ONLY_COMMANDS:
-            # customer commands stay visible but are gated by the Guard at invoke time
-            assert cmd.default_permissions is None or cmd.default_permissions.administrator is not True
+        assert cmd.default_permissions is None or cmd.default_permissions.administrator is not True
+
+
+def test_ip_lookup_falls_back_when_ipwho_rate_limits():
+    src = SENDER.read_text(encoding="utf-8")
+    assert "https://ipwho.is/" in src
+    assert "https://ipapi.co/" in src
+    assert "https://ipinfo.io/" in src
+    assert "if not payload or payload.get(\"success\") is False" in src
+
+
+def test_skill_md_has_admin_operator_guide():
+    skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert "## Admin Operator Guide" in skill
+    assert "10 most common admin commands" in skill
+    assert "Heartbeat stale" in skill
+    assert "Ticket not working" in skill
 
 
 def test_p2_9_a_stranger_only_ever_gets_help_and_getstarted(services):

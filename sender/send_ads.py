@@ -3329,19 +3329,26 @@ def _lookup_egress():
         details["ip"] = ip.strip()
 
         payload = _fetch_json(f"https://ipwho.is/{ip}") or {}
-        if payload.get("success") is False:
+        if not payload or payload.get("success") is False:
+            payload = _fetch_json(f"https://ipapi.co/{ip}/json/") or {}
+        if not payload or payload.get("error") or payload.get("reason"):
+            payload = _fetch_json(f"https://ipinfo.io/{ip}/json") or {}
+        if not payload:
             return details
-        connection = payload.get("connection") or {}
-        security = payload.get("security") or {}
-        if not isinstance(connection, dict) or not isinstance(security, dict):
-            return details
-        org = connection.get("org") or connection.get("isp")
+        connection = payload.get("connection") if isinstance(payload.get("connection"), dict) else {}
+        security = payload.get("security") if isinstance(payload.get("security"), dict) else {}
+        org = (
+            connection.get("org") or connection.get("isp")
+            or payload.get("org") or payload.get("org_name") or payload.get("isp")
+        )
         if not isinstance(org, str) or not org.strip():
             return details
         details["org"] = org.strip().lower()
-        details["country"] = str(payload.get("country_code") or "").upper()
-        details["country_name"] = str(payload.get("country") or "?")
-        details["connection_type"] = str(connection.get("type") or "").lower()
+        details["country"] = str(
+            payload.get("country_code") or payload.get("country") or ""
+        ).upper()[:2]
+        details["country_name"] = str(payload.get("country_name") or payload.get("country") or "?")
+        details["connection_type"] = str(connection.get("type") or payload.get("type") or "").lower()
         details["hosting"] = bool(security.get("hosting")) or any(
             marker in details["connection_type"]
             for marker in ("hosting", "datacenter", "data center")

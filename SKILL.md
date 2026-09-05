@@ -1,5 +1,41 @@
 # AdFarm V9 — Operator Skill
 
+## Admin Operator Guide
+
+Use this first. Commands work only in **admin rooms** (`#admin-commands`). `/admin` and
+`/help-admin` are visible to operators in `OWNER_IDS` (they are not hidden behind Discord
+Server Administrator). Destructive actions need a typed confirmation; **one admin is enough**.
+
+### 10 most common admin commands
+
+1. `/admin action:activate user:<id> days:30 alts:2` — onboard (creates hub).
+2. `/admin action:extend user:<id> days:30` — add days; closes the open renewal ticket.
+3. `/admin action:deactivate user:<id> confirm:DEACTIVATE` — stop runs, lock hub, drop roles.
+4. `/admin action:customer user:<id>` — full card (plan, hub, webhooks, alts).
+5. `/admin action:health` — workers, backup lease, dirty/missing alts, config problems.
+6. `/admin action:list` / `fleet:true` — customers or live fleet.
+7. `/admin action:alt user:<id> sub:sync` — repair hub webhooks and re-sync alt repos.
+8. `/admin action:tickets` then `/admin action:resolve ticket:<id> note:paid`.
+9. `/admin action:backup sub:now` — force a Gist snapshot.
+10. `/help-admin` — grouped operator reference (Customer / Alts / Ops / Destructive).
+
+### Quick troubleshooting
+
+* **Alt offline** — `/status customer:<id> refresh:true` and `/admin health`. If the repo is
+  `missing`, re-register with `/admin alt sub:add` then have the customer `/setup`. A ban
+  auto-renames `_BANNED_` and prepares a replacement.
+* **Ticket not working** — `/admin action:ticket-panel channel:<id>` re-posts the 🎫 button
+  and registers the ticket channel. Confirm `OPEN_TICKET_CH_ID` in `adfarm.db` meta.
+* **Heartbeat stale** — dashboard webhook may be incomplete (`/admin alt sub:sync`). Sender
+  IP lookups fall back `ipwho.is` → `ipapi.co` → `ipinfo.io` if rate-limited.
+
+### Admin-only commands
+
+`/admin` (all actions in `/help-admin`) and `/help-admin`. Guarded at invoke time; not
+Discord Administrator-gated.
+
+---
+
 Skill for operating the AdFarm V9 control bot (`python -m adfarm`, package `adfarm`). Use this
 when activating customers, running alts, handling bans, or answering "how do I…" questions about
 the bot. The legacy bot in the repo root is **not** this system — if a user references the old
@@ -50,9 +86,9 @@ permissions and re-run `python setup.py --discord`.
 
 Empty `OWNER_IDS` ⇒ nobody is admin (fail-closed). Expired/inactive customers get a tailored
 "subscription expired" message instead of a generic denial — and can still run `/renew`, since
-that is the command that gets them back in. Operator commands (`/admin`, `/help-admin`) carry
-`default_permissions=administrator`, so Discord hides them from non-admins entirely; every
-command is guild-only, and the per-user tier check still runs at invoke time.
+that is the command that gets them back in. Operator commands (`/admin`, `/help-admin`) are guild-only. They are **not** hidden behind
+Discord Server Administrator (so `OWNER_IDS` without that permission still see them). The
+per-user tier check still runs at invoke time.
 
 ## Command reference
 
@@ -106,10 +142,10 @@ command is guild-only, and the per-user tier check still runs at invoke time.
 * `/admin payment-address` — show the configured wallet.
 * `/admin sync-commands` — re-sync slash commands.
 * `/admin logs user:<id>` — event ledger.
-* `/admin reset confirm:RESET` — **two-admin** factory reset (stops runs, renames alt repos
-  `_DELETED_`); customer rows are kept.
-* `/admin shutdown-bot confirm:SHUTDOWN` — **two-admin** stop of the current runner only; the next
-  cron chunk starts a fresh one. Replaces the old customer `/shutdown`.
+* `/admin reset confirm:RESET` — factory reset (stops runs, renames alt repos
+  `_DELETED_`); customer rows are kept. Typed confirmation only; one admin.
+* `/admin shutdown-bot confirm:SHUTDOWN` — stop of the current runner only; the next
+  cron chunk starts a fresh one. Typed confirmation only; one admin.
 * `/help-admin` — the full operator command reference (every action, its summary and a
   copy-pasteable example). Admin-only, like `/admin`.
 
@@ -141,7 +177,7 @@ command is guild-only, and the per-user tier check still runs at invoke time.
 ## Gotchas
 
 * **Never** tell a customer to run `/shutdown` — that command no longer exists (it was a customer
-  footgun). Use `/admin shutdown-bot` (two-admin).
+  footgun). Use `/admin shutdown-bot` with `confirm:SHUTDOWN`.
 * `/run hours:0` is limitless (auto-renewed). `/tune hours:0` is rejected — runtime is set at run
   time only.
 * `admin` commands in a customer hub or public channel are **denied** — they must be issued in an
