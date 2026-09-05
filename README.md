@@ -1,178 +1,152 @@
-# Discord Ad Sender — V8 (Enterprise Multi-Customer Service)
+# AdFarm V9 — control plane (`new_reform/`)
 
-> **V8 (2026-09-03):** Full enterprise upgrade with multi-customer management,
-> subscription timers, VIP tier, admin panel, and 24/7 continuous bot runtime.
-> **One-command setup with 3-worker architecture.**
-> **V8 bug-fix round:** every command is now channel-aware (public/customer/vip/admin
-> tiers per channel + synced slash-command visibility), the fleet registry self-heals
-> via `/admin sweep-alts`, `/reset` performs a factory wipe, and ~150 silent
-> `except: pass` handlers across the codebase now log instead of swallowing.
+The reformed AdFarm control bot. A Discord-operated SaaS that runs "ad farms": customers hand
+over Discord alt-account tokens, the operator's infrastructure posts marketplace ads from those
+alts 24/7 with anti-detection behaviour, relays buyer DMs back to the customer, and bills monthly
+via manual crypto (BEP-20).
 
-This repository contains the canonical V8 sender and official control-bot
-source for a GitHub Actions deployment. V8 transforms the bot from a single-operator
-tool into a full enterprise service supporting multiple customers, each with their own
-private forum channels, GitHub repos, subscription timers, and VIP features.
+This folder (`new_reform/`) is a **clean-room reimplementation** of the legacy system in the
+repository root. It keeps the battle-tested `send_ads.py` sender **byte-for-byte** and replaces
+the fragile, monolithic bot with a modular, tested control plane. **The legacy code in the root
+is not modified by anything here.**
 
-## 🆕 V8 Quick Start (One Command)
+```
+new_reform/
+├── README.md            ← you are here
+├── ARCHITECTURE.md      ← component map + data flow
+├── SKILL.md             ← AI-operator skill (command reference)
+├── setup.py             ← idempotent installer (REST only, --dry-run, --non-interactive)
+├── requirements.txt
+├── pytest.ini
+├── analysis/            ← 01 description, 02 redesign, 04 comparison (Phase docs)
+├── adfarm/              ← the control-bot package (python -m adfarm)
+├── sender/              ← send_ads.py (V6, verbatim) + channel_registry + workflows
+├── workflows/           ← control_bot.yml (install as .github/workflows/)
+├── tools/               ← migrate_legacy.py (legacy customers.db → adfarm.db)
+└── tests/               ← unit/ + integration/ (real SQLite + fakes, no network)
+```
 
-### Prerequisites (one-time, 5 min):
-1. Install [GitHub CLI](https://cli.github.com): `brew install gh` (macOS) / `sudo apt install gh` (Ubuntu)
-2. Authenticate on your **main** account: `gh auth login && gh auth refresh -s repo,workflow,gist`
-3. Create **3 fresh GitHub accounts** for workers at [github.com/signup](https://github.com/signup) (these host customer alt repos — gives isolation if one gets flagged)
-4. Create a Discord bot at [discord.com/developers](https://discord.com/developers/applications) — enable Message Content Intent, invite to your server
+## 1. Requirements
 
-### Setup (one command):
+* Python ≥ 3.11
+* `discord.py>=2.4.0` (runtime; the control bot entry point imports it)
+* `PyNaCl>=1.5.0` (sealing GitHub repo secrets)
+* `requests>=2.31.0` (GitHub REST transport)
+* `pytest>=8.0` (only for the test suite)
+
 ```bash
-python3 setup.py
-```
-The script asks for:
-- **4 Discord/billing inputs:** Bot Token, User ID, Server ID, Wallet Address
-- **3 worker accounts:** Username + token for each (the script opens the token creation page for you in your browser)
-
-Everything else is automated — channels, secrets, Gist backup, database, policy card.
-
-### Architecture:
-```
-Main account (gh auth)  →  core repo + control bot + Gist backup
-Worker 1 (@username)    →  customer alt repos (round-robin)
-Worker 2 (@username)    →  customer alt repos (round-robin)
-Worker 3 (@username)    →  customer alt repos (round-robin)
+pip install -r requirements.txt
 ```
 
-### Launch:
+## 2. Configuration
+
+All configuration is read **once** from the environment by `adfarm.config.Settings.from_env()`
+(optionally merged with a JSON blob in `TUNING_JSON`). The bot **refuses to start** (exit 2) if
+`BOT_TOKEN` or `OWNER_IDS` is missing, and logs every other misconfiguration via
+`Settings.problems()` so problems surface at boot, not at the first command.
+
+| Variable | Purpose |
+|---|---|
+| `BOT_TOKEN` | Discord bot token (Message Content + applications.commands intents) |
+| `GUILD_ID` | Discord server id |
+| `OWNER_IDS` | Comma-separated admin Discord user ids (fail-closed if empty) |
+| `ADMIN_ALERTS_CH_ID` / `ADMIN_CHAT_CH_ID` / `AUDIT_LOG_CH_ID` | Admin room ids |
+| `OPEN_TICKET_CH_ID` | Ticket room id |
+| `CUSTOMER_HUB_ID` | 🏢 Customer Hub category id |
+| `PAYMENT_ADDRESS` | BEP-20 wallet address shown on tickets |
+| `GH_TOKEN` | Main-account PAT (`repo`, `workflow`, `gist`) |
+| `CORE_REPO` | `owner/repo` of this core repo (defaults to `GITHUB_REPOSITORY`) |
+| `WORKER_TOKENS` | `login:token,login:token` for the 3 worker accounts |
+| `WORKER_1_USER`/`_TOKEN`, `WORKER_2_*`, `WORKER_3_*` | Alternative per-worker env form |
+| `CONTROL_GIST_ID` | Gist holding `control_<ALT_ID>.json` command bus |
+| `ADFARM_GIST_ID` | Backup Gist for `adfarm.db` (write-through) |
+| `GIST_TOKEN` | Gist-write token (defaults to `GH_TOKEN`) |
+| `TOKEN_VAULT_KEY` | ≥8-char key to encrypt alt tokens at rest in the DB |
+| `ADFARM_DB` | Path to `adfarm.db` (defaults to `customers.db` for an easy cut-over) |
+| `ADFARM_REGISTER_COMMANDS` | `true` to sync slash commands (set on chunk 1 only) |
+
+Full list with defaults: `adfarm/config.py`.
+
+## 3. Running
+
 ```bash
-git add . && git commit -m '🚀 V8 setup' && git push origin main
+# Local / dev
+export BOT_TOKEN=... OWNER_IDS=... GH_TOKEN=... ADFARM_GIST_ID=... CONTROL_GIST_ID=...
+python -m adfarm
+
+# Or as a GitHub Actions service (recommended — 8×350-min chunks, ~46 h coverage)
+# Install new_reform/workflows/control_bot.yml as .github/workflows/control_bot.yml
+# and set the secrets above on the repo.
 ```
 
-### Onboard a customer:
-```
-/admin activate @User days:30 alts:2
-```
+On boot the bot:
+1. builds the service graph (`app.build_services`);
+2. restores `adfarm.db` from the backup Gist if the local copy is missing/empty;
+3. acquires the DB lease (exits if another runner holds it — split-brain prevention);
+4. syncs slash commands (chunk 1 only);
+5. starts the scheduler (expiry reminders, limitless renewal, run polling, dirty-sweep,
+   stale detection, lease renewal).
 
-📖 See [`SETUP_CONTROL.md`](./SETUP_CONTROL.md) for the full guide.
+## 4. Installing (optional)
 
----
+`new_reform/setup.py` is an idempotent installer that uses only the GitHub REST API:
 
-## V8 Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    V8 CONTROL BOT (24/7)                     │
-│  Runs on: MAIN GitHub account                                │
-│  • /admin panel (owner-only hidden commands)                 │
-│  • Customer commands: /setup /run /stop /pause /resume etc.  │
-│  • VIP commands: /squad /script (VIP customers only)         │
-│  • Timer engine: hourly subscription scan + auto-shutdown    │
-│  • SQLite: customers.db (Gist write-through backup)          │
-└─────────────────────────┬────────────────────────────────────┘
-                          │  dispatches to worker accounts
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│  Worker 1    │ │  Worker 2    │ │  Worker 3    │
-│  alt repos   │ │  alt repos   │ │  alt repos   │
-│  send_ads.py │ │  send_ads.py │ │  send_ads.py │
-│  (Actions)   │ │  (Actions)   │ │  (Actions)   │
-└──────────────┘ └──────────────┘ └──────────────┘
-          │
-          ▼
-┌─────────────────────┐         ┌─────────────────────┐
-│   Customer A Forum  │         │   Customer B Forum  │
-│   #control          │         │   #control          │
-│   #dashboard        │         │   #dashboard        │
-│   #farm-logs        │         │   #farm-logs        │
-│   #dm-inbox (VIP)   │         │   #deals            │
-│   #deals            │         └─────────────────────┘
-└─────────────────────┘
+```bash
+python -m tools.  # (no-op placeholder — run the file directly)
+python setup.py --dry-run                 # print what it would do
+python setup.py                            # create backup gist, set repo secrets, init DB
+python setup.py --push-workflows          # also upload control_bot.yml + sender files
+python setup.py --discord                 # also create Discord channels/forum + register commands
 ```
 
-## V8 Modules
+It never deletes or recreates the backup Gist, and all writes are `--dry-run`-safe. Discord-side
+steps require `discord.py` and are skipped gracefully when it is not installed.
 
-| File | Purpose |
-|------|---------|
-| `customer_manager.py` | SQLite CRUD, expiry helpers, VIP management |
-| `security.py` | Global `@require_access` permission decorator |
-| `github_dispatch.py` | Multi-worker repo provisioning + workflow dispatch |
-| `discord_forum.py` | Customer forum channel + thread creation |
-| `timer_engine.py` | Hourly subscription scan, reminders, auto-shutdown |
-| `admin_commands.py` | `/admin` slash command group (hidden) |
-| `gist_backup.py` | Gist write-through backup + restore-on-startup |
-| `setup.py` | **One-command installer** (gh CLI auth + 3 workers) |
+## 5. Migrating from the legacy system
 
-## V8 Command Reference
+The new DB schema (`adfarm.db`) is intentionally different from the legacy `customers.db`.
+`tools/migrate_legacy.py` imports it:
 
-### Admin Commands (OWNER_IDS only)
-| Command | Function |
-|---------|----------|
-| `/admin list` | Show all customers, days remaining |
-| `/admin activate @User days alts vip` | Onboard a customer |
-| `/admin extend @User days` | Extend subscription |
-| `/admin deactivate @User` | Shut down and lock |
-| `/admin shutdown confirm:ALL` | Emergency kill-switch (2-admin multi-sig) |
-| `/admin repo-sync` | Push latest sender to all repos |
-| `/admin logs @User` | View customer log thread |
-| `/admin pin-policy` | Pin ToS in #open-ticket |
-| `/admin payment-address @User` | Share wallet (policy-gated) |
-| `/admin verify-tokens` | Audit worker tokens |
-| `/admin expiry-alerts` | Dry-run reminder path |
-| `/admin activate-template @User` | Pre-filled activation command |
-| `/admin sync-commands` | Re-register the slash-command tree and re-apply channel visibility (run after deploys or channel renames) |
-| `/admin sweep-alts` | Probe every `ALT_REPOS` entry against GitHub and prune confirmed-404 ghost alts from state, DB and repo secrets |
-| `/reset confirm:RESET` | Owner-only factory reset: DB rows, backup files, control state, fleet registry + secrets (keeps user accounts/settings/repos intact) |
+```bash
+python -m tools.migrate_legacy \
+    --from customers.db --to adfarm.db \
+    --legacy-vault-key "$LEGACY_TOKEN_VAULT_KEY" \
+    --vault-key "$TOKEN_VAULT_KEY" \
+    --alt-repos "200000000000000001:worker1/alice_alt1,worker1/alice_alt2" \
+    --dry-run
+```
 
-### Channel Policy (bug-fix round)
-Slash commands are gated by *where* they are invoked — channel role decides the
-tier ceiling, the per-command tier must fit inside it (owners bypass the channel
-check entirely):
+The importer maps `customers`, `alt_credentials`, `run_state`, `reminder_sent`,
+`policy_acks`, `events` and `meta`. Legacy repo names are best-effort split into
+`repo_owner`/`repo_name`; `--alt-repos` overrides them when the legacy list is unreliable.
+Tokens are de-obfuscated with the *legacy* key and re-sealed with the *new* `TokenVault`.
 
-| Tier | Commands | Default channels (name match, case-insensitive) |
-|------|----------|--------------------------------------------------|
-| public | `/help`, `/getstarted` | `welcome-about`, `pricing-plans`, `announcements` |
-| customer | `/setup` `/run` `/stop` `/pause` `/resume` `/tune` `/channels` `/deals` `/status` `/reply` `/refresh` `/dashboard` `/shutdown` `/alt` `/renew` `/pause-billing` `/proofs` | `control`, `dashboard`, `farm-logs`, `deals`, `open-ticket`, `tickets` |
-| vip | `/squad` `/script` `/vip` | `dm-inbox` |
-| admin | `/admin …`, `/reset` | `admin-commands`, `admin-alerts`, `admin-chat`, `audit-logs` |
+Full migration runbook (shadow deploy → import → webhook backfill → parallel run → cut-over →
+decommission): `analysis/02_REDESIGN.md` §8 and `analysis/04_COMPARISON.md`.
 
-Override via env with channel IDs **or** names (comma-separated):
-`PUBLIC_CHANNELS`, `CUSTOMER_CHANNELS`, `VIP_CHANNELS`, `ADMIN_CHANNELS`,
-and `CUSTOMER_HUB_MARKER` (pattern that marks a customer's own hub room as
-customer-tier anywhere). Unclassified channels allow **public tier only**.
-On startup (and after `/admin sync-commands`) the guild is switched to
-**private registration** so commands only exist where allowed — one API call
-per command, and a human-readable summary is written to `#control` and the
-log channel. `CUSTOMER_GUILD_ID=0` (self-serve servers) skips guild-wide
-registration entirely, so every slash command stays invisible by design.
+## 6. Commands
 
-### Customer Commands (active subscription required)
-`/setup`, `/run`, `/stop`, `/pause`, `/resume`, `/alt`, `/tune`, `/channels`,
-`/deals`, `/squad`, `/status`, `/reply`, `/refresh`, `/dashboard`, `/help`,
-`/shutdown`, `/renew`, `/pause-billing`, `/proofs`
+See `SKILL.md` for the full operator reference. Top-level:
+`help getstarted account setup run stop pause resume tune channels deals status reply alt
+renew pause-billing proofs vip admin`.
 
-### VIP Commands (VIP tier required)
-`/squad`, `/script simulate`, `/script run`, `#dm-inbox` visibility
+## 7. Development & testing
 
----
+```bash
+pip install -r requirements.txt
+python -m pytest -q          # unit + integration; uses real SQLite + fakes, never the network
+```
 
-> **Safety:** This is user-account automation, not an official Discord bot
-> feature. Use only accounts and servers you control. Never use it for
-> harassment, fraud, spam, or unsolicited bulk messaging.
+* `core`, `security`, `timers`, `telemetry.heartbeat` — pure, no mocks.
+* `db` — real SQLite in `tmp_path`; Gist backup against an in-memory `FakeGist`.
+* `github` — `FakeGitHubTransport` models repos/secrets/runs/gists; asserts sealed secrets are
+  base64 and never equal to plaintext.
+* `services` / `commands` — real services + real DB + fakes for GitHub/Discord/clock.
+* `integration/` — activate → setup → run → tune → heartbeat → expiry shutdown; ban → rename →
+  replacement; crash → restore from Gist; lease conflict.
 
-## Start here
+## 8. What is intentionally unchanged
 
-- **Setup:** run [`python3 setup.py`](./setup.py) then [`SETUP_CONTROL.md`](./SETUP_CONTROL.md)
-- **Customer guide:** [`SETUP_GUIDE.md`](./SETUP_GUIDE.md)
-- **AI Co-Pilot:** [`SKILL.md`](./SKILL.md)
-- **Roadmap:** [`ROADMAP.md`](./ROADMAP.md)
-
-## Files
-
-| Path | Runs where | Purpose |
-|---|---|---|
-| `send_ads.py` | Worker alt repos (Actions) | Canonical sender, heartbeat, deal scanner. |
-| `.github/workflows/send_ads.yml` | Worker alt repos | Chained six-hour sender chunks, WARP routing. |
-| `.github/workflows/self_check.yml` | Worker alt repos | Pre-flight validation. |
-| `.github/workflows/control_bot.yml` | Main repo | 24/7 control bot with 8-chunk watchdog. |
-| `.github/workflows/sync_to_alts.yml` | Main repo | Copies sender + workflows to all alt repos. |
-| `control_bot/` | Main repo | Slash commands, live state, dashboard. |
-| `setup.py` | Main repo | **One-command installer (main + 3 workers).** |
-
-See [`SETUP_CONTROL.md`](./SETUP_CONTROL.md) for full setup and operations.
+`new_reform/sender/send_ads.py` is the same V6 sender as the root. The control plane talks to it
+through its **existing** protocol (GitHub repo secrets/variables + the `control_<ALT_ID>.json`
+Gist command bus + the heartbeat embed), so no sender changes are required for cut-over.

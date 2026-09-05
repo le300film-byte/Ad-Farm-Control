@@ -1,0 +1,131 @@
+# ADFARM V9 — control bot runtime (new_reform/).
+#
+# Same proven shape as the legacy chain (8 sequential 350-minute chunks under one
+# concurrency group, re-armed daily by cron) but the bot itself is `python -m adfarm`.
+#
+# Install this file as `.github/workflows/control_bot.yml` when cutting over
+# (see new_reform/analysis/04_COMPARISON_AND_MIGRATION.md). Until then it is inert here.
+#
+# Differences from the legacy workflow that matter operationally:
+#   • No ALT_REPOS / ALT_DISCORD_IDS / ALT_NAMES secrets — the fleet lives in the DB (+ Gist).
+#   • No CONTROL_CH_ID / DASHBOARD_CH_ID / LOG_CH_ID / DEALS_CH_ID — telemetry is per-customer.
+#   • A stale-lease runner exits instead of racing (DB lease in the backup Gist).
+#   • `/admin shutdown-bot` stops the *current* runner only; the next cron chunk starts fresh.
+
+name: "🤖 AdFarm V9 Control Bot"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"       # daily re-arm; the 8-chunk chain covers ~46 h so there is always overlap
+  push:
+    branches: [main]
+    paths:
+      - "new_reform/adfarm/**"
+      - "new_reform/requirements.txt"
+      - ".github/workflows/control_bot.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: control-bot
+  cancel-in-progress: false    # queue the next chain; the DB lease prevents a split brain during hand-off
+
+jobs:
+  run-bot:
+    name: "control bot · chunk ${{ matrix.chunk }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8]
+    timeout-minutes: 370
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: new_reform/requirements.txt
+
+      - name: Install dependencies
+        working-directory: new_reform
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet -r requirements.txt
+
+      - name: Validate required secrets (fail fast, before touching Discord)
+        env:
+          BOT_TOKEN:  ${{ secrets.BOT_TOKEN }}
+          OWNER_IDS:  ${{ secrets.OWNER_IDS || secrets.OWNER_ID }}
+          GH_TOKEN:   ${{ secrets.GH_TOKEN || secrets.GH_ADMIN_TOKEN || secrets.GITHUB_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${BOT_TOKEN}" ]] || { echo "::error::BOT_TOKEN is missing"; exit 1; }
+          [[ -n "${GH_TOKEN}"  ]] || { echo "::error::GH_TOKEN (main-account PAT with repo,workflow,gist) is missing"; exit 1; }
+          [[ -n "${OWNER_IDS//[[:space:]]/}" ]] || { echo "::error::OWNER_IDS must contain at least one Discord user ID"; exit 1; }
+          IFS=',' read -ra IDS <<< "$OWNER_IDS"
+          for id in "${IDS[@]}"; do
+            id="${id//[[:space:]]/}"
+            [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::OWNER_IDS contains a non-numeric ID"; exit 1; }
+          done
+
+      - name: Run control bot (chunk ${{ matrix.chunk }})
+        working-directory: new_reform
+        env:
+          # ── Discord ──────────────────────────────────────────────────────
+          BOT_TOKEN:            ${{ secrets.BOT_TOKEN }}
+          GUILD_ID:             ${{ secrets.GUILD_ID }}
+          OWNER_IDS:            ${{ secrets.OWNER_IDS || secrets.OWNER_ID }}
+          ADMIN_ALERTS_CH_ID:   ${{ secrets.ADMIN_ALERTS_CH_ID }}
+          ADMIN_CHAT_CH_ID:     ${{ secrets.ADMIN_CHAT_CH_ID }}
+          AUDIT_LOG_CH_ID:      ${{ secrets.AUDIT_LOG_CH_ID || secrets.AUDIT_LOGS_CH_ID }}
+          OPEN_TICKET_CH_ID:    ${{ secrets.OPEN_TICKET_CH_ID }}
+          PROOFS_CH_ID:         ${{ secrets.PROOFS_CH_ID }}
+          CUSTOMER_HUB_ID:      ${{ secrets.CUSTOMER_HUB_ID }}
+          PAYMENT_ADDRESS:      ${{ secrets.PAYMENT_ADDRESS }}
+          # ── GitHub (main account + workers) ──────────────────────────────
+          GH_TOKEN:             ${{ secrets.GH_TOKEN || secrets.GH_ADMIN_TOKEN || secrets.GITHUB_PAT }}
+          CORE_REPO:            ${{ github.repository }}
+          WORKER_TOKENS:        ${{ secrets.WORKER_TOKENS }}
+          WORKER_1_USER:        ${{ secrets.WORKER_1_USER }}
+          WORKER_1_TOKEN:       ${{ secrets.WORKER_1_TOKEN }}
+          WORKER_2_USER:        ${{ secrets.WORKER_2_USER }}
+          WORKER_2_TOKEN:       ${{ secrets.WORKER_2_TOKEN }}
+          WORKER_3_USER:        ${{ secrets.WORKER_3_USER }}
+          WORKER_3_TOKEN:       ${{ secrets.WORKER_3_TOKEN }}
+          # ── State ────────────────────────────────────────────────────────
+          ADFARM_GIST_ID:       ${{ secrets.ADFARM_GIST_ID || secrets.CUSTOMERS_GIST_ID }}
+          CONTROL_GIST_ID:      ${{ secrets.CONTROL_GIST_ID }}
+          GIST_TOKEN:           ${{ secrets.GIST_TOKEN }}
+          TOKEN_VAULT_KEY:      ${{ secrets.TOKEN_VAULT_KEY }}
+          ADFARM_DB:            ${{ runner.temp }}/adfarm.db
+          # ── Tuning (optional JSON blob overrides any of the above) ───────
+          TUNING_JSON:          ${{ secrets.TUNING_JSON }}
+          ADFARM_REGISTER_COMMANDS: ${{ matrix.chunk == 1 && 'true' || 'false' }}
+          LOG_LEVEL:            INFO
+          PYTHONUNBUFFERED:     "1"
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Watchdog: restart on crash (exit ≠ 0) with back-off, stop cleanly when the job budget is spent
+          # or when the bot exits 0 (clean shutdown via /admin shutdown-bot or lease conflict).
+          budget=$((345 * 60)); start=$(date +%s); attempt=0
+          while :; do
+            attempt=$((attempt + 1))
+            echo "::group::bot attempt ${attempt}"
+            python -m adfarm; code=$?
+            echo "::endgroup::"
+            if [[ $code -eq 0 ]]; then echo "bot exited cleanly"; break; fi
+            now=$(date +%s); elapsed=$((now - start))
+            if (( elapsed > budget )); then echo "chunk budget exhausted after crash; handing over"; break; fi
+            sleep_for=$(( attempt < 5 ? attempt * 15 : 60 ))
+            echo "::warning::bot crashed (exit ${code}); restarting in ${sleep_for}s"
+            sleep "${sleep_for}"
+          done
+          exit 0
