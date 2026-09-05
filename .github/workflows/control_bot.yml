@@ -1,10 +1,7 @@
-# ADFARM V9 — control bot runtime (new_reform/).
+# ADFARM V9 — control bot runtime.
 #
 # Same proven shape as the legacy chain (8 sequential 350-minute chunks under one
 # concurrency group, re-armed daily by cron) but the bot itself is `python -m adfarm`.
-#
-# Install this file as `.github/workflows/control_bot.yml` when cutting over
-# (see new_reform/analysis/04_COMPARISON_AND_MIGRATION.md). Until then it is inert here.
 #
 # Differences from the legacy workflow that matter operationally:
 #   • No ALT_REPOS / ALT_DISCORD_IDS / ALT_NAMES secrets — the fleet lives in the DB (+ Gist).
@@ -21,8 +18,8 @@ on:
   push:
     branches: [main]
     paths:
-      - "new_reform/adfarm/**"
-      - "new_reform/requirements.txt"
+      - "adfarm/**"
+      - "requirements.txt"
       - ".github/workflows/control_bot.yml"
 
 permissions:
@@ -50,10 +47,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: new_reform/requirements.txt
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        working-directory: new_reform
         run: |
           python -m pip install --quiet --upgrade pip
           pip install --quiet -r requirements.txt
@@ -76,7 +72,6 @@ jobs:
           done
 
       - name: Run control bot (chunk ${{ matrix.chunk }})
-        working-directory: new_reform
         env:
           # ── Discord ──────────────────────────────────────────────────────
           BOT_TOKEN:            ${{ secrets.BOT_TOKEN }}
