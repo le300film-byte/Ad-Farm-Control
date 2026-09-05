@@ -206,7 +206,7 @@ class CommandRegistry:
 # ── interactive components ─────────────────────────────────────────────────
 class SetupModal(discord.ui.Modal):
     def __init__(self, registry: CommandRegistry, ctx: CommandContext, alt_index: int):
-        super().__init__(title=f"Setup alt {alt_index} (never share this token elsewhere)")
+        super().__init__(title=f"Alt {alt_index} Setup")
         self.registry, self.ctx, self.alt_index = registry, ctx, alt_index
         self.token = discord.ui.TextInput(label="Alt Discord user token", style=discord.TextStyle.short, required=True, max_length=120)
         self.channels = discord.ui.TextInput(label="Target channel IDs (comma-separated, ≤10)", style=discord.TextStyle.paragraph, required=True, max_length=400)
